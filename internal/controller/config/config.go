@@ -11,7 +11,8 @@
 
 // Package config contains the ProviderConfig and ClusterProviderConfig
 // controllers. They account for usage: a config cannot be deleted while
-// ProviderConfigUsages reference it.
+// ProviderConfigUsages reference it. The ClusterProviderConfig controller
+// also reports a policy that does not compile with a Warning event.
 package config
 
 import (
@@ -64,14 +65,18 @@ func setupClusterProviderConfig(mgr ctrl.Manager, o controller.Options) error {
 		Usage:     v1alpha1.ProviderConfigUsageGroupVersionKind,
 		UsageList: v1alpha1.ProviderConfigUsageListGroupVersionKind,
 	}
+	recorder := event.NewAPIRecorder(mgr.GetEventRecorderFor(name)) //nolint:staticcheck // crossplane-runtime still uses the legacy events API.
 	r := providerconfig.NewReconciler(mgr, of,
 		providerconfig.WithLogger(o.Logger.WithValues("controller", name)),
-		providerconfig.WithRecorder(event.NewAPIRecorder(mgr.GetEventRecorderFor(name)))) //nolint:staticcheck // crossplane-runtime still uses the legacy events API.
+		providerconfig.WithRecorder(recorder))
+	// The policy is compiled first, so that an invalid pattern is reported
+	// on the config itself (design 3.3).
+	check := &PolicyCheck{Kube: mgr.GetClient(), Recorder: recorder, Next: r}
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named(name).
 		WithOptions(o.ForControllerRuntime()).
 		For(&v1alpha1.ClusterProviderConfig{}).
 		Watches(&v1alpha1.ProviderConfigUsage{}, &resource.EnqueueRequestForProviderConfig{Kind: v1alpha1.ClusterProviderConfigKind}).
-		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
+		Complete(ratelimiter.NewReconciler(name, check, o.GlobalRateLimiter))
 }

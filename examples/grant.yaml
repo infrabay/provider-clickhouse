@@ -23,11 +23,12 @@ spec:
       name: reader      # Role MR team-a/reader
 ---
 # Column privileges for a user, by ClickHouse names. The user must be owned
-# by a User MR in this namespace that uses the same ProviderConfig.
+# by a User MR in this namespace that uses the same ProviderConfig: here the
+# JWT user of the User MR team-a/reporting-api (user.yaml).
 apiVersion: clickhouse.m.infrabay.io/v1alpha1
 kind: Grant
 metadata:
-  name: api-events-columns
+  name: reporting-api-events-columns
   namespace: team-a
 spec:
   providerConfigRef:
@@ -38,7 +39,7 @@ spec:
     database: team-a_analytics
     table: events
     columns: ["id", "created_at"]
-    user: team-a_api
+    user: system:serviceaccount:team-a:reporting-api
 ---
 # Importing grants that existed before the MR: without Delete in the
 # management policies, deleting the MR never revokes anything. The grantee

@@ -777,3 +777,43 @@ func TestObserve(t *testing.T) {
 		})
 	}
 }
+
+// TestLateInitializeProfileDenied: once the server refused the read of
+// system.settings_profile_elements (497), late initialization of
+// settingsProfile skips it for a while, so that a provider identity without
+// that optional grant does not send a query the server denies on every poll
+// of every user. A managed settingsProfile still reads it, and still needs
+// the grant.
+func TestLateInitializeProfileDenied(t *testing.T) {
+	ctx := context.Background()
+	s := newServer(fake.Upstream268, passwordRow(), "")
+	s.db.On(sqlx.QueryUserSettings, fake.Error(fake.Exception(497, "necessary to have the grant SELECT ON system.settings_profile_elements")))
+	e := newEnv(t, s, nil, recorded(recordedPassword, ""))
+	reads := func() int {
+		n := 0
+		for _, q := range e.db.Seen {
+			if q == sqlx.QueryUserSettings {
+				n++
+			}
+		}
+		return n
+	}
+	for range 3 {
+		mr := newUser(owned(userID))
+		if o, err := e.Observe(ctx, mr); err != nil || !o.ResourceExists {
+			t.Fatalf("Observe() = %+v, %v", o, err)
+		}
+		if mr.Spec.ForProvider.SettingsProfile != nil {
+			t.Errorf("settingsProfile = %q, want it left unset", *mr.Spec.ForProvider.SettingsProfile)
+		}
+	}
+	if n := reads(); n != 1 {
+		t.Errorf("the refused read ran %d times in three polls, want once", n)
+	}
+	if _, err := e.Observe(ctx, newUser(owned(userID), managedFields("", "default"))); !reason.Is(err, reason.PermissionDenied) {
+		t.Errorf("Observe() with a managed settingsProfile = %v, want PermissionDenied", err)
+	}
+	if n := reads(); n != 2 {
+		t.Errorf("a managed settingsProfile must read the table: %d reads", n)
+	}
+}

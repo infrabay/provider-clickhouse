@@ -123,8 +123,10 @@ func (e *Env) BindGrantee(ctx context.Context, mg resource.ModernManaged, g Gran
 // whatever crossplane-runtime calls (D-26). When the grantee no longer
 // exists it returns exists=false without error while the MR is being
 // deleted (there is nothing left to revoke, so Delete returns without
-// error), and DependencyMissing otherwise.
-func (e *Env) RebindGrantee(ctx context.Context, mg resource.ModernManaged, b Binding) (bool, error) {
+// error), and DependencyMissing otherwise. A failed check sets Ready=False
+// (UnavailableOn).
+func (e *Env) RebindGrantee(ctx context.Context, mg resource.ModernManaged, b Binding) (ok bool, err error) {
+	defer func() { err = UnavailableOn(mg, err) }()
 	if err := e.CheckWritable(ctx); err != nil {
 		return false, err
 	}
@@ -205,7 +207,7 @@ func (e *Env) bind(ctx context.Context, mg resource.ModernManaged, g Grantee) (b
 		return b, nil, nil, err
 	}
 	if readOnly {
-		return leave(ReasonOrphaned, reason.Errorf(reason.ReadOnlyStorage, "grantee %s is in the read-only user directory %q (such as users.xml/users.d) and is never written", g, ent.Storage))
+		return leave(ReasonOrphaned, reason.Errorf(reason.ReadOnlyStorage, "grantee %s is in user directory %q, which is read-only (such as users.xml/users.d) or shares its name with a read-only directory, and is never written", g, ent.Storage))
 	}
 	if g.Kind == User && g.Name == e.CurrentUser() {
 		return leave(ReasonOrphaned, reason.Errorf(reason.SelfModification, "grantee %s is the provider's own identity and is never modified", g))

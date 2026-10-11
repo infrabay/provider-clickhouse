@@ -557,6 +557,118 @@ func testRenamedUserDirectories(t *testing.T, f *accessFixture) {
 	}
 }
 
+// ambiguousUserDirectories gives the SQL directory and users_xml the same
+// name, with the SQL directory first: every entity then reports the storage
+// shared_dir, and the storage no longer tells users.d entities from SQL ones
+// [verified on every supported version].
+const ambiguousUserDirectories = `<clickhouse>
+  <user_directories replace="replace">
+    <local_directory><name>shared_dir</name><path>/var/lib/clickhouse/access/</path></local_directory>
+    <users_xml><name>shared_dir</name><path>users.xml</path></users_xml>
+  </user_directories>
+</clickhouse>
+`
+
+// TestAmbiguousUserDirectories checks, on every image, that an entity whose
+// user directory shares its name with a read-only one is never written: a
+// Role MR cannot adopt a users.d role and is released on deletion without a
+// DROP, a User MR claiming a users.d user changes nothing, a Grant to that
+// user grants nothing, and no role is created in the SQL directory, whose
+// entities the provider could not tell from read-only ones.
+func TestAmbiguousUserDirectories(t *testing.T) {
+	policy := accessPolicy()
+	policy.AllowAdoption = true
+	ran := false
+	for _, fam := range []struct{ name, env, def string }{
+		{familyUpstream, envUpstreamImages, defaultUpstreamImages},
+		{familyAntalya, envAntalyaImages, defaultAntalyaImages},
+	} {
+		for _, image := range imageList(fam.env, fam.def) {
+			ran = true
+			t.Run(image, func(t *testing.T) {
+				testAmbiguousUserDirectories(t, newAccessFixture(t, fam.name, image, policy, map[string]string{
+					"/etc/clickhouse-server/users.d/role-fixtures.yaml":    roleUsersD(),
+					"/etc/clickhouse-server/config.d/user-directories.xml": ambiguousUserDirectories,
+				}))
+			})
+		}
+	}
+	if !ran {
+		t.Skip("no images selected")
+	}
+}
+
+func testAmbiguousUserDirectories(t *testing.T, f *accessFixture) {
+	roleID, storage, ok := f.srv.entity(t, access.Role, roleFixtureYAMLRole)
+	if !ok || storage != "shared_dir" {
+		t.Fatalf("users.d role: %q %q %t", roleID, storage, ok)
+	}
+	userID, storage, ok := f.srv.entity(t, access.User, roleFixtureYAMLUser)
+	if !ok || storage != "shared_dir" {
+		t.Fatalf("users.d user: %q %q %t", userID, storage, ok)
+	}
+	before := f.srv.roleSnapshot(t)
+	userBefore := f.showCreateUser(t, roleFixtureYAMLUser)
+	grantsBefore := f.srv.rawStrings(t, "SHOW GRANTS FOR "+ch.QuoteIdent(roleFixtureYAMLUser))
+
+	h := roleHarness(t, f)
+	r := newRoleMR(f, "yaml", roleFixtureYAMLRole)
+	meta.AddAnnotations(r, map[string]string{v1alpha1.AnnotationAdopt: roleID})
+	h.create(r)
+	if o := h.reconcile("yaml"); !reason.Is(o.err, reason.ReadOnlyStorage) || o.created {
+		t.Fatalf("adopting a users.d role: %s", o)
+	}
+	if c := ownership.ClaimOf(h.get("yaml")); c.OwnedID != "" {
+		t.Fatalf("a users.d role was claimed: %+v", c)
+	}
+	h.mutate("yaml", func(r *v1alpha1.Role) {
+		meta.RemoveAnnotations(r, v1alpha1.AnnotationAdopt)
+		meta.AddAnnotations(r, map[string]string{v1alpha1.AnnotationOwnerUID: string(r.GetUID()), v1alpha1.AnnotationOwnedID: roleID})
+	})
+	h.delete("yaml")
+	if o := h.reconcile("yaml"); o.err != nil || !o.gone || o.deleted {
+		t.Fatalf("delete: %s", o)
+	}
+
+	uh := newUserHarness(t, f)
+	uh.createUser("yaml-user", roleFixtureYAMLUser, func(u *v1alpha1.User) {
+		u.Spec.ForProvider.HostIP = []string{"10.0.0.0/8"}
+	})
+	uh.mutate("yaml-user", func(u *v1alpha1.User) {
+		meta.AddAnnotations(u, map[string]string{v1alpha1.AnnotationOwnerUID: string(u.GetUID()), v1alpha1.AnnotationOwnedID: userID})
+	})
+	uh.mustReconcile("yaml-user", "users.d user", failedWith(reason.ReadOnlyStorage))
+
+	g := newGrantFixture(t, f)
+	p := roleGrantee("app_shared", "SELECT")
+	p.User = new(roleFixtureYAMLUser)
+	g.newGrant("yaml-grant", p)
+	if o := g.h.reconcile("yaml-grant"); !reason.Is(o.err, reason.ReadOnlyStorage) || o.created || o.updated {
+		t.Fatalf("grant to a users.d user: %s", o)
+	}
+
+	// New entities would go to the SQL directory of the same name.
+	h.create(newRoleMR(f, "new", "app_new_role"))
+	if o := h.reconcile("new"); !reason.Is(o.err, reason.InvalidConfig) || o.created {
+		t.Fatalf("create in an ambiguous directory: %s", o)
+	}
+	if _, _, ok := f.srv.entity(t, access.Role, "app_new_role"); ok {
+		t.Fatal("a role was created in a directory whose entities the provider cannot manage")
+	}
+	h.delete("new")
+	if o := h.reconcile("new"); o.err != nil || !o.gone || o.deleted {
+		t.Fatalf("delete: %s", o)
+	}
+
+	sameRoleSnapshot(t, f.srv, before, "MRs for entities of an ambiguous user directory")
+	if got := f.showCreateUser(t, roleFixtureYAMLUser); got != userBefore {
+		t.Errorf("the users.d user changed: %s, was %s", got, userBefore)
+	}
+	if diff := cmp.Diff(grantsBefore, f.srv.rawStrings(t, "SHOW GRANTS FOR "+ch.QuoteIdent(roleFixtureYAMLUser))); diff != "" {
+		t.Errorf("grants of the users.d user changed (-before +after):\n%s", diff)
+	}
+}
+
 func testRoleAdversarialName(t *testing.T, f *accessFixture) {
 	h := roleHarness(t, f)
 	name := "app_r`'\\.ü@*\tx"

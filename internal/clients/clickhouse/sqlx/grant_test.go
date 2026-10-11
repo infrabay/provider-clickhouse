@@ -672,6 +672,12 @@ func TestGrantOptionRecord(t *testing.T) {
 		// An option granted before the record existed is recorded.
 		"ShownRecorded": {rows: shown, privs: []string{"SELECT"}, wgo: true, after: sel,
 			revoke: []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}},
+		// GRANT SELECT ON app.* WITH GRANT OPTION by another Grant: the
+		// option of record adds nothing under it, and whatever revokes the
+		// broader option (REVOKE GRANT OPTION FOR SELECT ON app.*) revokes
+		// it too, so it is forgotten; once the broader option is gone, the
+		// Grant grants its own again (GrantedOnce).
+		"BroaderOptionForgotten": {rows: []GrantRow{gr("SELECT", "app.*", "g"), gr("INSERT", "app.events_raw", "")}, privs: []string{"SELECT"}, wgo: true, record: sel},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -696,6 +702,78 @@ func TestGrantOptionRecord(t *testing.T) {
 			}
 			if r := a.Revoke(tc.record).Record; len(r) != 0 {
 				t.Errorf("a deleted Grant records nothing: %v", r.Sorted())
+			}
+		})
+	}
+}
+
+// TestRecordAfter: a statement that the server refuses (497) changes
+// nothing, so the record keeps the flags it would have revoked and gains
+// none that only the GRANT would have given.
+func TestRecordAfter(t *testing.T) {
+	c := catalogue(t, v253)
+	events := GrantTarget{Database: "app", Table: "events"}
+	global := GrantTarget{Database: "*"}
+	expand := func(t *testing.T, target GrantTarget, privs ...string) PrivilegeSet {
+		t.Helper()
+		d, err := c.Expand(privs, target.Level())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	hidden := []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.*", ""), gr("INSERT", "app.events_raw", "")}
+	none := func(StepKind) bool { return false }
+	only := func(k StepKind) func(StepKind) bool { return func(x StepKind) bool { return x == k } }
+	all := func(StepKind) bool { return true }
+	cases := map[string]struct {
+		target GrantTarget
+		rows   []GrantRow
+		privs  []string
+		wgo    bool
+		record PrivilegeSet
+		steps  []StepKind
+		after  map[string]func(StepKind) bool
+		want   map[string]PrivilegeSet
+	}{
+		// INSERT was dropped from the spec of a Grant that gave it with
+		// grant option, which the server hides; SELECT is newly wanted with
+		// it: REVOKE GRANT OPTION FOR INSERT, GRANT SELECT WITH GRANT OPTION.
+		"RevokeOptionAndGrant": {target: events, rows: hidden, privs: []string{"SELECT"}, wgo: true, record: NewPrivilegeSet("INSERT"),
+			steps: []StepKind{StepRevokeGrantOption, StepGrant},
+			after: map[string]func(StepKind) bool{"None": none, "RevokeRefused": only(StepRevokeGrantOption), "GrantRefused": only(StepGrant), "Both": all},
+			want: map[string]PrivilegeSet{"None": NewPrivilegeSet("SELECT"), "RevokeRefused": NewPrivilegeSet("INSERT", "SELECT"),
+				"GrantRefused": {}, "Both": NewPrivilegeSet("INSERT")}},
+		// A foreign CREATE ARBITRARY TEMPORARY TABLE with grant option at
+		// the target: its REVOKE also removes the desired CREATE TEMPORARY
+		// TABLE, which the GRANT gives again.
+		"RevokeOfAParent": {target: global, rows: []GrantRow{gr("CREATE ARBITRARY TEMPORARY TABLE", "*.*", "g")}, privs: []string{"CREATE TEMPORARY TABLE"}, wgo: true,
+			record: NewPrivilegeSet("CREATE TEMPORARY TABLE"), steps: []StepKind{StepRevoke, StepGrant},
+			after: map[string]func(StepKind) bool{"None": none, "RevokeRefused": only(StepRevoke), "GrantRefused": only(StepGrant), "Both": all},
+			want: map[string]PrivilegeSet{"None": NewPrivilegeSet("CREATE TEMPORARY TABLE"), "RevokeRefused": NewPrivilegeSet("CREATE TEMPORARY TABLE"),
+				"GrantRefused": {}, "Both": NewPrivilegeSet("CREATE TEMPORARY TABLE")}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := Analyze(c, tc.target, expand(t, tc.target, tc.privs...), tc.rows).Apply(tc.wgo, tc.record)
+			steps, err := p.Steps(tc.target, "g")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var kinds []StepKind
+			for _, s := range steps {
+				kinds = append(kinds, s.Kind)
+			}
+			if diff := cmp.Diff(tc.steps, kinds); diff != "" {
+				t.Fatalf("steps -want +got:\n%s (%v)", diff, steps)
+			}
+			if got := p.RecordAfter(none); !got.Equal(p.Record) {
+				t.Errorf("RecordAfter(nothing refused) = %v, want Record %v", got.Sorted(), p.Record.Sorted())
+			}
+			for n, refused := range tc.after {
+				if got := p.RecordAfter(refused); !got.Equal(tc.want[n]) {
+					t.Errorf("%s: RecordAfter() = %v, want %v", n, got.Sorted(), tc.want[n].Sorted())
+				}
 			}
 		})
 	}

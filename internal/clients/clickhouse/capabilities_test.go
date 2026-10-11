@@ -5,6 +5,7 @@ package clickhouse_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
@@ -104,6 +105,23 @@ func TestAccessStorage(t *testing.T) {
 	if err != nil || got != ch.StorageMemory {
 		t.Fatalf("FirstWritableDirectory() = %q, %v", got, err)
 	}
+	// New entities would go to a directory whose name a read-only one
+	// shares: they could never be managed (TestStorageReadOnlyAmbiguous).
+	if _, err := ch.FirstWritableDirectory([]ch.UserDirectory{
+		{Name: "users_xml", Type: ch.StorageUsersXML, Params: `{}`},
+		{Name: "local_directory", Type: ch.StorageLocalDirectory, Params: `{"path":"\/var\/lib\/clickhouse\/access\/"}`},
+		{Name: "local_directory", Type: ch.StorageLocalDirectory, Params: `{"path":"\/var\/lib\/clickhouse\/access_ro\/","readonly":true}`},
+	}); !reason.Is(err, reason.InvalidConfig) || !strings.Contains(err.Error(), "<name>") {
+		t.Fatalf("ambiguous writable directory: %v", err)
+	}
+	got, err = ch.FirstWritableDirectory([]ch.UserDirectory{
+		{Name: "users_xml", Type: ch.StorageUsersXML, Params: `{}`},
+		{Name: "local_directory", Type: ch.StorageLocalDirectory, Params: `{}`},
+		{Name: "local_directory", Type: ch.StorageLocalDirectory, Params: `{"path":"\/var\/lib\/clickhouse\/access2\/"}`},
+	})
+	if err != nil || got != ch.StorageLocalDirectory {
+		t.Fatalf("two writable directories of one name: %q, %v", got, err)
+	}
 }
 
 // TestStorageReadOnly: an entity's storage is the name of its directory,
@@ -154,6 +172,42 @@ func TestStorageReadOnly(t *testing.T) {
 	denied := fake.NewDB().On(ch.QueryUserDirectories, fake.Error(fake.Exception(ch.CodeAccessDenied, "necessary to have the grant SELECT ON system.user_directories")))
 	if _, err := ch.NewCapabilities().StorageReadOnly(ctx, denied, "sql_users"); !reason.Is(err, reason.PermissionDenied) {
 		t.Errorf("StorageReadOnly() without the grant = %v, want PermissionDenied", err)
+	}
+}
+
+// TestStorageReadOnlyAmbiguous: directories may share a name, and an
+// entity's storage then does not tell which one holds it, so the name is
+// read-only unless every directory of that name is writable [verified on
+// every supported version: two local directories without a <name>, the
+// second read-only, both report local_directory, and so do a local
+// directory and users_xml given the same <name>].
+func TestStorageReadOnlyAmbiguous(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		dirs [][]any
+		want bool
+	}{
+		"UnnamedLocalDirectories": {dirs: [][]any{
+			{"users_xml", "users_xml", `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+			{"local_directory", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(2)},
+			{"local_directory", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access_ro\/","readonly":true}`, uint64(3)},
+		}, want: true},
+		"LocalDirectoryAndUsersXML": {dirs: [][]any{
+			{"local_directory", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(1)},
+			{"local_directory", "users_xml", `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(2)},
+		}, want: true},
+		"WritableDirectories": {dirs: [][]any{
+			{"users_xml", "users_xml", `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+			{"local_directory", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(2)},
+			{"local_directory", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access2\/"}`, uint64(3)},
+		}, want: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := fake.NewDB().On(ch.QueryUserDirectories, fake.Rows(tc.dirs...))
+			if got, err := ch.NewCapabilities().StorageReadOnly(ctx, db, "local_directory"); err != nil || got != tc.want {
+				t.Errorf("StorageReadOnly(local_directory) = %t, %v; want %t", got, err, tc.want)
+			}
+		})
 	}
 }
 

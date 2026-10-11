@@ -77,6 +77,7 @@ func TestUser(t *testing.T) {
 		t.Run("DefaultRoles", func(t *testing.T) { testUserDefaultRoles(t, f) })
 		t.Run("Ownership", func(t *testing.T) { testUserOwnership(t, f) })
 		t.Run("ProviderIdentity", func(t *testing.T) { testUserIdentity(t, f) })
+		t.Run("PermissionDenied", func(t *testing.T) { testUserPermissionDenied(t, f) })
 		if f.family == familyAntalya {
 			t.Run("JWT", func(t *testing.T) { testUserJWT(t, f) })
 		} else {
@@ -839,6 +840,28 @@ func testUserHosts(t *testing.T, f *accessFixture) {
 	h.mutate("local", func(u *v1alpha1.User) { u.Spec.ForProvider.HostIP = []string{"::ffff:0.1.2.3"} })
 	h.mustReconcile("local", "lossy address", failedWith(reason.InvalidSpec))
 	local("refused")
+
+	// The server folds only ASCII letters: a name that Unicode folding alone
+	// makes localhost (U+017F, long s) is an ordinary host name, never HOST
+	// LOCAL, and HOST LOCAL set out of band is drift.
+	fold := "localhoſt"
+	h.createUser("fold", "app_fold", func(u *v1alpha1.User) {
+		u.Spec.ForProvider.HostNames = []string{fold}
+		u.Spec.ForProvider.DefaultDatabase = new("")
+	})
+	h.mustReconcile("fold", "create", created)
+	folded := func(what string) {
+		t.Helper()
+		if r := f.userRow(t, "app_fold"); len(r.hostIP) > 0 || !slices.Equal(r.hostNames, []string{fold}) {
+			t.Fatalf("%s: hosts as stored: %+v", what, r)
+		}
+	}
+	folded("create")
+	h.mustReconcile("fold", "steady", steady)
+	f.srv.exec(t, "ALTER USER app_fold HOST LOCAL")
+	h.mustReconcile("fold", "repair HOST LOCAL", updated)
+	folded("repair")
+	h.mustReconcile("fold", "steady after repair", steady)
 }
 
 func testUserDefaultRoles(t *testing.T, f *accessFixture) {
@@ -1007,6 +1030,41 @@ func testUserOwnership(t *testing.T, f *accessFixture) {
 		t.Fatalf("login after adoption: %v", err)
 	}
 	h.mustReconcile("adoptee", "steady after adoption", steady)
+}
+
+// testUserPermissionDenied: through an unrestricted config, a User outside
+// the identity's server-side prefix reaches the server, which refuses its
+// CREATE USER (497). The statement carries an IDENTIFIED clause, so every
+// literal is redacted from the server's error; the error still names the
+// grant the identity lacks, and it holds no hash or salt (design 5.1, 5.2).
+func testUserPermissionDenied(t *testing.T, f *accessFixture) {
+	ctx := context.Background()
+	cpc := &v1alpha1.ClusterProviderConfig{}
+	if err := f.kube.Get(ctx, client.ObjectKey{Name: f.pc.Name}, cpc); err != nil {
+		t.Fatal(err)
+	}
+	cpc = cpc.DeepCopy()
+	cpc.ObjectMeta = metav1.ObjectMeta{Name: "access-open-user", UID: types.UID("cpc-access-open-user")}
+	cpc.Spec.Policy = v1alpha1.ClusterPolicy{Unrestricted: true}
+	if err := f.kube.Create(ctx, cpc); err != nil {
+		t.Fatal(err)
+	}
+	h := newUserHarness(t, f)
+	h.createUser("outside-prefix", "zz_outside_prefix", func(u *v1alpha1.User) {
+		u.Spec.ProviderConfigReference = &xpv2.ProviderConfigReference{Kind: v1alpha1.ClusterProviderConfigKind, Name: cpc.Name}
+	})
+	o := h.reconcile("outside-prefix")
+	if !reason.Is(o.err, reason.PermissionDenied) || o.created {
+		t.Fatalf("create outside the prefix: %s", o)
+	}
+	if msg := o.err.Error(); !strings.Contains(msg, "necessary to have the grant CREATE USER ON") || regexp.MustCompile(`[0-9a-fA-F]{32}`).MatchString(msg) {
+		t.Errorf("the error must name the missing grant and hold no hash or salt: %s", msg)
+	}
+	if _, _, ok := f.srv.entity(t, access.User, "zz_outside_prefix"); ok {
+		t.Fatal("the user was created")
+	}
+	h.delete("outside-prefix")
+	h.mustReconcile("outside-prefix", "delete", released)
 }
 
 // testUserIdentity: the provider's own identity, defined in users.d, is

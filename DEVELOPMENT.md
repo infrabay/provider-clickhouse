@@ -34,6 +34,7 @@ test/envtest/                  CRD validation against a real kube-apiserver
 test/integration/              tests against ClickHouse containers
 cluster/images/                the runtime image
 docs/design.md                 the design
+docs/operations.md             the operations runbook
 ```
 
 ## Everyday commands
@@ -78,6 +79,12 @@ with testcontainers. The tests start:
   protocol, the HTTP transport over plain HTTP and HTTPS (a throwaway CA and
   certificate are generated per run), token rotation, the audience check and
   the retry on error 516;
+- every image again with a provider identity defined in SQL that holds
+  exactly the grants of every kind (`TestMinimalGrants`, design 10.2
+  scenario 5): an administrator revokes them one at a time, every resource
+  then fails with `PermissionDenied` (or `DependencyMissing` when a
+  dependency could not be created) and is never reported as absent, and
+  everything converges once the grant is back;
 - a two-replica upstream cluster (interserver secret, embedded Keeper on the
   first node, on a temporary Docker network) for `ON CLUSTER` DDL, Replicated
   databases, the per-host ownership check and the Keeper path policy. It uses

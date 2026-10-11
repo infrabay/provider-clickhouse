@@ -460,6 +460,11 @@ func TestVerifyOwned(t *testing.T) {
 				env.cl.Servers = []string{"s1", "s2"}
 			}
 			exists, err := env.VerifyOwned(context.Background(), tc.mr, Role, *tc.mr.Spec.ForProvider.Name)
+			// What the re-check finds makes the MR unavailable as it would in
+			// Observe (design 5.10).
+			if got := readyStatus(tc.mr); (got == "False") != (tc.reason != "") {
+				t.Errorf("Ready = %s after %v", got, err)
+			}
 			if tc.reason != "" {
 				if !reason.Is(err, tc.reason) {
 					t.Fatalf("VerifyOwned() = %t, %v; want %s", exists, err, tc.reason)
@@ -471,7 +476,13 @@ func TestVerifyOwned(t *testing.T) {
 			}
 		})
 	}
-	env := newEnv(t, fake.NewDB(), namespacedResolved())
+	// While deleting, Ready stays as Delete set it (Deleting).
+	gone := newRole(roleName, claimed(roleID), deleting())
+	env := newEnv(t, fake.NewDB().WithRole(roleName, otherID, ch.StorageLocalDirectory), clusterResolved(t, sharedPolicy()))
+	if _, err := env.VerifyOwned(context.Background(), gone, Role, roleName); !reason.Is(err, reason.Replaced) || readyStatus(gone) == "False" {
+		t.Errorf("deleting: %v, Ready %s", err, readyStatus(gone))
+	}
+	env = newEnv(t, fake.NewDB(), namespacedResolved())
 	if _, err := env.VerifyOwned(context.Background(), newRole(provider, claimed(userID)), User, provider); !reason.Is(err, reason.SelfModification) {
 		t.Errorf("self: %v", err)
 	}
@@ -525,6 +536,56 @@ func TestRenamedUserDirectories(t *testing.T) {
 	}
 	if exists, err := env.VerifyOwned(ctx, mine, Role, roleName); err != nil || !exists {
 		t.Errorf("VerifyOwned() = %t, %v", exists, err)
+	}
+}
+
+// TestAmbiguousUserDirectories: two local directories without a <name>, the
+// second configured read-only, are both called local_directory, and so is
+// the storage of every entity in either [verified on 25.3.3; the server
+// refuses every write to an entity of the read-only one with 495]. Such an
+// entity is never written: adoption is refused, a deleting MR is released
+// without SQL, the re-check before a write refuses, and no grant is made to
+// it. Nothing is created either: the new entity would be stored in a
+// directory whose entities the provider cannot manage.
+func TestAmbiguousUserDirectories(t *testing.T) {
+	ctx := context.Background()
+	ambiguous := func(db *fake.DB, res *providerconfig.Resolved, objs ...client.Object) *testEnv {
+		env := newEnv(t, db, res, objs...)
+		db.On(ch.QueryUserDirectories, fake.Rows(
+			[]any{ch.StorageUsersXML, ch.StorageUsersXML, `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+			[]any{ch.StorageLocalDirectory, ch.StorageLocalDirectory, `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(2)},
+			[]any{ch.StorageLocalDirectory, ch.StorageLocalDirectory, `{"path":"\/var\/lib\/clickhouse\/access_ro\/","readonly":true}`, uint64(3)},
+		))
+		return env
+	}
+	adopt := newRole(roleName, claimed(""), annotated(v1alpha1.AnnotationAdopt, roleID))
+	env := ambiguous(fake.NewDB().WithRole(roleName, roleID, ch.StorageLocalDirectory), namespacedResolved(), adopt.DeepCopy())
+	if obs, err := env.ObserveEntity(ctx, adopt, Role, adopt.Spec.ForProvider.Name); !reason.Is(err, reason.ReadOnlyStorage) || obs.Decision.Decision != ownership.ReadOnly {
+		t.Errorf("adopting a role whose directory may be read-only: %+v, %v; want ReadOnlyStorage", obs.Decision, err)
+	}
+	if c := ownership.ClaimOf(adopt); c.OwnedID != "" {
+		t.Errorf("nothing may be claimed: %+v", c)
+	}
+
+	gone := newRole(roleName, claimed(roleID), deleting())
+	env = ambiguous(fake.NewDB().WithRole(roleName, roleID, ch.StorageLocalDirectory), clusterResolved(t, sharedPolicy()))
+	if obs, err := env.ObserveEntity(ctx, gone, Role, gone.Spec.ForProvider.Name); err != nil || obs.Exists || !obs.Orphaned {
+		t.Errorf("a deleting MR must be released without a DROP: %+v, %v", obs, err)
+	}
+	if exists, err := env.VerifyOwned(ctx, newRole(roleName, claimed(roleID)), Role, roleName); exists || !reason.Is(err, reason.InvalidConfig) {
+		t.Errorf("VerifyOwned() = %t, %v; want InvalidConfig", exists, err)
+	}
+
+	owner := accesstest.OwnedUser(ns, "api", userName, userID, sharedPC)
+	env = ambiguous(fake.NewDB().WithUser(userName, userID, ch.StorageLocalDirectory), clusterResolved(t, sharedPolicy()), owner)
+	if _, err := env.BindGrantee(ctx, newGrant(), Grantee{Kind: User, Name: userName}); !reason.Is(err, reason.ReadOnlyStorage) {
+		t.Errorf("BindGrantee() = %v, want ReadOnlyStorage", err)
+	}
+
+	create := newRole(roleName, claimed(""))
+	env = ambiguous(fake.NewDB().WithEntities(), clusterResolved(t, sharedPolicy()))
+	if err := env.CreateEntity(ctx, create, Role, roleName, "CREATE ROLE `team-a_reader`"); !reason.Is(err, reason.InvalidConfig) || len(env.db.Execs) > 0 {
+		t.Errorf("CreateEntity() = %v, statements %v; want InvalidConfig and none", err, env.db.Execs)
 	}
 }
 

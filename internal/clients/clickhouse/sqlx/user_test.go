@@ -436,6 +436,11 @@ func TestHostsServerForms(t *testing.T) {
 		"FirstZeroRun":             {ips: []string{"2001:0:0:1:0:0:0:1"}, server: stored{ips: []string{"2001::1:0:0:0:1"}}},
 		"UpperCaseHex":             {ips: []string{"FD00::ABCD"}, server: stored{ips: []string{"fd00::abcd"}}},
 		"NotCompatible":            {ips: []string{"::1:0:0/96"}, server: stored{ips: []string{"::1:0:0/96"}}},
+		// The server folds only ASCII letters: with U+017F (long s), which
+		// Unicode folds to s, the name is an ordinary host name [verified on
+		// every supported version].
+		"NameUnicodeFold":   {names: []string{"localho\u017ft"}, server: stored{names: []string{"localho\u017ft"}}},
+		"NameUnicodeFoldUp": {names: []string{"LOCALHO\u017fT"}, server: stored{names: []string{"LOCALHO\u017fT"}}},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -460,6 +465,18 @@ func TestHostsServerForms(t *testing.T) {
 	// A localhost entry still restricts the hosts.
 	if got, _ := NormalizeHosts([]string{"127.0.0.1"}, nil); got.Any() {
 		t.Errorf("a loopback address must not mean ANY: %+v", got)
+	}
+	// A host name that only Unicode folding makes localhost is sent and
+	// compared as it is, never as HOST LOCAL, which would admit every address
+	// of the server host.
+	for _, n := range []string{"localho\u017ft", "LOCALHO\u017fT"} {
+		got, err := NormalizeHosts(nil, []string{n})
+		if err != nil || len(got.Names) != 1 || got.Names[0] != n {
+			t.Errorf("NormalizeHosts(nil, [%q]) = %+v, %v; want the name as it is", n, got, err)
+		}
+		if o := ObservedHosts(nil, []string{LocalHostName}); o.Equal(got) {
+			t.Errorf("%q must not compare equal to HOST LOCAL", n)
+		}
 	}
 }
 

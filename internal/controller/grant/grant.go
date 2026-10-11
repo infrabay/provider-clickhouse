@@ -207,7 +207,17 @@ func (e *External) Observe(ctx context.Context, cr *v1alpha1.Grant) (managed.Ext
 	} else {
 		cr.SetConditions(xpv2.Available())
 	}
-	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: a.Apply(s.withGrantOption, record).Empty()}, nil
+	p := a.Apply(s.withGrantOption, record)
+	if p.Empty() && ownership.PoliciesOf(cr).Update() {
+		// No Update follows an empty plan, so a record that changes without
+		// a statement is saved here: a grant option of record that a broader
+		// row now shows, or one that is no longer wanted and that only a
+		// partial revoke could remove.
+		if err := e.saveRecord(ctx, cr, b.Entity.ID, p.Record); err != nil {
+			return managed.ExternalObservation{}, err
+		}
+	}
+	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: p.Empty()}, nil
 }
 
 // list names privileges in a message, at most maxListed of them.
@@ -345,8 +355,16 @@ func notAllowed(op string) error {
 // and, immediately before the statements, re-checks the grantee binding:
 // the grantee must still exist, be owned and unambiguous, have the UUID
 // bound in Observe, and the access storage must be writable from this
-// endpoint. Once the statements ran it saves the record of the grant option
-// the plan leaves.
+// endpoint.
+//
+// A statement that the server refuses for a missing privilege (497: the
+// identity does not hold it WITH GRANT OPTION, design 9.4) changed nothing,
+// and the other statements do not depend on it, so they still run: a
+// foreign privilege at the target that the identity cannot revoke must not
+// keep the desired privileges from being granted. The refusals are
+// returned once every statement ran. Any other error stops the plan. Once
+// the statements ran, apply saves the record of the grant option that they
+// leave (sqlx.Plan.RecordAfter).
 func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 	ctx = access.SQLContext(ctx, kind, cr)
 	s, err := specOf(cr)
@@ -369,14 +387,12 @@ func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 	granteeID := e.binding.Entity.ID
 	record := recordOf(cr, granteeID)
 	p := a.Apply(s.withGrantOption, record)
-	stmts, err := p.Statements(s.target, s.grantee.Name)
+	steps, err := p.Steps(s.target, s.grantee.Name)
 	if err != nil {
 		return reason.Wrap(reason.Internal, err)
 	}
-	if len(stmts) == 0 {
-		// A record that changed without statements (a grant option no row
-		// shows any more) is saved with the next statements.
-		return nil
+	if len(steps) == 0 {
+		return e.saveRecord(ctx, cr, granteeID, p.Record)
 	}
 	ok, err := e.RebindGrantee(ctx, cr, e.binding)
 	if err != nil {
@@ -385,15 +401,53 @@ func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 	if !ok {
 		return reason.Errorf(reason.DependencyMissing, "grantee %s no longer exists; nothing was granted or revoked", s.grantee)
 	}
-	for _, stmt := range stmts {
-		// 497: the identity lacks the privilege WITH GRANT OPTION (the
-		// server-side ceiling); 509: a privilege at the wrong level; 511 and
-		// 192: the grantee disappeared.
-		if err := e.Client.Exec(ctx, stmt); err != nil {
+	refused := map[sqlx.StepKind]bool{}
+	var denied []error
+	for _, st := range steps {
+		err := e.Client.Exec(ctx, st.SQL)
+		switch {
+		case err == nil:
+		case ch.IsCode(err, ch.CodeAccessDenied):
+			// The server checks every privilege of a GRANT or REVOKE before
+			// it changes any: this statement changed nothing.
+			refused[st.Kind] = true
+			denied = append(denied, ch.WithDefaultReason(err))
+		default:
+			// 509: a privilege at the wrong level; 511 and 192: the grantee
+			// disappeared; or the outcome is unknown. Nothing more is sent,
+			// and the record stays as it was.
 			return ch.WithDefaultReason(err)
 		}
 	}
-	return e.saveRecord(ctx, cr, granteeID, p.Record)
+	if err := e.saveRecord(ctx, cr, granteeID, p.RecordAfter(func(k sqlx.StepKind) bool { return refused[k] })); err != nil {
+		return err
+	}
+	return joinRefusals(denied)
+}
+
+// refusals are the errors of the statements of one plan that the server
+// refused (497); each names the grant the identity lacks. The reason is
+// that of the first.
+type refusals []error
+
+func (r refusals) Error() string {
+	msgs := make([]string, 0, len(r))
+	for _, err := range r {
+		msgs = append(msgs, err.Error())
+	}
+	return strings.Join(msgs, "; ")
+}
+
+func (r refusals) Unwrap() []error { return r }
+
+func joinRefusals(errs []error) error {
+	switch len(errs) {
+	case 0:
+		return nil
+	case 1:
+		return errs[0]
+	}
+	return refusals(errs)
 }
 
 // Delete revokes the desired privileges that are granted at exactly the

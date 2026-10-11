@@ -19,11 +19,13 @@ package access
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/event"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 
@@ -31,6 +33,7 @@ import (
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
 	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/controller/providerconfig"
+	"github.com/infrabay/provider-clickhouse/internal/reason"
 )
 
 // Event reasons shared by the access entity kinds (design 5.2).
@@ -144,6 +147,29 @@ func SQLContext(ctx context.Context, kind string, mg resource.Managed) context.C
 // Design 5.10 lists the reasons that make an MR unavailable.
 func Unavailable(mg resource.Managed, err error) error {
 	mg.SetConditions(xpv2.Unavailable().WithMessage(err.Error()))
+	return err
+}
+
+// unavailableReasons are the reasons that make an MR unavailable (design
+// 5.10).
+var unavailableReasons = []reason.Reason{
+	reason.NotOwned, reason.Replaced, reason.AdoptionRejected, reason.ReadOnlyStorage, reason.PolicyViolation,
+	reason.NameCollision, reason.AmbiguousGrantee, reason.SelfModification, reason.AccessStorageNotReplicated,
+	reason.Unsupported, reason.SecretConflict,
+}
+
+// UnavailableOn sets Ready=False with err as the message when err carries a
+// reason that makes an MR unavailable (design 5.10), and returns err. The
+// re-checks before a write use it, so that what they find shows on Ready as
+// it would in Observe, not only as Synced=False. While the MR is being
+// deleted, Delete has set Ready=False (Deleting), which is kept.
+func UnavailableOn(mg resource.Managed, err error) error {
+	if err == nil || meta.WasDeleted(mg) {
+		return err
+	}
+	if r, ok := reason.Of(err); ok && slices.Contains(unavailableReasons, r) {
+		mg.SetConditions(xpv2.Unavailable().WithMessage(err.Error()))
+	}
 	return err
 }
 

@@ -51,21 +51,26 @@ func recordOf(cr *v1alpha1.Grant, granteeID string) sqlx.PrivilegeSet {
 // saveRecord persists the record of the grant option for the grantee with
 // UUID granteeID with a JSON merge patch on the MR's annotations, or removes
 // the annotation when nothing is recorded. crossplane-runtime does not
-// persist annotations that Update or Delete set.
+// persist annotations that Observe, Update or Delete set. The patch returns
+// the stored object, whose status is that of an earlier reconcile; the
+// status that this reconcile set is kept.
 func (e *External) saveRecord(ctx context.Context, cr *v1alpha1.Grant, granteeID string, rec sqlx.PrivilegeSet) error {
 	_, held := cr.GetAnnotations()[v1alpha1.AnnotationGrantOption]
-	if len(rec) == 0 {
-		if !held {
-			return nil
-		}
-		return ownership.Patch(ctx, e.Kube, cr, nil, []string{v1alpha1.AnnotationGrantOption})
-	}
-	if held && recordOf(cr, granteeID).Equal(rec) {
+	var set map[string]string
+	var remove []string
+	switch {
+	case len(rec) == 0 && !held, held && len(rec) > 0 && recordOf(cr, granteeID).Equal(rec):
 		return nil
+	case len(rec) == 0:
+		remove = []string{v1alpha1.AnnotationGrantOption}
+	default:
+		b, err := json.Marshal(grantOptionRecord{GranteeID: granteeID, Privileges: rec.Sorted()})
+		if err != nil {
+			return err
+		}
+		set = map[string]string{v1alpha1.AnnotationGrantOption: string(b)}
 	}
-	b, err := json.Marshal(grantOptionRecord{GranteeID: granteeID, Privileges: rec.Sorted()})
-	if err != nil {
-		return err
-	}
-	return ownership.Patch(ctx, e.Kube, cr, map[string]string{v1alpha1.AnnotationGrantOption: string(b)}, nil)
+	status := cr.Status.DeepCopy()
+	defer func() { cr.Status = *status }()
+	return ownership.Patch(ctx, e.Kube, cr, set, remove)
 }

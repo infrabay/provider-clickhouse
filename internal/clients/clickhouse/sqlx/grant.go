@@ -537,9 +537,35 @@ type Plan struct {
 	Revoke            []Revocation
 	RevokeGrantOption []Revocation
 	// Record is the Grant's record of the grant option it gave at the
-	// target once the statements ran (see Analysis.Apply). Revoke leaves it
+	// target once every statement ran (see Analysis.Apply). Revoke leaves it
 	// empty: a deleted Grant gave nothing.
 	Record PrivilegeSet
+
+	// granted are the flags that only the GRANT puts into Record; revoked
+	// and revokedGO are the flags of the record before the plan that the
+	// REVOKE and the REVOKE GRANT OPTION FOR take out of it (RecordAfter).
+	granted, revoked, revokedGO PrivilegeSet
+}
+
+// A StepKind is the kind of a statement of a Plan.
+type StepKind int
+
+// Statement kinds, in the order in which a plan runs them.
+const (
+	// StepRevoke is REVOKE <flags> ON <target> FROM <grantee>.
+	StepRevoke StepKind = iota
+	// StepRevokeGrantOption is REVOKE GRANT OPTION FOR <flags> ON <target>
+	// FROM <grantee>.
+	StepRevokeGrantOption
+	// StepGrant is GRANT <flags> ON <target> TO <grantee>
+	// [WITH GRANT OPTION].
+	StepGrant
+)
+
+// A Step is one statement of a Plan.
+type Step struct {
+	Kind StepKind
+	SQL  string
 }
 
 // Empty reports whether the plan has no statements.
@@ -680,10 +706,10 @@ func (a *Analysis) canRevokeGO(st pointState, l string, regrant func(string) boo
 // granting again on every reconcile, and a flag of record whose grant option
 // is no longer wanted has it revoked although no row shows it (step 4, which
 // creates no partial revoke where no broader row with grant option is
-// shown). Plan.Record is the record once the statements ran; the Grant saves
-// it with them. The Grant is up to date exactly when the plan is empty: a
-// record entry that no row confirms any more, where the server shows the
-// grant option, is dropped with the next statements.
+// shown). Plan.Record is the record once the statements ran (see
+// Analysis.record); the Grant saves it with them, or, when the plan has no
+// statement, on its own. The Grant is up to date exactly when the plan is
+// empty.
 func (a *Analysis) Apply(withGrantOption bool, record PrivilegeSet) Plan {
 	p := Plan{WithGrantOption: withGrantOption}
 	wantGO := func(l string) bool { return withGrantOption && a.desired.Has(l) }
@@ -733,7 +759,31 @@ func (a *Analysis) Apply(withGrantOption bool, record PrivilegeSet) Plan {
 	if len(p.Grant) == 0 {
 		p.WithGrantOption = false
 	}
-	p.Record = PrivilegeSet{}
+	a.record(&p, withGrantOption, record, removed, removedGO)
+	return p
+}
+
+// record sets the Grant's record of the grant option that the plan p
+// leaves at the target (Plan.Record), and what a statement that the server
+// refuses changes in it (Plan.RecordAfter). old is the record before the
+// plan; removed and removedGO are the flags and grant options that the
+// plan's REVOKE and REVOKE GRANT OPTION FOR remove.
+//
+// With withGrantOption a desired flag is recorded when the plan grants it
+// WITH GRANT OPTION, when a row shows its grant option at the target, or
+// when it was recorded and the server may hide its grant option at the
+// target. A flag of record is forgotten where a broader row shows its grant
+// option on the whole target: the grant option at the target adds nothing
+// there, and whatever revokes the broader one revokes it too (a REVOKE
+// removes its flags from every object below its own), so once the broader
+// grant option is gone, the Grant grants its own again instead of trusting
+// a stale record. A flag that the plan's REVOKE removes is recorded only if
+// the GRANT gives it again. Without withGrantOption nothing is recorded:
+// the plan revokes every grant option of record that it can revoke without
+// cutting a partial revoke into a broader one, and the others are covered
+// by a broader grant option.
+func (a *Analysis) record(p *Plan, withGrantOption bool, old, removed, removedGO PrivilegeSet) {
+	p.Record, p.granted = PrivilegeSet{}, PrivilegeSet{}
 	if withGrantOption {
 		for l := range a.desired {
 			granted := p.WithGrantOption && slices.Contains(p.Grant, l)
@@ -741,12 +791,53 @@ func (a *Analysis) Apply(withGrantOption bool, record PrivilegeSet) Plan {
 			for _, st := range a.points {
 				shown = shown || st.exactGO.Has(l)
 			}
-			if granted || shown || (record.Has(l) && a.Hidden()) {
+			covered := a.all(l, func(st pointState) PrivilegeSet { return st.aboveGO })
+			kept := old.Has(l) && a.Hidden() && !covered
+			switch {
+			case (shown || kept) && !removed.Has(l) && !removedGO.Has(l):
 				p.Record[l] = struct{}{}
+			case granted:
+				p.Record[l] = struct{}{}
+				p.granted[l] = struct{}{}
 			}
 		}
 	}
-	return p
+	p.revoked, p.revokedGO = PrivilegeSet{}, PrivilegeSet{}
+	for l := range old {
+		if removed.Has(l) {
+			p.revoked[l] = struct{}{}
+		}
+		if removedGO.Has(l) {
+			p.revokedGO[l] = struct{}{}
+		}
+	}
+}
+
+// RecordAfter returns the record once the plan's statements ran, where
+// refused reports the kinds of statement that the server refused for a
+// missing privilege (497). The server checks every privilege of a GRANT or
+// REVOKE before it changes any [verified on every supported version], so a
+// refused statement changed nothing: what only the GRANT would have recorded
+// stays out of the record, and the flags of record that a REVOKE would have
+// taken out stay in it. With nothing refused it is Record.
+func (p Plan) RecordAfter(refused func(StepKind) bool) PrivilegeSet {
+	out := PrivilegeSet{}
+	for l := range p.Record {
+		if !refused(StepGrant) || !p.granted.Has(l) {
+			out[l] = struct{}{}
+		}
+	}
+	if refused(StepRevoke) {
+		for l := range p.revoked {
+			out[l] = struct{}{}
+		}
+	}
+	if refused(StepRevokeGrantOption) {
+		for l := range p.revokedGO {
+			out[l] = struct{}{}
+		}
+	}
+	return out
 }
 
 // Revoke returns the plan of Delete: for every desired flag granted at
@@ -785,29 +876,42 @@ func (a *Analysis) Revoke(record PrivilegeSet) Plan {
 	return Plan{Revoke: revoke.sorted(), RevokeGrantOption: revokeGO.sorted()}
 }
 
-// Statements renders the plan for the target and grantee, in the order
-// REVOKE, REVOKE GRANT OPTION FOR, GRANT.
-func (p Plan) Statements(t GrantTarget, grantee string) ([]string, error) {
-	var out []string
+// Steps renders the plan for the target and grantee, in the order REVOKE,
+// REVOKE GRANT OPTION FOR, GRANT.
+func (p Plan) Steps(t GrantTarget, grantee string) ([]Step, error) {
+	var out []Step
 	for _, r := range []struct {
-		revs     []Revocation
-		goOption bool
-	}{{p.Revoke, false}, {p.RevokeGrantOption, true}} {
+		kind StepKind
+		revs []Revocation
+	}{{StepRevoke, p.Revoke}, {StepRevokeGrantOption, p.RevokeGrantOption}} {
 		if len(r.revs) == 0 {
 			continue
 		}
-		s, err := RevokeStmt(r.revs, t, grantee, r.goOption)
+		s, err := RevokeStmt(r.revs, t, grantee, r.kind == StepRevokeGrantOption)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, s)
+		out = append(out, Step{Kind: r.kind, SQL: s})
 	}
 	if len(p.Grant) > 0 {
 		s, err := GrantStmt(p.Grant, t, grantee, p.WithGrantOption)
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, s)
+		out = append(out, Step{Kind: StepGrant, SQL: s})
+	}
+	return out, nil
+}
+
+// Statements returns the statements of Steps.
+func (p Plan) Statements(t GrantTarget, grantee string) ([]string, error) {
+	steps, err := p.Steps(t, grantee)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, s := range steps {
+		out = append(out, s.SQL)
 	}
 	return out, nil
 }

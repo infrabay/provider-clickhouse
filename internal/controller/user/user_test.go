@@ -655,6 +655,37 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+// TestUpdateRecheckUnavailable: what the re-check before an ALTER finds
+// makes the user unavailable, as it would in Observe (design 5.10): an
+// endpoint that reaches two servers with local user directories, and a user
+// replaced since Observe. Nothing is sent.
+func TestUpdateRecheckUnavailable(t *testing.T) {
+	ctx := context.Background()
+	for name, tc := range map[string]struct {
+		between func(e *env)
+		reason  reason.Reason
+	}{
+		"MultipleServers": {between: func(e *env) { e.cl.Servers = []string{"s1", "s2"} }, reason: reason.AccessStorageNotReplicated},
+		"Replaced":        {between: func(e *env) { e.db.WithUser(userName, otherID, ch.StorageLocalDirectory) }, reason: reason.Replaced},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mr := newUser(owned(userID), managedFields("team-a_db", ""))
+			s := newServer(fake.Upstream268, modRow(func(r *row) { r.db = "other" }), "")
+			e := newEnv(t, s, nil, recorded(recordedPassword, ""))
+			if o, err := e.Observe(ctx, mr); err != nil || o.ResourceUpToDate || readyStatus(mr) != "True" {
+				t.Fatalf("Observe() = %+v, %v, Ready %s; want a drifted, available user", o, err, readyStatus(mr))
+			}
+			tc.between(e)
+			if _, err := e.Update(ctx, mr); !reason.Is(err, tc.reason) {
+				t.Fatalf("Update() = %v, want %s", err, tc.reason)
+			}
+			if readyStatus(mr) != "False" || len(e.db.Execs) > 0 {
+				t.Errorf("Ready %s, statements %v; want False and none", readyStatus(mr), e.db.Execs)
+			}
+		})
+	}
+}
+
 // TestCreateObserveUpdate runs a user through its life on a scripted server
 // that applies the statements: the connection details of Create are what
 // the next Observe finds up to date.

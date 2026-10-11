@@ -339,8 +339,10 @@ func (e *Env) CreateEntity(ctx context.Context, mg resource.Managed, kind Entity
 // provider's own identity, the access storage (CheckWritable), and that the
 // entity's current UUID equals owned-id and it is not in users.xml. exists
 // is false when the entity no longer exists: the caller then returns without
-// error and the next Observe decides.
-func (e *Env) VerifyOwned(ctx context.Context, mg resource.Managed, kind EntityKind, name string) (bool, error) {
+// error and the next Observe decides. A failed check sets Ready=False
+// (UnavailableOn).
+func (e *Env) VerifyOwned(ctx context.Context, mg resource.Managed, kind EntityKind, name string) (exists bool, err error) {
+	defer func() { err = UnavailableOn(mg, err) }()
 	claim := ownership.ClaimOf(mg)
 	if !ownership.ClaimValid(mg) || claim.OwnedID == "" {
 		return false, reason.Errorf(reason.NotOwned, "%s %q is not claimed by this resource; nothing was changed", kind, name)
@@ -363,7 +365,7 @@ func (e *Env) VerifyOwned(ctx context.Context, mg resource.Managed, kind EntityK
 		return false, err
 	}
 	if readOnly {
-		return false, reason.Errorf(reason.ReadOnlyStorage, "%s %q is in the read-only user directory %q (such as users.xml/users.d) and cannot be managed", kind, name, ent.Storage)
+		return false, reason.Errorf(reason.ReadOnlyStorage, "%s %q is in user directory %q, which is read-only (such as users.xml/users.d) or shares its name with a read-only directory, and cannot be managed", kind, name, ent.Storage)
 	}
 	if ent.ID != claim.OwnedID {
 		return false, reason.Errorf(reason.Replaced, "%s %q was replaced since it was observed (id %s, now %s); nothing was changed", kind, name, claim.OwnedID, ent.ID)

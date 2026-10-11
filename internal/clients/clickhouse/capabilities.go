@@ -49,10 +49,14 @@ const (
 	privilegeDBCommentMod = "ALTER MODIFY DATABASE COMMENT"
 )
 
-// System tables and columns that only some server versions have.
+// System tables and columns that only some server versions have, and
+// tables that an optional grant opens.
 const (
 	TableUsers  = "users"
 	TableGrants = "grants"
+	// TableSettingsProfileElements needs SELECT on it, which only Users with
+	// a managed settingsProfile require (design 9.4).
+	TableSettingsProfileElements = "settings_profile_elements"
 
 	// ColumnValidUntil is system.users.valid_until: absent on 25.3 and 25.8,
 	// Array(DateTime) on Antalya 26.3 and 26.6, Array(DateTime64(0)) on 26.8.
@@ -147,6 +151,21 @@ func probe[T any](ctx context.Context, c *Capabilities, key string, fn func(cont
 	return v, nil
 }
 
+// TableDenied reports whether a read of system.<table> was refused for a
+// missing grant (497) within CapabilityTTL; see DenyTable.
+func (c *Capabilities) TableDenied(table string) bool {
+	_, ok := c.get("denied/" + table)
+	return ok
+}
+
+// DenyTable records that a read of system.<table> was refused for a missing
+// grant (497). A best-effort read, such as the late initialization of
+// User.settingsProfile, skips the table while TableDenied reports it, so
+// that an optional grant left out does not make every poll of every
+// resource send a query the server denies. The record expires like a probe
+// result, so a grant given later is picked up.
+func (c *Capabilities) DenyTable(table string) { c.put("denied/"+table, true) }
+
 // JWTUsers reports whether the server accepts IDENTIFIED WITH jwt (Altinity
 // Antalya). The probe has no side effects. 36 BAD_ARGUMENTS ("CREATE USER is
 // not supported for JWT") and 62 SYNTAX_ERROR mean unsupported; any other
@@ -224,11 +243,22 @@ func (c *Capabilities) AccessStorage(ctx context.Context, db DB) (string, error)
 }
 
 // FirstWritableDirectory returns the type of the first writable directory.
+// When a read-only directory shares its name, the entities of the two
+// cannot be told apart and count as read-only (StorageReadOnly), so the
+// provider could never manage an entity it creates there: that is
+// InvalidConfig too.
 func FirstWritableDirectory(dirs []UserDirectory) (string, error) {
 	for _, d := range dirs {
-		if d.Writable() {
-			return d.Type, nil
+		if !d.Writable() {
+			continue
 		}
+		for _, o := range dirs {
+			if o.Name == d.Name && !o.Writable() {
+				return "", reason.Errorf(reason.InvalidConfig,
+					"user directory %q, where new access entities are stored, shares its name with a read-only user directory, so their entities cannot be told apart; give each user directory its own <name> in the server configuration", d.Name)
+			}
+		}
+		return d.Type, nil
 	}
 	return "", reason.Errorf(reason.InvalidConfig, "the server has no writable user directory")
 }
@@ -237,21 +267,33 @@ func FirstWritableDirectory(dirs []UserDirectory) (string, error) {
 // entity refuses writes, given the entity's storage (system.users.storage or
 // system.roles.storage). That is the name of the directory, not its type: a
 // configuration may rename users_xml (<users_xml><name>...</name>), so the
-// name is looked up in system.user_directories. A name that is not among
-// the cached directories is looked up once more without the cache (the
-// server reads its user directories only at start, so a restart may have
-// changed them); a name that is still unknown counts as read-only, so the
-// provider never writes to an entity whose directory it cannot tell.
+// name is looked up in system.user_directories. Several directories may
+// share a name (two local directories without a <name> are both called
+// local_directory), and the storage then does not tell which one holds the
+// entity: the name counts as read-only unless every directory of that name
+// is writable. A name that is not among the cached directories is looked up
+// once more without the cache (the server reads its user directories only
+// at start, so a restart may have changed them); a name that is still
+// unknown counts as read-only. So the provider never writes to an entity
+// whose directory it cannot tell.
 func (c *Capabilities) StorageReadOnly(ctx context.Context, db DB, storage string) (bool, error) {
 	for refreshed := false; ; refreshed = true {
 		dirs, err := c.UserDirectories(ctx, db)
 		if err != nil {
 			return false, err
 		}
+		found := false
 		for _, d := range dirs {
-			if d.Name == storage {
-				return !d.Writable(), nil
+			if d.Name != storage {
+				continue
 			}
+			if !d.Writable() {
+				return true, nil
+			}
+			found = true
+		}
+		if found {
+			return false, nil
 		}
 		if refreshed {
 			return true, nil

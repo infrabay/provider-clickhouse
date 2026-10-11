@@ -27,6 +27,29 @@ func TestRedactLiterals(t *testing.T) {
 		"EscapedQuote": {`BY 'se\'cret' x`, "BY '***' x"},
 		"EscapedSlash": {`BY 'a\\' x 'b'`, "BY '***' x '***'"},
 		"Unterminated": {"near 'abc", "near '***"},
+		// The server's messages, read on every supported version: 497 for a
+		// statement that carries IDENTIFIED keeps the missing grant, and a
+		// syntax error keeps no literal of the statement it quotes.
+		"MissingGrant": {"provider-clickhouse: Not enough privileges. To execute this query, it's necessary to have the grant CREATE USER ON zz_u",
+			"provider-clickhouse: Not enough privileges. To execute this query, it's necessary to have the grant CREATE USER ON zz_u"},
+		"MissingGrantHint": {"it's necessary to have the grant SELECT, ALTER UPDATE ON app.* WITH GRANT OPTION. (Missing permissions: ALTER UPDATE ON app.*). You can try to use the `GRANT CURRENT GRANTS(...)` statement",
+			"it's necessary to have the grant SELECT, ALTER UPDATE ON app.* WITH GRANT OPTION. (Missing permissions: ALTER UPDATE ON app.*). You can try to use the `GRANT CURRENT GRANTS(...)` statement"},
+		"SyntaxErrorAtLiteral": {"Syntax error: failed at position 48 ('6257310c'): '6257310c' SALT '00112233'. Expected one of: BY, end of query",
+			"Syntax error: failed at position 48 ('***'): '***' SALT '***'. Expected one of: BY, end of query"},
+		"SyntaxErrorAfter": {"Syntax error: failed at position 118 (SALTY): SALTY '00112233'. Expected one of: SALT, VALID UNTIL",
+			"Syntax error: failed at position 118 (SALTY): SALTY '***'. Expected one of: SALT, VALID UNTIL"},
+		// An apostrophe in a backtick-quoted name is no quote: taking it for
+		// one would print the hash and the salt that follow.
+		"QuoteInIdentifier": {"failed at position 13 (`o'neil`): `o'neil` IDENTIFIED WITH sha256_hash BY '6257310c' SALT '00112233'",
+			"failed at position 13 (`o'neil`): `o'neil` IDENTIFIED WITH sha256_hash BY '***' SALT '***'"},
+		"EscapedBacktick":    {"`a\\`'b` BY 'x'", "`a\\`'b` BY '***'"},
+		"UnclosedBacktick":   {"near `abc BY 'x'", "near `abc BY '***'"},
+		"ContractionAtEnd":   {"BY 'x' it's", "BY '***' it's"},
+		"Contractions":       {"doesn't, you're, it'll: 'x'", "doesn't, you're, it'll: '***'"},
+		"QuoteAfterLetter":   {"BY'x' y", "BY'***' y"},
+		"QuoteAfterLetterS":  {"BY'sx' y", "BY'***' y"},
+		"QuoteBeforeLetter":  {"BY 'x'y", "BY '***'y"},
+		"LiteralWithLetters": {"BY 'abc' SALT 'def'", "BY '***' SALT '***'"},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

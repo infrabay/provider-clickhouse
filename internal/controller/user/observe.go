@@ -177,8 +177,14 @@ func (e *External) read(ctx context.Context, cr *v1alpha1.User, name, id string,
 	// The profile elements need SELECT ON system.settings_profile_elements.
 	// A managed settingsProfile requires it; late initialization is
 	// best-effort and is skipped without it, so that users which do not set
-	// settingsProfile need no such grant.
-	if lateInit := cr.Spec.ForProvider.SettingsProfile == nil && ownership.PoliciesOf(cr).LateInitialize(); d.settingsProfile != nil || lateInit {
+	// settingsProfile need no such grant. Once the server refused the read,
+	// late initialization skips it for a while (ch.Capabilities.DenyTable),
+	// so that every poll of every user does not send a query that the
+	// server denies.
+	caps := e.Client.Capabilities()
+	lateInit := cr.Spec.ForProvider.SettingsProfile == nil && ownership.PoliciesOf(cr).LateInitialize() &&
+		!caps.TableDenied(ch.TableSettingsProfileElements)
+	if d.settingsProfile != nil || lateInit {
 		err := e.Client.Query(ctx, sqlx.QueryUserSettings, ch.Params{"name": name}, func(r ch.Row) error {
 			var s settingsElement
 			if err := r.Scan(&s.profile, &s.setting); err != nil {
@@ -191,6 +197,7 @@ func (e *External) read(ctx context.Context, cr *v1alpha1.User, name, id string,
 		case err == nil:
 			o.settingsRead = true
 		case d.settingsProfile == nil && ch.IsCode(err, ch.CodeAccessDenied):
+			caps.DenyTable(ch.TableSettingsProfileElements)
 			o.settings = nil
 		default:
 			return nil, ch.WithDefaultReason(err)

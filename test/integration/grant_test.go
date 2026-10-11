@@ -123,7 +123,9 @@ func TestGrant(t *testing.T) {
 		t.Run("ExpansionModel", func(t *testing.T) { testGrantExpansionModel(t, g) })
 		t.Run("HiddenGrantOption", func(t *testing.T) { testGrantHiddenOption(t, g) })
 		t.Run("HiddenGrantOptionModel", func(t *testing.T) { testGrantHiddenOptionModel(t, g) })
+		t.Run("HiddenGrantOptionBroader", func(t *testing.T) { testGrantHiddenOptionBroader(t, g) })
 		t.Run("PlanOrder", func(t *testing.T) { testGrantPlanOrder(t, g) })
+		t.Run("UnrevocableForeign", func(t *testing.T) { testGrantUnrevocableForeign(t, g) })
 		bystander.unchanged(t)
 	})
 }
@@ -1006,6 +1008,112 @@ func testGrantHiddenOption(t *testing.T, g *grantFixture) {
 	g.deleteGrant(t, "g12-raw")
 	g.deleteGrant(t, "g12-db")
 	g.expectRoleGrants(t, "app_g12")
+}
+
+// testGrantHiddenOptionBroader: the server hides the grant option at
+// app_db15.events (a sibling events_raw), and another Grant of the role
+// turns the option on at app_db15.* and off again. Its REVOKE GRANT OPTION
+// FOR also removes the option at app_db15.events, as delegation shows. The
+// Grant on app_db15.events forgets its record while the broader option is
+// shown, also without a statement, so it grants its own option again once
+// the broader one is gone; the same when it turns its option off under the
+// broader one and on again after that is gone (D-35).
+func testGrantHiddenOptionBroader(t *testing.T, g *grantFixture) {
+	role := "app_g15"
+	g.ownedRole(t, "reader15", role)
+	raw := roleGrantee("app_db15", "INSERT")
+	raw.Table, raw.Role = new("events_raw"), new(role)
+	g.newGrant("g15-raw", raw)
+	g.mustReconcile(t, "g15-raw")
+	db := roleGrantee("app_db15", "SELECT")
+	db.Role = new(role)
+	g.newGrant("g15-db", db)
+	g.mustReconcile(t, "g15-db")
+	p := roleGrantee("app_db15", "SELECT")
+	p.Table, p.Role, p.WithGrantOption = new("events"), new(role), new(true)
+	g.newGrant("g15", p)
+	if o := g.mustReconcile(t, "g15"); !o.updated {
+		t.Fatalf("grant the option: %s", o)
+	}
+	setOption := func(name string, on bool) {
+		t.Helper()
+		g.h.mutate(name, func(mr *v1alpha1.Grant) { mr.Spec.ForProvider.WithGrantOption = new(on) })
+		g.mustReconcile(t, name)
+	}
+	record := func() string { return g.h.get("g15").GetAnnotations()[v1alpha1.AnnotationGrantOption] }
+	delegates := func() bool { return g.delegates(t, role, "SELECT", "app_db15.events") }
+	if !delegates() || record() == "" {
+		t.Fatalf("the role must hold the option, recorded: %q", record())
+	}
+
+	// The broader option is shown: the record is forgotten.
+	setOption("g15-db", true)
+	g.upToDate(t, "g15")
+	if record() != "" {
+		t.Errorf("the record of an option that a broader shown one covers must be forgotten: %q", record())
+	}
+	// It is revoked, and the option at the target with it.
+	setOption("g15-db", false)
+	if delegates() {
+		t.Fatal("REVOKE GRANT OPTION FOR SELECT ON app_db15.* must remove the option below it")
+	}
+	if o := g.mustReconcile(t, "g15"); !o.updated || !delegates() {
+		t.Fatalf("the option must be granted again: %s", o)
+	}
+	g.upToDate(t, "g15")
+
+	// Turned off under the broader option, which is then revoked; turned on
+	// again.
+	setOption("g15-db", true)
+	g.h.mutate("g15", func(mr *v1alpha1.Grant) { mr.Spec.ForProvider.WithGrantOption = new(false) })
+	g.upToDate(t, "g15")
+	if record() != "" {
+		t.Errorf("the record must be dropped although no statement ran: %q", record())
+	}
+	setOption("g15-db", false)
+	g.h.mutate("g15", func(mr *v1alpha1.Grant) { mr.Spec.ForProvider.WithGrantOption = new(true) })
+	if o := g.mustReconcile(t, "g15"); !o.updated || !delegates() {
+		t.Fatalf("turned on again: %s", o)
+	}
+	g.upToDate(t, "g15")
+
+	for _, n := range []string{"g15", "g15-db", "g15-raw"} {
+		g.deleteGrant(t, n)
+	}
+	if delegates() {
+		t.Error("the option must be revoked with the Grant")
+	}
+	g.expectRoleGrants(t, role)
+}
+
+// testGrantUnrevocableForeign: a foreign privilege at the target that the
+// identity cannot revoke (it holds ALTER UPDATE nowhere WITH GRANT OPTION)
+// does not keep the desired privilege from being granted. The refused
+// REVOKE changes nothing and is reported as PermissionDenied naming the
+// grant the identity lacks; once an administrator revokes the privilege,
+// the Grant is up to date (design 9.4).
+func testGrantUnrevocableForeign(t *testing.T, g *grantFixture) {
+	g.ownedRole(t, "reader14", "app_g14")
+	g.srv.exec(t, "GRANT ALTER UPDATE ON app_db14.* TO app_g14")
+	p := roleGrantee("app_db14", "SELECT")
+	p.Role = new("app_g14")
+	g.newGrant("g14", p)
+	for i := range 2 {
+		o := g.h.reconcile("g14")
+		if !reason.Is(o.err, reason.PermissionDenied) || !strings.Contains(o.err.Error(), "ALTER UPDATE ON app_db14.* WITH GRANT OPTION") {
+			t.Fatalf("reconcile %d: %s", i+1, o)
+		}
+		g.expectRoleGrants(t, "app_g14", "ALTER UPDATE app_db14.*", "SELECT app_db14.*")
+	}
+	// The role holds what the Grant asks for: Ready, but not up to date.
+	mr, obs, err := g.observe(t, "g14")
+	if err != nil || !obs.ResourceExists || obs.ResourceUpToDate || mr.GetCondition(xpv2.TypeReady).Status != corev1.ConditionTrue {
+		t.Fatalf("observe: %+v, %v, %+v", obs, err, mr.GetCondition(xpv2.TypeReady))
+	}
+	g.srv.exec(t, "REVOKE ALTER UPDATE ON app_db14.* FROM app_g14")
+	g.upToDate(t, "g14")
+	g.deleteGrant(t, "g14")
+	g.expectRoleGrants(t, "app_g14")
 }
 
 // testGrantHiddenOptionModel checks the analysis against the server: for

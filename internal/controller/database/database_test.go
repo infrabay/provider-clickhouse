@@ -801,6 +801,12 @@ func TestUpdate(t *testing.T) {
 			if diff := cmp.Diff(tc.wantStmts, tc.db.Execs); diff != "" {
 				t.Errorf("statements -want +got:\n%s", diff)
 			}
+			// What the re-check finds makes the MR unavailable as it would in
+			// Observe (design 5.10).
+			unavailable := reason.Is(err, reason.Replaced) || reason.Is(err, reason.NotOwned)
+			if got := readyStatus(tc.mr); (got == "False") != unavailable {
+				t.Errorf("Ready = %s after %v", got, err)
+			}
 		})
 	}
 }
@@ -922,6 +928,60 @@ func TestDelete(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.wantStmts, tc.db.Execs); diff != "" {
 				t.Errorf("statements -want +got:\n%s", diff)
+			}
+		})
+	}
+}
+
+// TestManagementPolicyGuards: crossplane-runtime never calls a write that
+// the management policies leave out, and the Database does not depend on
+// it (D-26): a deleting MR without Delete is released without SQL, even
+// for its own empty database, and Create and Update refuse without their
+// policies.
+func TestManagementPolicyGuards(t *testing.T) {
+	ctx := context.Background()
+	keep := []xpv2.ManagementAction{xpv2.ManagementActionObserve, xpv2.ManagementActionCreate, xpv2.ManagementActionUpdate, xpv2.ManagementActionLateInitialize}
+	server := func() *fake.DB {
+		return owns(scripted(dbUUID, "Atomic", "Atomic", ""), dbUUID).
+			On(sqlx.CheckGrantShowTables(dbName), fake.Row(uint8(1))).
+			On(sqlx.QueryDatabaseTableCount, fake.Row(uint64(0)))
+	}
+
+	mr := newDB(owned(dbUUID), beingDeleted(), managementPolicies(keep...))
+	db, rec := server(), &recorder{}
+	e := &External{Client: fake.NewClient(db), Resolved: resolved(t, "", false), Kube: kubeWith(t, mr), Recorder: rec}
+	if o, err := e.Observe(ctx, mr); err != nil || o.ResourceExists {
+		t.Errorf("Observe() while deleting without Delete = %+v, %v; want absent", o, err)
+	}
+	if got := rec.reasons(); len(got) != 1 || got[0] != string(ReasonOrphaned) {
+		t.Errorf("events = %v, want Orphaned", got)
+	}
+	if len(db.Seen) > 0 {
+		t.Errorf("no SQL may run: %v", db.Seen)
+	}
+	if _, err := e.Delete(ctx, mr); err != nil || len(db.Execs) > 0 {
+		t.Errorf("Delete() without Delete = %v, statements %v; want nothing dropped", err, db.Execs)
+	}
+
+	for name, tc := range map[string]struct {
+		policies []xpv2.ManagementAction
+		write    func(e *External, mr *v1alpha1.Database) error
+	}{
+		"CreateWithoutCreate": {policies: []xpv2.ManagementAction{xpv2.ManagementActionObserve, xpv2.ManagementActionUpdate}, write: func(e *External, mr *v1alpha1.Database) error {
+			_, err := e.Create(ctx, mr)
+			return err
+		}},
+		"UpdateWithoutUpdate": {policies: []xpv2.ManagementAction{xpv2.ManagementActionObserve, xpv2.ManagementActionCreate}, write: func(e *External, mr *v1alpha1.Database) error {
+			_, err := e.Update(ctx, mr)
+			return err
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			mr := newDB(owned(dbUUID), atomic("new"), managementPolicies(tc.policies...))
+			db := server()
+			e := &External{Client: fake.NewClient(db), Resolved: resolved(t, "", false), Kube: kubeWith(t, mr), Recorder: &recorder{}}
+			if err := tc.write(e, mr); !reason.Is(err, reason.Internal) || len(db.Execs) > 0 {
+				t.Errorf("write = %v, statements %v; want Internal and none", err, db.Execs)
 			}
 		})
 	}

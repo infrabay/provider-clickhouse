@@ -17,7 +17,9 @@ metadata:
       in a Secret. See https://github.com/infrabay/provider-clickhouse.
 spec:
   crossplane:
-    # Must equal the oldest Crossplane version the end-to-end tests run.
+    # The oldest Crossplane release with namespaced managed resources. The
+    # end-to-end job that will run it on kind is not written yet (design
+    # 10.4, OQ-34); the end-to-end tests run the controllers on envtest.
     version: ">=v2.0.0"
   # Managed resource controllers start once their CRDs are activated
   # (ManagedResourceActivationPolicy, see examples/mrap.yaml).

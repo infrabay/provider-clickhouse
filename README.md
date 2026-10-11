@@ -24,7 +24,8 @@ services are a different thing.
 
 > **Status: alpha.** The API is `clickhouse.m.infrabay.io/v1alpha1` and may
 > change between minor releases. The full design is in
-> [`docs/design.md`](docs/design.md).
+> [`docs/design.md`](docs/design.md); known limitations are listed
+> [below](#known-limitations).
 
 ## Kinds
 
@@ -38,7 +39,8 @@ services are a different thing.
 | `RoleGrant` | `chrolegrant` | membership of one user or role in one role, with or without the admin option |
 
 Every kind is packaged together with its controller (a unit test keeps the
-two in sync), and every kind is namespaced.
+two in sync). Every managed resource kind is namespaced, and so is
+`ProviderConfig`; `ClusterProviderConfig` is cluster-scoped.
 
 ## Compatibility
 
@@ -380,9 +382,35 @@ The identity then also needs:
 an Upjet provider for self-hosted SQL objects, covers settings profiles, row
 policies and masking policies, which this provider does not manage yet.
 
+## Known limitations
+
+- ClickHouse leaves some grant options out of `system.grants` and
+  `SHOW GRANTS`. A `Grant` with `withGrantOption` records the option it gave,
+  but it cannot see the option being revoked where the server hides it, by
+  someone else or by a broader `REVOKE GRANT OPTION FOR` it did not observe:
+  it then reports up to date although the grantee cannot delegate. Removing
+  the annotation `clickhouse.m.infrabay.io/grant-option` makes it grant the
+  option again ([runbook](docs/operations.md#grant-options-the-server-does-not-list),
+  design OQ-31 and OQ-33).
+- A privilege that someone else granted at a `Grant`'s target, and that the
+  provider identity does not hold `WITH GRANT OPTION`, cannot be revoked: the
+  `Grant` still grants what it asks for, and reports the refused `REVOKE` as
+  `PermissionDenied` until an administrator revokes the privilege.
+- User directories must have distinct names: when a read-only directory
+  shares the name of the one where new entities are stored, the provider
+  writes no users, roles or grants (`InvalidConfig`, see the
+  [runbook](docs/operations.md#user-directories-that-share-a-name)).
+- Detecting an endpoint that reaches several servers with local user
+  directories is best effort (design OQ-20).
+- `docs/auth.md`, `docs/security.md`, `docs/upgrade.md`, generated API
+  docs, quick-start example directories and an end-to-end job on kind are
+  planned (design OQ-34).
+
 ## Documentation
 
 - [`docs/design.md`](docs/design.md): the design of v1alpha1.
+- [`docs/operations.md`](docs/operations.md): restores and adoption, lost
+  creates, password rotation, stuck deletions and other procedures.
 - [`DEVELOPMENT.md`](DEVELOPMENT.md): building, testing and releasing.
 - [`CONTRIBUTING.md`](CONTRIBUTING.md): how to contribute.
 - [`SECURITY.md`](SECURITY.md): how to report a vulnerability.

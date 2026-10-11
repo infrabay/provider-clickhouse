@@ -135,8 +135,31 @@ func hostIPEntry(s string) (ip string, local bool, err error) {
 }
 
 // isLocalName reports whether the server stores the host name n as HOST
-// LOCAL: localhost in any case.
-func isLocalName(n string) bool { return strings.EqualFold(n, LocalHostName) }
+// LOCAL: localhost in any case. The server folds only ASCII letters, so
+// 'localhoſt' (U+017F, which Unicode folds to s) is an ordinary host name
+// [verified on every supported version]; strings.EqualFold would match it.
+func isLocalName(n string) bool { return equalFoldASCII(n, LocalHostName) }
+
+// equalFoldASCII reports whether a and b are equal when ASCII letters are
+// compared case-insensitively; every other byte must be equal.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		if lowerASCII(a[i]) != lowerASCII(b[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func lowerASCII(c byte) byte {
+	if 'A' <= c && c <= 'Z' {
+		return c + 'a' - 'A'
+	}
+	return c
+}
 
 // maskBits returns the prefix length of a mask written as a decimal prefix
 // length or as an address of the same family as addr.
@@ -243,7 +266,7 @@ func ObservedHosts(ips, names []string) Hosts {
 	out := Hosts{}
 	for _, s := range ips {
 		addr, mask, hasMask := strings.Cut(s, "/")
-		if strings.EqualFold(addr, pocoMappedZero) {
+		if equalFoldASCII(addr, pocoMappedZero) {
 			if s = pocoMappedZero + "0.0.0.0"; hasMask {
 				s += "/" + mask
 			}

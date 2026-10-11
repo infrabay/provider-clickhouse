@@ -250,7 +250,7 @@ func Decide(mg resource.Managed, in Input) Result {
 		r := Result{Decision: ReadOnly, Exists: !deleting, ObserveOnly: !writes}
 		if !deleting && writes {
 			r.Err = reason.Errorf(reason.ReadOnlyStorage,
-				"%s %q is in the read-only user directory %q (such as users.xml/users.d) and cannot be managed", in.Kind, in.Name, in.Storage)
+				"%s %q is in user directory %q, which is read-only (such as users.xml/users.d) or shares its name with a read-only directory, and cannot be managed", in.Kind, in.Name, in.Storage)
 		}
 		return r
 	}

@@ -159,6 +159,27 @@ func TestProviderEndToEnd(t *testing.T) {
 		}
 	}
 
+	// A policy pattern that CEL cannot check and Go cannot compile is
+	// reported on the config itself (design 3.3).
+	invalid := passwordCPC(srv, "e2e-invalid", v1alpha1.ClusterPolicy{DatabaseNamePatterns: []string{"app_("}})
+	invalid.UID = ""
+	if err := kube.Create(context.Background(), invalid); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, 60*time.Second, "Warning event InvalidConfig on the ClusterProviderConfig", func() (bool, string) {
+		events := &corev1.EventList{}
+		if err := kube.List(context.Background(), events); err != nil {
+			return false, err.Error()
+		}
+		for _, e := range events.Items {
+			if e.InvolvedObject.Kind == v1alpha1.ClusterProviderConfigKind && e.InvolvedObject.Name == invalid.Name && e.Type == corev1.EventTypeWarning &&
+				e.Reason == "InvalidConfig" && strings.Contains(e.Message, "policy.databaseNamePatterns[0]") {
+				return true, ""
+			}
+		}
+		return false, fmt.Sprintf("%d events, none for %s", len(events.Items), invalid.Name)
+	})
+
 	key := client.ObjectKey{Namespace: namespace, Name: "events"}
 	eventually(t, 90*time.Second, "Database Ready and Synced", func() (bool, string) {
 		d := &v1alpha1.Database{}

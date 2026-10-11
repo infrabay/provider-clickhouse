@@ -685,6 +685,9 @@ func TestApply(t *testing.T) {
 		change     func(s *server)
 		wantStmts  []string
 		wantReason reason.Reason
+		// wantErr are parts of the error message; with wantReason "" an
+		// error without a reason is expected.
+		wantErr []string
 	}
 	up := func(rows ...sqlx.GrantRow) func(t *testing.T) *server {
 		return func(t *testing.T) *server {
@@ -692,6 +695,8 @@ func TestApply(t *testing.T) {
 		}
 	}
 	grantSelect := "GRANT SELECT ON `team-a_db`.* TO `team-a_reader`"
+	revokeUpdate := "REVOKE ALTER UPDATE ON `team-a_db`.* FROM `team-a_reader`"
+	deniedUpdate := fake.Exception(497, "Not enough privileges. To execute this query, it's necessary to have the grant ALTER UPDATE ON `team-a_db`.* WITH GRANT OPTION")
 	cases := map[string]tc{
 		"Grants": {
 			mr: newGrant(), server: up(), objs: []client.Object{ownedRole()},
@@ -769,6 +774,35 @@ func TestApply(t *testing.T) {
 			wantStmts:  []string{grantSelect},
 			wantReason: reason.DependencyMissing,
 		},
+		// A foreign privilege at the target outside the identity's ceiling:
+		// its REVOKE is refused and changes nothing, and the desired
+		// privilege is still granted (design 9.4).
+		"UnrevocableForeign": {
+			mr: newGrant(), server: up(gr("ALTER UPDATE", dbName+".*", "")), objs: []client.Object{ownedRole()},
+			execErr:    map[string]error{revokeUpdate: deniedUpdate},
+			wantStmts:  []string{revokeUpdate, grantSelect},
+			wantReason: reason.PermissionDenied,
+		},
+		"EveryStatementRefused": {
+			mr: newGrant(), server: up(gr("ALTER UPDATE", dbName+".*", "")), objs: []client.Object{ownedRole()},
+			execErr:    map[string]error{revokeUpdate: deniedUpdate, grantSelect: fake.Exception(497, "Not enough privileges. To execute this query, it's necessary to have the grant SELECT ON `team-a_db`.* WITH GRANT OPTION")},
+			wantStmts:  []string{revokeUpdate, grantSelect},
+			wantReason: reason.PermissionDenied,
+			wantErr:    []string{"ALTER UPDATE ON `team-a_db`.* WITH GRANT OPTION", "SELECT ON `team-a_db`.* WITH GRANT OPTION"},
+		},
+		// Any other error stops the plan.
+		"RevokeFailsOtherwise": {
+			mr: newGrant(), server: up(gr("ALTER UPDATE", dbName+".*", "")), objs: []client.Object{ownedRole()},
+			execErr:    map[string]error{revokeUpdate: fake.Exception(509, "ALTER UPDATE cannot be revoked on the database level")},
+			wantStmts:  []string{revokeUpdate},
+			wantReason: reason.InvalidSpec,
+		},
+		"RevokeTransportError": {
+			mr: newGrant(), server: up(gr("ALTER UPDATE", dbName+".*", "")), objs: []client.Object{ownedRole()},
+			execErr:   map[string]error{revokeUpdate: &ch.TransportError{Category: "connection closed"}},
+			wantStmts: []string{revokeUpdate},
+			wantErr:   []string{"connection closed"},
+		},
 	}
 	for name, tc := range cases {
 		for _, op := range []string{"Create", "Update"} {
@@ -797,12 +831,22 @@ func TestApply(t *testing.T) {
 				} else {
 					_, err = e.Update(context.Background(), tc.mr)
 				}
-				if tc.wantReason != "" {
+				switch {
+				case tc.wantReason != "":
 					if !reason.Is(err, tc.wantReason) {
 						t.Fatalf("%s() error = %v, want %s", op, err, tc.wantReason)
 					}
-				} else if err != nil {
+				case len(tc.wantErr) > 0:
+					if err == nil {
+						t.Fatalf("%s() error = nil, want an error", op)
+					}
+				case err != nil:
 					t.Fatalf("%s() error = %v", op, err)
+				}
+				for _, part := range tc.wantErr {
+					if !strings.Contains(err.Error(), part) {
+						t.Errorf("%s() error %q does not contain %q", op, err, part)
+					}
 				}
 				if diff := cmp.Diff(tc.wantStmts, s.db.Execs, cmpopts.EquateEmpty()); diff != "" {
 					t.Errorf("statements -want +got:\n%s", diff)
@@ -1091,6 +1135,185 @@ func TestGrantOptionRecord(t *testing.T) {
 	}
 	if o, stmts := reconcile(stored()); o.ResourceExists || len(stmts) > 0 {
 		t.Fatalf("after delete: %+v, %v", o, stmts)
+	}
+}
+
+// TestGrantOptionRecordBroaderOption: another Grant of the role turns the
+// grant option on at team-a_db.* and off again, and the Grant turns its own
+// option off while the broader one is shown and on again once it is gone.
+// The server hides the option at team-a_db.events (a sibling events_raw),
+// and a REVOKE GRANT OPTION FOR at team-a_db.* removes it there too. The
+// record of an option that a shown broader option covers is forgotten, also
+// when no statement runs, so that the Grant grants its own option again
+// once the broader one is gone instead of trusting a stale record.
+func TestGrantOptionRecordBroaderOption(t *testing.T) {
+	ctx := context.Background()
+	plain := []sqlx.GrantRow{gr("SELECT", dbName+".*", ""), gr("INSERT", dbName+".events_raw", "")}
+	broader := []sqlx.GrantRow{gr("SELECT", dbName+".*", "g"), gr("INSERT", dbName+".events_raw", "")}
+	s := newServer(t, fake.Upstream253).role(roleName, roleID).grants(true, roleName, plain...)
+	policy := v1alpha1.ClusterPolicy{AllowedNamespaces: []string{"team-.*"}, RoleNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, DatabaseNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, AllowGrantOption: true}
+	mr := newGrant(table("events"), withGrantOption())
+	e := newTestExternal(t, s, resolved(t, policy), mr.DeepCopy(), ownedRole())
+	stored := func() *v1alpha1.Grant {
+		t.Helper()
+		g := &v1alpha1.Grant{}
+		if err := e.Kube.Get(ctx, client.ObjectKeyFromObject(mr), g); err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	setOption := func(on bool) {
+		t.Helper()
+		g := stored()
+		g.Spec.ForProvider.WithGrantOption = new(on)
+		if err := e.Kube.Update(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := func() string { return stored().GetAnnotations()[v1alpha1.AnnotationGrantOption] }
+	reconcile := func() (managed.ExternalObservation, []string) {
+		t.Helper()
+		g := stored()
+		s.db.Execs = nil
+		o, err := e.Observe(ctx, g)
+		if err != nil {
+			t.Fatalf("Observe() = %v", err)
+		}
+		if o.ResourceExists && !o.ResourceUpToDate {
+			if _, err := e.Update(ctx, g); err != nil {
+				t.Fatalf("Update() = %v", err)
+			}
+		}
+		return o, s.db.Execs
+	}
+	grantGO := []string{"GRANT SELECT ON `team-a_db`.`events` TO `team-a_reader` WITH GRANT OPTION"}
+
+	if _, stmts := reconcile(); !slices.Equal(stmts, grantGO) || record() == "" {
+		t.Fatalf("first reconcile: %v, record %q", stmts, record())
+	}
+	// The broader option is shown: up to date, and the record is forgotten
+	// without a statement. Saving it keeps the status that Observe set.
+	s.grants(true, roleName, broader...)
+	if o, stmts := reconcile(); !o.ResourceUpToDate || len(stmts) > 0 || record() != "" {
+		t.Fatalf("under the broader option: %+v, %v, record %q", o, stmts, record())
+	}
+	g := stored()
+	meta.AddAnnotations(g, map[string]string{v1alpha1.AnnotationGrantOption: `{"granteeID":"` + roleID + `","privileges":["SELECT"]}`})
+	if err := e.Kube.Update(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	g = stored()
+	if o, err := e.Observe(ctx, g); err != nil || !o.ResourceUpToDate || record() != "" ||
+		readyStatus(g).Status != corev1.ConditionTrue || g.Status.AtProvider.Target != dbName+".events" {
+		t.Fatalf("Observe() = %+v, %v, record %q, Ready %+v, status %+v", o, err, record(), readyStatus(g), g.Status.AtProvider)
+	}
+	// It is revoked again, and the option at the target with it.
+	s.grants(true, roleName, plain...)
+	if _, stmts := reconcile(); !slices.Equal(stmts, grantGO) || record() == "" {
+		t.Fatalf("after the broader option was revoked: %v, record %q", stmts, record())
+	}
+
+	// The Grant turns its option off while the broader one is shown:
+	// nothing can be revoked without a partial revoke, and the record is
+	// dropped although no statement runs.
+	s.grants(true, roleName, broader...)
+	setOption(false)
+	if o, stmts := reconcile(); !o.ResourceUpToDate || len(stmts) > 0 || record() != "" {
+		t.Fatalf("turned off under the broader option: %+v, %v, record %q", o, stmts, record())
+	}
+	s.grants(true, roleName, plain...)
+	setOption(true)
+	if _, stmts := reconcile(); !slices.Equal(stmts, grantGO) {
+		t.Fatalf("turned on again after the broader option was revoked: %v", stmts)
+	}
+
+	// An observe-only Grant never writes the record.
+	obs := stored()
+	obs.SetManagementPolicies(xpv2.ManagementPolicies{xpv2.ManagementActionObserve})
+	if err := e.Kube.Update(ctx, obs); err != nil {
+		t.Fatal(err)
+	}
+	s.grants(true, roleName, broader...)
+	before := record()
+	if o, err := e.Observe(ctx, stored()); err != nil || !o.ResourceUpToDate || record() != before {
+		t.Fatalf("observe-only: %+v, %v, record %q (was %q)", o, err, record(), before)
+	}
+}
+
+// TestGrantOptionRecordKeepsStatus: saving the record patches the MR, and
+// the patch returns the stored object; the status that the reconcile set
+// (Ready, status.atProvider) is kept, in Update and in Delete.
+func TestGrantOptionRecordKeepsStatus(t *testing.T) {
+	ctx := context.Background()
+	policy := v1alpha1.ClusterPolicy{AllowedNamespaces: []string{"team-.*"}, RoleNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, DatabaseNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, AllowGrantOption: true}
+	s := newServer(t, fake.Upstream253).role(roleName, roleID).
+		grants(true, roleName, gr("SELECT", dbName+".*", ""), gr("INSERT", dbName+".events_raw", ""))
+	mr := newGrant(table("events"), withGrantOption())
+	e := newTestExternal(t, s, resolved(t, policy), mr.DeepCopy(), ownedRole())
+	if _, err := e.Observe(ctx, mr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Update(ctx, mr); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := mr.GetAnnotations()[v1alpha1.AnnotationGrantOption]; !held || readyStatus(mr).Status != corev1.ConditionTrue || mr.Status.AtProvider.Target != dbName+".events" {
+		t.Errorf("after Update: record held %t, Ready %+v, status %+v", held, readyStatus(mr), mr.Status.AtProvider)
+	}
+	del := mr.DeepCopy()
+	deleting()(del)
+	if _, err := e.Observe(ctx, del); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Delete(ctx, del); err != nil {
+		t.Fatal(err)
+	}
+	if _, held := del.GetAnnotations()[v1alpha1.AnnotationGrantOption]; held || readyStatus(del).Reason != xpv2.ReasonDeleting {
+		t.Errorf("after Delete: record held %t, Ready %+v", held, readyStatus(del))
+	}
+}
+
+// TestGrantOptionRecordRefused: the server refuses a statement (497) without
+// changing anything, so the record gains the grant option only when the
+// GRANT that gives it ran.
+func TestGrantOptionRecordRefused(t *testing.T) {
+	ctx := context.Background()
+	policy := v1alpha1.ClusterPolicy{AllowedNamespaces: []string{"team-.*"}, RoleNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, DatabaseNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, AllowGrantOption: true}
+	revokeUpdate := "REVOKE ALTER UPDATE ON `team-a_db`.`events` FROM `team-a_reader`"
+	grantGO := "GRANT SELECT ON `team-a_db`.`events` TO `team-a_reader` WITH GRANT OPTION"
+	denied := fake.Exception(497, "Not enough privileges")
+	for name, tc := range map[string]struct {
+		refused []string
+		want    string
+	}{
+		"RevokeRefused": {refused: []string{revokeUpdate}, want: `{"granteeID":"` + roleID + `","privileges":["SELECT"]}`},
+		"GrantRefused":  {refused: []string{grantGO}},
+		"BothRefused":   {refused: []string{revokeUpdate, grantGO}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newServer(t, fake.Upstream253).role(roleName, roleID).
+				grants(true, roleName, gr("SELECT", dbName+".*", ""), gr("ALTER UPDATE", dbName+".events", ""))
+			for _, stmt := range tc.refused {
+				s.db.OnExec(stmt, denied)
+			}
+			mr := newGrant(table("events"), withGrantOption())
+			e := newTestExternal(t, s, resolved(t, policy), mr.DeepCopy(), ownedRole())
+			if _, err := e.Observe(ctx, mr); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := e.Update(ctx, mr); !reason.Is(err, reason.PermissionDenied) {
+				t.Fatalf("Update() = %v, want PermissionDenied", err)
+			}
+			if diff := cmp.Diff([]string{revokeUpdate, grantGO}, s.db.Execs); diff != "" {
+				t.Errorf("statements -want +got:\n%s", diff)
+			}
+			g := &v1alpha1.Grant{}
+			if err := e.Kube.Get(ctx, client.ObjectKeyFromObject(mr), g); err != nil {
+				t.Fatal(err)
+			}
+			if got := g.GetAnnotations()[v1alpha1.AnnotationGrantOption]; got != tc.want {
+				t.Errorf("record = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

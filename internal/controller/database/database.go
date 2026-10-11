@@ -209,13 +209,19 @@ func unavailable(cr *v1alpha1.Database, err error) (managed.ExternalObservation,
 //
 // While the MR is being deleted, Observe reports the database as existing
 // only when it is the MR's own (owned, adopted or recovered), its name is
-// allowed by the ClusterProviderConfig policy and, with a cluster, no host
-// has a database of that name with another UUID. In every other case it
-// emits a Warning event and reports it as absent: the MR goes away, no SQL
-// write runs and the database is left in place. Deletion never blocks on a
-// policy or a name conflict.
+// allowed by the ClusterProviderConfig policy, the management policies
+// include Delete and, with a cluster, no host has a database of that name
+// with another UUID. In every other case it emits a Warning event and
+// reports it as absent: the MR goes away, no SQL write runs and the
+// database is left in place. Deletion never blocks on a policy or a name
+// conflict.
 func (e *External) Observe(ctx context.Context, cr *v1alpha1.Database) (managed.ExternalObservation, error) {
 	deleting := meta.WasDeleted(cr)
+	if deleting && !ownership.PoliciesOf(cr).Delete() {
+		// crossplane-runtime releases such an MR without calling Delete; this
+		// second guard does not depend on it (D-26).
+		return e.leaveInPlace(cr, ReasonOrphaned, errors.New("the management policies do not include Delete; the database is left in place")), nil
+	}
 	name, err := ownership.EffectiveName(cr, cr.Spec.ForProvider.Name)
 	if err != nil {
 		if deleting {
@@ -365,8 +371,10 @@ func (e *External) currentID(ctx context.Context, name string) (string, bool, er
 // the statements address it by name. This narrows that window to one round
 // trip. With a cluster it also checks every host, because ON CLUSTER writes
 // go to every host by name. It returns false when the database no longer
-// exists on the connected server.
-func (e *External) verifyOwned(ctx context.Context, cr *v1alpha1.Database, name string) (bool, error) {
+// exists on the connected server. A failed check sets Ready=False
+// (access.UnavailableOn).
+func (e *External) verifyOwned(ctx context.Context, cr *v1alpha1.Database, name string) (exists bool, err error) {
+	defer func() { err = access.UnavailableOn(cr, err) }()
 	claim := ownership.ClaimOf(cr)
 	if !ownership.ClaimValid(cr) || claim.OwnedID == "" {
 		return false, reason.Errorf(reason.NotOwned, "%s %q is not claimed by this resource; nothing was changed", kind, name)
@@ -510,8 +518,14 @@ func (e *External) upToDate(ctx context.Context, cr *v1alpha1.Database, obs v1al
 	return true, nil
 }
 
-// Create runs CREATE DATABASE with the UUID the initializer chose.
+// Create runs CREATE DATABASE with the UUID the initializer chose. It
+// refuses without the Create management policy (D-26).
 func (e *External) Create(ctx context.Context, cr *v1alpha1.Database) (managed.ExternalCreation, error) {
+	if !ownership.PoliciesOf(cr).Create() {
+		// crossplane-runtime does not call Create without the Create
+		// management policy; this second guard does not depend on it.
+		return managed.ExternalCreation{}, reason.Errorf(reason.Internal, "the management policies do not include Create; no database was created")
+	}
 	name, err := ownership.EffectiveName(cr, cr.Spec.ForProvider.Name)
 	if err != nil {
 		return managed.ExternalCreation{}, err
@@ -554,8 +568,14 @@ func (e *External) Create(ctx context.Context, cr *v1alpha1.Database) (managed.E
 // Update changes the comment, the only mutable aspect. The statement is
 // idempotent, so it is sent whenever a comment is desired: status may have
 // been reset by a late-initialization update earlier in the reconcile.
-// Ownership is re-checked first, on every host with a cluster.
+// Ownership is re-checked first, on every host with a cluster. Update
+// refuses without the Update management policy (D-26).
 func (e *External) Update(ctx context.Context, cr *v1alpha1.Database) (managed.ExternalUpdate, error) {
+	if !ownership.PoliciesOf(cr).Update() {
+		// crossplane-runtime does not call Update without the Update
+		// management policy; this second guard does not depend on it.
+		return managed.ExternalUpdate{}, reason.Errorf(reason.Internal, "the management policies do not include Update; the database was not changed")
+	}
 	p := cr.Spec.ForProvider
 	if p.Comment == nil {
 		return managed.ExternalUpdate{}, nil
@@ -585,9 +605,14 @@ func (e *External) Update(ctx context.Context, cr *v1alpha1.Database) (managed.E
 // Unless forceDrop is set it refuses to drop a database that has tables, or
 // whose emptiness cannot be verified; with a cluster emptiness can never be
 // verified on every host. Ownership is re-checked immediately before the
-// DROP, on every host with a cluster.
+// DROP, on every host with a cluster. Without the Delete management policy
+// nothing is dropped (D-26).
 func (e *External) Delete(ctx context.Context, cr *v1alpha1.Database) (managed.ExternalDelete, error) {
 	cr.SetConditions(xpv2.Deleting())
+	if !ownership.PoliciesOf(cr).Delete() {
+		// Observe already left the database in place.
+		return managed.ExternalDelete{}, nil
+	}
 	name, err := ownership.EffectiveName(cr, cr.Spec.ForProvider.Name)
 	if err != nil {
 		return managed.ExternalDelete{}, err

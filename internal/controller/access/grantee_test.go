@@ -323,6 +323,12 @@ func TestRebindGrantee(t *testing.T) {
 			if len(env.rec.reasons()) > 0 {
 				t.Errorf("a rebind emits no events: %v", env.rec.reasons())
 			}
+			// What the re-check finds makes the MR unavailable as it would in
+			// Observe (design 5.10); while deleting, Ready stays Deleting.
+			unavailable := tc.reason != "" && tc.reason != reason.DependencyMissing && !meta.WasDeleted(tc.mr)
+			if got := readyStatus(tc.mr); (got == "False") != unavailable {
+				t.Errorf("Ready = %s, want False: %t", got, unavailable)
+			}
 		})
 	}
 }

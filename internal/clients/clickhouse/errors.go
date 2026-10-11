@@ -271,6 +271,16 @@ func isRuneStart(b byte) bool { return b&0xC0 != 0x80 }
 // RedactLiterals replaces every single-quoted literal in s with '***'.
 // Backslash escapes inside literals are honoured, so an escaped quote does not
 // end the literal. An unterminated literal is redacted to the end of s.
+//
+// Two kinds of apostrophe do not start a literal, so that a message keeps
+// what it says. One inside a backtick-quoted identifier, which ClickHouse
+// messages and the statements they quote use for names (`o'neil`): taking
+// it for a quote would turn the text up to the next quote into a literal
+// and print the following literal, for example a password hash, unredacted.
+// And one of an English contraction (see contraction): the server explains
+// a missing privilege as "it's necessary to have the grant ..." (497).
+// Statements built by the provider put a space, comma or parenthesis before
+// every literal, and so does the server where it quotes them.
 func RedactLiterals(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -278,10 +288,18 @@ func RedactLiterals(s string) string {
 	for i := 0; i < len(s); i++ {
 		c := s[i]
 		if !in {
-			b.WriteByte(c)
-			if c == '\'' {
+			switch {
+			case c == '`':
+				if end := identifierEnd(s, i); end > 0 {
+					b.WriteString(s[i:end])
+					i = end - 1
+					continue
+				}
+			case c == '\'' && contraction(s, i):
+			case c == '\'':
 				in = true
 			}
+			b.WriteByte(c)
 			continue
 		}
 		switch c {
@@ -297,6 +315,43 @@ func RedactLiterals(s string) string {
 	}
 	return b.String()
 }
+
+// identifierEnd returns the index after the backtick that closes the
+// backtick-quoted identifier starting at s[start], or 0 if none does; then
+// the backtick is ordinary text. Backslash escapes are honoured (a doubled
+// backtick simply makes two identifiers).
+func identifierEnd(s string, start int) int {
+	for i := start + 1; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			i++
+		case '`':
+			return i + 1
+		}
+	}
+	return 0
+}
+
+// contraction reports whether the apostrophe at s[i] belongs to an English
+// contraction such as "it's", "doesn't" or "you're": a letter before it, and
+// after it one of the endings s, t, d, m, re, ve and ll, then a non-letter
+// or the end of s.
+func contraction(s string, i int) bool {
+	if i == 0 || !isASCIILetter(s[i-1]) {
+		return false
+	}
+	j := i + 1
+	for j < len(s) && isASCIILetter(s[j]) {
+		j++
+	}
+	switch strings.ToLower(s[i+1 : j]) {
+	case "s", "t", "d", "m", "re", "ve", "ll":
+		return true
+	}
+	return false
+}
+
+func isASCIILetter(c byte) bool { return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z' }
 
 // carriesSecret reports whether a statement may carry secret literals, so
 // that its errors must be redacted.
