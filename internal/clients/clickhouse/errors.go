@@ -21,7 +21,9 @@ import (
 
 // ClickHouse error codes the provider branches on.
 const (
+	CodeNoSuchColumnInTable       int32 = 16
 	CodeBadArguments              int32 = 36
+	CodeUnknownIdentifier         int32 = 47
 	CodeTableAlreadyExists        int32 = 57
 	CodeSyntaxError               int32 = 62
 	CodeUnknownDatabase           int32 = 81
@@ -41,7 +43,9 @@ const (
 )
 
 var codeNames = map[int32]string{
+	CodeNoSuchColumnInTable:       "NO_SUCH_COLUMN_IN_TABLE",
 	CodeBadArguments:              "BAD_ARGUMENTS",
+	CodeUnknownIdentifier:         "UNKNOWN_IDENTIFIER",
 	CodeTableAlreadyExists:        "TABLE_ALREADY_EXISTS",
 	CodeSyntaxError:               "SYNTAX_ERROR",
 	CodeUnknownDatabase:           "UNKNOWN_DATABASE",

@@ -185,6 +185,11 @@ func matchAny(ps []*Pattern, namespace, name string) bool {
 }
 
 // A Policy is a compiled ClusterPolicy. It is closed by default.
+//
+// A nil *Policy is the policy of a namespaced ProviderConfig, which has none
+// (D-3): every check passes and adoption is allowed. Only the checks that
+// apply to every config kind (storage, self-modification, name collisions,
+// capabilities, JWT processor syntax) still apply there.
 type Policy struct {
 	unrestricted bool
 
@@ -236,18 +241,19 @@ func CompilePolicy(cp v1alpha1.ClusterPolicy) (*Policy, error) {
 	return p, nil
 }
 
-// Unrestricted reports whether every policy check passes.
-func (p *Policy) Unrestricted() bool { return p.unrestricted }
+// Unrestricted reports whether every policy check passes: unrestricted is
+// set, or there is no policy (a namespaced ProviderConfig).
+func (p *Policy) Unrestricted() bool { return p == nil || p.unrestricted }
 
 // NamespaceAllowed reports whether MRs in namespace may use the config.
 func (p *Policy) NamespaceAllowed(namespace string) bool {
-	return p.unrestricted || matchAny(p.namespaces, namespace, namespace)
+	return p == nil || p.unrestricted || matchAny(p.namespaces, namespace, namespace)
 }
 
 // CheckDatabaseName returns PolicyViolation unless name matches
 // databaseNamePatterns.
 func (p *Policy) CheckDatabaseName(namespace, name string) error {
-	if p.unrestricted || matchAny(p.databases, namespace, name) {
+	if p == nil || p.unrestricted || matchAny(p.databases, namespace, name) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "database name %q does not match policy.databaseNamePatterns of the ClusterProviderConfig", name)
@@ -258,7 +264,7 @@ func (p *Policy) CheckDatabaseName(namespace, name string) error {
 // zooKeeperPathPatterns. A custom path could register a replica under
 // another tenant's Replicated database, or nest under its Keeper node.
 func (p *Policy) CheckZooKeeperPath(namespace, path string) error {
-	if p.unrestricted || path == v1alpha1.DefaultZooKeeperPath || matchAny(p.zooKeeperPaths, namespace, path) {
+	if p == nil || p.unrestricted || path == v1alpha1.DefaultZooKeeperPath || matchAny(p.zooKeeperPaths, namespace, path) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation,
@@ -268,7 +274,7 @@ func (p *Policy) CheckZooKeeperPath(namespace, path string) error {
 
 // CheckUserName returns PolicyViolation unless name matches userNamePatterns.
 func (p *Policy) CheckUserName(namespace, name string) error {
-	if p.unrestricted || matchAny(p.users, namespace, name) {
+	if p == nil || p.unrestricted || matchAny(p.users, namespace, name) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "user name %q does not match policy.userNamePatterns of the ClusterProviderConfig", name)
@@ -276,7 +282,7 @@ func (p *Policy) CheckUserName(namespace, name string) error {
 
 // CheckRoleName returns PolicyViolation unless name matches roleNamePatterns.
 func (p *Policy) CheckRoleName(namespace, name string) error {
-	if p.unrestricted || matchAny(p.roles, namespace, name) {
+	if p == nil || p.unrestricted || matchAny(p.roles, namespace, name) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "role name %q does not match policy.roleNamePatterns of the ClusterProviderConfig", name)
@@ -285,7 +291,7 @@ func (p *Policy) CheckRoleName(namespace, name string) error {
 // CheckGrantableRole returns PolicyViolation unless role matches
 // grantableRoles.
 func (p *Policy) CheckGrantableRole(namespace, role string) error {
-	if p.unrestricted || matchAny(p.grantableRoles, namespace, role) {
+	if p == nil || p.unrestricted || matchAny(p.grantableRoles, namespace, role) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "role %q does not match policy.grantableRoles of the ClusterProviderConfig", role)
@@ -293,7 +299,7 @@ func (p *Policy) CheckGrantableRole(namespace, role string) error {
 
 // CheckAuthentication returns PolicyViolation unless m is allowed.
 func (p *Policy) CheckAuthentication(m v1alpha1.AuthenticationMethod) error {
-	if p.unrestricted || slices.Contains(p.authentication, m) {
+	if p == nil || p.unrestricted || slices.Contains(p.authentication, m) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "authentication method %s is not in policy.allowedAuthentication of the ClusterProviderConfig", m)
@@ -301,7 +307,7 @@ func (p *Policy) CheckAuthentication(m v1alpha1.AuthenticationMethod) error {
 
 // CheckJWTProcessor returns PolicyViolation unless processor is allowed.
 func (p *Policy) CheckJWTProcessor(processor string) error {
-	if p.unrestricted || slices.Contains(p.processors, processor) {
+	if p == nil || p.unrestricted || slices.Contains(p.processors, processor) {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "token processor %q is not in policy.allowedJWTProcessors of the ClusterProviderConfig", processor)
@@ -309,7 +315,7 @@ func (p *Policy) CheckJWTProcessor(processor string) error {
 
 // CheckGlobalGrant returns PolicyViolation unless global grants are allowed.
 func (p *Policy) CheckGlobalGrant() error {
-	if p.unrestricted || p.allowGlobalGrants {
+	if p == nil || p.unrestricted || p.allowGlobalGrants {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "global grants (database \"*\") need policy.allowGlobalGrants on the ClusterProviderConfig")
@@ -317,7 +323,7 @@ func (p *Policy) CheckGlobalGrant() error {
 
 // CheckGrantOption returns PolicyViolation unless grant option is allowed.
 func (p *Policy) CheckGrantOption() error {
-	if p.unrestricted || p.allowGrantOption {
+	if p == nil || p.unrestricted || p.allowGrantOption {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "withGrantOption needs policy.allowGrantOption on the ClusterProviderConfig")
@@ -325,12 +331,13 @@ func (p *Policy) CheckGrantOption() error {
 
 // CheckAdminOption returns PolicyViolation unless admin option is allowed.
 func (p *Policy) CheckAdminOption() error {
-	if p.unrestricted || p.allowAdminOption {
+	if p == nil || p.unrestricted || p.allowAdminOption {
 		return nil
 	}
 	return reason.Errorf(reason.PolicyViolation, "adminOption needs policy.allowAdminOption on the ClusterProviderConfig")
 }
 
 // AdoptionAllowed reports whether MRs may adopt pre-existing objects.
-// Unrestricted does not imply it.
-func (p *Policy) AdoptionAllowed() bool { return p.allowAdoption }
+// Unrestricted does not imply it. Adoption through a namespaced
+// ProviderConfig (nil policy) is always allowed.
+func (p *Policy) AdoptionAllowed() bool { return p == nil || p.allowAdoption }

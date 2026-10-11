@@ -36,13 +36,45 @@ func ProbeInfo(ctx context.Context, db DB) (ServerInfo, error) {
 
 // Probe queries. They are exported so that tests can match them.
 const (
-	QueryJWTProbe         = "EXPLAIN AST CREATE USER capability_probe IDENTIFIED WITH jwt"
-	QueryUserDirectories  = "SELECT name, type, precedence FROM system.user_directories ORDER BY precedence"
-	QueryClusterHosts     = "SELECT count() FROM system.clusters WHERE cluster = {cluster:String}"
-	QuerySystemColumns    = "SELECT name FROM system.columns WHERE database = 'system' AND table = {table:String}"
-	QueryPrivilegeExists  = "SELECT count() FROM system.privileges WHERE privilege = {privilege:String}"
+	QueryJWTProbe        = "EXPLAIN AST CREATE USER capability_probe IDENTIFIED WITH jwt"
+	QueryUserDirectories = "SELECT name, type, precedence FROM system.user_directories ORDER BY precedence"
+	QueryClusterHosts    = "SELECT count() FROM system.clusters WHERE cluster = {cluster:String}"
+	QueryPrivilegeExists = "SELECT count() FROM system.privileges WHERE privilege = {privilege:String}"
+
+	// QueryPrivileges reads the privilege catalogue. system.privileges is
+	// readable without grants. NULL levels and parents are read as "".
+	QueryPrivileges = "SELECT toString(privilege), aliases, ifNull(toString(level), ''), ifNull(toString(parent_group), '') FROM system.privileges"
+
 	privilegeDBCommentMod = "ALTER MODIFY DATABASE COMMENT"
 )
+
+// System tables and columns that only some server versions have.
+const (
+	TableUsers  = "users"
+	TableGrants = "grants"
+
+	// ColumnValidUntil is system.users.valid_until: absent on 25.3 and 25.8,
+	// Array(DateTime) on Antalya 26.3 and 26.6, Array(DateTime64(0)) on 26.8.
+	ColumnValidUntil = "valid_until"
+	// ColumnAccessObject is system.grants.access_object (25.8 and later).
+	ColumnAccessObject = "access_object"
+	// ColumnIsWildcard is system.grants.is_wildcard (26.8 and later).
+	ColumnIsWildcard = "is_wildcard"
+)
+
+// QuerySystemColumnProbe returns the probe for one column of a system table:
+// SELECT `column` FROM system.`table` LIMIT 0. It returns no rows and
+// succeeds when the column exists; it fails with 47 UNKNOWN_IDENTIFIER (16
+// NO_SUCH_COLUMN_IN_TABLE without the analyzer) when it does not.
+//
+// system.columns is not used: it is filtered by SHOW COLUMNS, so an identity
+// that holds SHOW USERS but no SELECT ON system.users sees no columns of
+// system.users there and would wrongly conclude that valid_until is missing
+// [verified on 25.3.3, 26.6 and 26.8]. The probe needs exactly the grant that
+// reading the table needs anyway.
+func QuerySystemColumnProbe(table, column string) string {
+	return "SELECT " + QuoteIdent(column) + " FROM system." + QuoteIdent(table) + " LIMIT 0"
+}
 
 // Writable user directory types.
 const (
@@ -173,30 +205,78 @@ func (c *Capabilities) ClusterHosts(ctx context.Context, db DB, cluster string) 
 	})
 }
 
-// SystemColumns returns the column names of a system table.
-func (c *Capabilities) SystemColumns(ctx context.Context, db DB, table string) ([]string, error) {
-	return probe(ctx, c, "columns/"+table, func(ctx context.Context) ([]string, error) {
-		var cols []string
-		err := db.Query(ctx, QuerySystemColumns, Params{"table": table}, func(r Row) error {
-			var n string
-			if err := r.Scan(&n); err != nil {
-				return err
-			}
-			cols = append(cols, n)
-			return nil
-		})
-		return cols, WithDefaultReason(err)
+// HasSystemColumn reports whether a system table has a column, e.g.
+// system.grants.is_wildcard or system.users.valid_until (see
+// QuerySystemColumnProbe). A missing column is false; any other failure,
+// such as 497 without the grant that reading the table needs, is returned.
+func (c *Capabilities) HasSystemColumn(ctx context.Context, db DB, table, column string) (bool, error) {
+	return probe(ctx, c, "column/"+table+"."+column, func(ctx context.Context) (bool, error) {
+		err := db.Query(ctx, QuerySystemColumnProbe(table, column), nil, func(Row) error { return nil })
+		switch {
+		case err == nil:
+			return true, nil
+		case IsCode(err, CodeUnknownIdentifier, CodeNoSuchColumnInTable):
+			return false, nil
+		default:
+			return false, WithDefaultReason(err)
+		}
 	})
 }
 
-// HasSystemColumn reports whether a system table has a column, e.g.
-// system.grants.is_wildcard or system.users.valid_until.
-func (c *Capabilities) HasSystemColumn(ctx context.Context, db DB, table, column string) (bool, error) {
-	cols, err := c.SystemColumns(ctx, db, table)
-	if err != nil {
-		return false, err
-	}
-	return slices.Contains(cols, column), nil
+// UsersValidUntil reports whether system.users has valid_until. Without it
+// (25.3, 25.8) VALID UNTIL is visible only in SHOW CREATE USER. Reading it
+// needs SHOW USERS, which every User needs anyway.
+func (c *Capabilities) UsersValidUntil(ctx context.Context, db DB) (bool, error) {
+	return c.HasSystemColumn(ctx, db, TableUsers, ColumnValidUntil)
+}
+
+// GrantsAccessObject reports whether system.grants has access_object (25.8
+// and later). Rows with a non-empty access_object (source privileges such as
+// READ ON S3, prefix-scoped access management) are never managed by Grant.
+func (c *Capabilities) GrantsAccessObject(ctx context.Context, db DB) (bool, error) {
+	return c.HasSystemColumn(ctx, db, TableGrants, ColumnAccessObject)
+}
+
+// GrantsIsWildcard reports whether system.grants has is_wildcard (26.8 and
+// later). Without it a wildcard grant (ON team_*.*) cannot be told apart from
+// a literal grant on a database named "team_" in system.grants, and Grant
+// falls back to scanning SHOW GRANTS (design 5.6, D-10).
+func (c *Capabilities) GrantsIsWildcard(ctx context.Context, db DB) (bool, error) {
+	return c.HasSystemColumn(ctx, db, TableGrants, ColumnIsWildcard)
+}
+
+// A Privilege is a row of system.privileges. Level and Parent are "" where
+// the server has NULL (for example SHOW FILESYSTEM CACHES has no level, and
+// ALL and NONE have no parent).
+type Privilege struct {
+	Name    string
+	Aliases []string
+	Level   string
+	Parent  string
+}
+
+// Privileges returns the privilege catalogue. It is read once per client and
+// cached like every probe, so a server upgrade is picked up after
+// CapabilityTTL. Callers must not modify the result: it is shared.
+func (c *Capabilities) Privileges(ctx context.Context, db DB) ([]Privilege, error) {
+	return probe(ctx, c, "privileges", func(ctx context.Context) ([]Privilege, error) {
+		var out []Privilege
+		err := db.Query(ctx, QueryPrivileges, nil, func(r Row) error {
+			var p Privilege
+			if err := r.Scan(&p.Name, &p.Aliases, &p.Level, &p.Parent); err != nil {
+				return err
+			}
+			out = append(out, p)
+			return nil
+		})
+		if err != nil {
+			return nil, WithDefaultReason(err)
+		}
+		if len(out) == 0 {
+			return nil, reason.Errorf(reason.Internal, "system.privileges returned no rows")
+		}
+		return out, nil
+	})
 }
 
 // DatabaseCommentChange reports whether the server supports

@@ -200,58 +200,11 @@ func ParseEngineArgs(engineFull string) (string, []string, error) {
 		if s[i] != '\'' {
 			return "", nil, fmt.Errorf("unexpected engine argument in %q", engineFull)
 		}
-		lit, n, err := readLiteral(s[i:])
+		lit, n, err := readQuoted(s[i:], '\'')
 		if err != nil {
 			return "", nil, fmt.Errorf("%w in %q", err, engineFull)
 		}
 		args = append(args, lit)
 		i += n
 	}
-}
-
-// readLiteral reads a single-quoted ClickHouse string literal at the start of
-// s and returns its value and length.
-func readLiteral(s string) (string, int, error) {
-	var b strings.Builder
-	for i := 1; i < len(s); i++ {
-		c := s[i]
-		switch c {
-		case '\'':
-			return b.String(), i + 1, nil
-		case '\\':
-			i++
-			if i >= len(s) {
-				return "", 0, errors.New("unterminated escape")
-			}
-			switch s[i] {
-			case 'n':
-				b.WriteByte('\n')
-			case 't':
-				b.WriteByte('\t')
-			case 'r':
-				b.WriteByte('\r')
-			case '0':
-				b.WriteByte(0)
-			case 'b':
-				b.WriteByte('\b')
-			case 'f':
-				b.WriteByte('\f')
-			case 'x':
-				if i+2 >= len(s) {
-					return "", 0, errors.New("short \\x escape")
-				}
-				var v byte
-				if _, err := fmt.Sscanf(s[i+1:i+3], "%02x", &v); err != nil {
-					return "", 0, errors.New("invalid \\x escape")
-				}
-				b.WriteByte(v)
-				i += 2
-			default:
-				b.WriteByte(s[i])
-			}
-		default:
-			b.WriteByte(c)
-		}
-	}
-	return "", 0, errors.New("unterminated string literal")
 }

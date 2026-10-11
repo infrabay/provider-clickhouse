@@ -29,6 +29,7 @@ import (
 	"github.com/infrabay/provider-clickhouse/apis/v1alpha1"
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
 	"github.com/infrabay/provider-clickhouse/internal/clients/clickhouse/sqlx"
+	"github.com/infrabay/provider-clickhouse/internal/controller/access"
 	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/controller/providerconfig"
 	"github.com/infrabay/provider-clickhouse/internal/reason"
@@ -62,10 +63,7 @@ const (
 )
 
 // Dependencies are shared by the controllers.
-type Dependencies struct {
-	Cache *ch.Cache
-	Flags providerconfig.Flags
-}
+type Dependencies = access.Dependencies
 
 // SetupGated registers the Database controller with safe-start: it is set up
 // once the Database CRD is installed (and activated).
@@ -167,7 +165,7 @@ func (c *Connector) Connect(ctx context.Context, cr *v1alpha1.Database) (managed
 		return nil, err
 	}
 	if res.NamespaceDenied {
-		return &orphan{recorder: c.recorder()}, nil
+		return &orphan{recorder: c.recorder(), why: res.DenyReason}, nil
 	}
 	if err := c.Usage.Track(ctx, cr); err != nil {
 		return nil, fmt.Errorf("cannot track ProviderConfig usage: %w", err)
@@ -654,17 +652,22 @@ func (e *External) Disconnect(_ context.Context) error {
 	return e.Client.Close()
 }
 
-// orphan is the external client for a Database whose namespace is no longer
-// allowed by its ClusterProviderConfig while the MR is being deleted. The
-// database is left in place and the MR goes away, so namespace deletion does
-// not hang.
+// orphan is the external client for a Database that may no longer use its
+// config while the MR is being deleted: its namespace is not allowed by the
+// ClusterProviderConfig policy, or the provider flags forbid its namespaced
+// ProviderConfig. The database is left in place and the MR goes away, so
+// namespace deletion does not hang.
 type orphan struct {
 	recorder event.Recorder
+	why      string
 }
 
 func (o *orphan) Observe(_ context.Context, cr *v1alpha1.Database) (managed.ExternalObservation, error) {
-	o.recorder.Event(cr, event.Warning(ReasonOrphanedByPolicy,
-		errors.New("the namespace is no longer allowed by the ClusterProviderConfig policy; the database is left in place")))
+	why := o.why
+	if why == "" {
+		why = "the namespace is no longer allowed by the ClusterProviderConfig policy"
+	}
+	o.recorder.Event(cr, event.Warning(ReasonOrphanedByPolicy, errors.New(why+"; the database is left in place")))
 	return managed.ExternalObservation{ResourceExists: false}, nil
 }
 

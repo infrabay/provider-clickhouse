@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Revision 3, after the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller). Revision 2 followed the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
+| Status | Revision 4, after re-verifying the access entity facts on upstream 25.3.3.42 and building the foundations that User, Role, Grant and RoleGrant share. Revision 3 followed the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller); revision 2 the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
 | Module and repository | `github.com/infrabay/provider-clickhouse` |
 | Package | `ghcr.io/infrabay/provider-clickhouse` |
 | API group and version | `clickhouse.m.infrabay.io/v1alpha1` |
@@ -12,11 +12,19 @@
 
 Evidence markers used below:
 
-- **[V]**: verified against a running server during design. Without a qualifier it means verified on Antalya `altinity/clickhouse-server:26.6.4.20001.altinityantalya` and upstream `clickhouse/clickhouse-server:26.8.23.6`. Other versions are named when they were checked too or when they behave differently: **25.3** (`25.3.14.14`), **25.8** (`25.8.33.6`), **A26.3** (`26.3.13.20001.altinityantalya`). "[V all]" means all five.
+- **[V]**: verified against a running server during design. Without a qualifier it means verified on Antalya `altinity/clickhouse-server:26.6.4.20001.altinityantalya` and upstream `clickhouse/clickhouse-server:26.8.23.6`. Other versions are named when they were checked too or when they behave differently: **25.3** (`25.3.14.14`), **25.3.3** (`25.3.3.42-alpine`, the early 25.3 patch that CI tests and that production installs run), **25.8** (`25.8.33.6`), **A26.3** (`26.3.13.20001.altinityantalya`). "[V all]" means all five images of the CI matrix. Every access entity fact tagged 25.3 was re-checked on 25.3.3.42 for revision 4; where it holds there too, the tag names **25.3.3**.
 - **[C]**: taken from reading source code. Not run.
 - **[T]**: an assumption. An integration test must confirm it before the feature is called done.
 
 Decisions taken during the review are collected in [section 12](#12-decisions) (D-n). Open questions are marked **OQ-n** where they come up and are collected in [section 13](#13-open-questions).
+
+### What changed in revision 4
+
+- **25.3.3.42**: every user, role, grant and role grant fact tagged 25.3 was re-verified on the early patch. They all hold there. Two facts were wrong on every version and are corrected: `CREATE USER OR REPLACE` assigns a new UUID and drops grants and memberships (A30), and `system.columns` hides the columns of `system.users` from the minimal identity, so capability probes read the column directly (A41, [section 7](#7-server-capability-detection)).
+- **Recovery is bound to this process** (D-29): ownership row 5 needs a record of a CREATE this provider process sent; forged create annotations never claim an entity ([4.2](#42-ownership)).
+- **Grants and role grants are bound to an owned grantee** (D-30): the provider grants to and revokes from only users and roles that a User or Role MR in the namespace owns ([4.3](#43-grants-and-role-grants-grantee-binding)).
+- **Provider flags while deleting** (D-31): a namespaced ProviderConfig that the flags forbid orphans a deleting MR instead of blocking it ([5.9](#59-shared-controller-wiring)).
+- **JWT processor names** are validated provider-side on every config kind (D-32, [5.8](#58-policy-evaluation)).
 
 ### What changed in revision 3
 
@@ -814,9 +822,9 @@ type UserObservation struct {
 - **Passwords.**
   - Passwords are stored as `IDENTIFIED WITH sha256_hash BY '<hash>' SALT '<salt>'`, computed exactly like this:
     - `salt := hex.EncodeToString(16 bytes from crypto/rand)`, a 32-character ASCII string, fresh every time the password is applied;
-    - `hash := hex.EncodeToString(sha256.Sum256([]byte(password + salt)))`. The salt is appended **as its hex text**, not as the decoded bytes. The server concatenates the SALT literal exactly as sent. Hashing the decoded bytes creates a user who can never log in (516) [V 25.3, 26.6, 26.8].
-    - Test vector: password `Pa55word`, salt `00112233445566778899aabbccddeeff`, hash `6257310c34f98d6e96c672db8cee44e0077f4e03eb3581a7260ccd6861848188`. A user created with these values logs in with `Pa55word` [V 25.3, 26.6, 26.8].
-  - Every build requires a 64-hex-digit hash. A shorter value fails with 36 [V 25.3, 26.6, 26.8].
+    - `hash := hex.EncodeToString(sha256.Sum256([]byte(password + salt)))`. The salt is appended **as its hex text**, not as the decoded bytes. The server concatenates the SALT literal exactly as sent. Hashing the decoded bytes creates a user who can never log in (516) [V 25.3, 25.3.3, 26.6, 26.8].
+    - Test vector: password `Pa55word`, salt `00112233445566778899aabbccddeeff`, hash `6257310c34f98d6e96c672db8cee44e0077f4e03eb3581a7260ccd6861848188`. A user created with these values logs in with `Pa55word` [V 25.3, 25.3.3, 26.6, 26.8].
+  - Every build requires a 64-hex-digit hash. A shorter value fails with 36 [V 25.3, 25.3.3, 26.6, 26.8].
   - The server's `query_log` masks the clause as `IDENTIFIED WITH sha256_password` [V].
   - `sha256_hash` bypasses the server's `password_complexity_rules`. `generate` produces strong passwords. For `passwordSecretRef`, the Secret's owner is responsible for strength. This is documented.
 - **Password users need `writeConnectionSecretToRef`.** The connection Secret is the record of the password that was last applied:
@@ -834,13 +842,13 @@ type UserObservation struct {
 - **Default roles.**
   - `DEFAULT ROLE` is a property of the user and replaces the whole list. A per-membership flag on `RoleGrant` would need a read-modify-write of that list from several reconcilers. So `RoleGrant` has no `default` field in v1 (**OQ-4**).
   - New users start with `DEFAULT ROLE ALL`, so every role granted later is active. That covers the common case [V].
-  - `Listed` requires the roles to be granted first: otherwise the server returns 512 `SET_NON_GRANTED_ROLE` [V]. The provider creates such users with `DEFAULT ROLE NONE` and applies only the listed roles that are currently granted ([5.4](#54-user)).
-  - `AllExcept` does not require the roles to be granted. It needs only that they exist (511 otherwise) [V 25.3, 26.6, 26.8], so it is set at creation.
+  - `Listed` requires the roles to be granted first: `ALTER USER ... DEFAULT ROLE` with a role that is not granted returns 512 `SET_NON_GRANTED_ROLE` [V 25.3.3, 26.6, 26.8]. (`CREATE USER ... DEFAULT ROLE r` accepts an existing role that is not granted yet and stores it, so it becomes active once granted [V 25.3.3, 26.6, 26.8]; the provider does not rely on that.) The provider creates such users with `DEFAULT ROLE NONE` and applies only the listed roles that are currently granted ([5.4](#54-user)).
+  - `AllExcept` does not require the roles to be granted. It needs only that they exist (511 otherwise) [V 25.3.3, 26.6, 26.8], so it is set at creation.
 - **Hosts.**
   - Hosts are always enforced. Empty means `HOST ANY`.
   - They are deliberately not late-initialized. Telling "unset" apart from `ANY` would need tri-state lists, which do not survive JSON `omitempty`.
   - `HOST REGEXP`, `HOST LIKE` and `HOST NONE` cannot be requested. Observing any of them on a managed user is drift ([5.4](#54-user)).
-- **Expiry.** `VALID UNTIL` cannot be requested. An expiry set out of band locks the user out (516) while every other column looks unchanged [V 25.3, 26.6, 26.8]. The provider therefore treats it as drift and clears it.
+- **Expiry.** `VALID UNTIL` cannot be requested. An expiry set out of band locks the user out (516) while every other column looks unchanged [V 25.3, 25.3.3, 26.6, 26.8]. The provider therefore treats it as drift and clears it.
 
 **Examples.**
 
@@ -1115,7 +1123,7 @@ If `forProvider.name` and the annotation are both set and differ, the reconcile 
 
 The provider identity can alter or drop SQL users and roles it did not create ([9.2](#92-blast-radius)). So the controller must know whether the object behind a name is *its* object.
 
-- ClickHouse has no server-side marker it could use for this: `CREATE USER ... COMMENT` is a syntax error [V 25.3, 26.6, 26.8].
+- ClickHouse has no server-side marker it could use for this: `CREATE USER ... COMMENT` is a syntax error [V 25.3, 25.3.3, 26.6, 26.8].
 - Ownership is therefore anchored on the entity UUID: `system.users.id`, `system.roles.id` or `system.databases.uuid`.
 - **The claim lives in annotations, not in `status`** (D-6). crossplane-runtime resets in-memory status on full-object updates, so a UUID written to status during Create is always lost [C]. `status.atProvider.id` stays purely informational, and observe-only MRs fill it without claiming anything.
 
@@ -1153,7 +1161,7 @@ After adoption the annotation is spent. A later out-of-band replacement yields `
 | 2 | valid claim, `owned-id` equals the observed UUID | **Owned.** A leftover `adopt` annotation is removed. |
 | 3 | `adopt` equals the observed UUID and adoption is allowed | **Adopted.** Write the claim, remove `adopt`, emit event `Adopted`. |
 | 4 | `adopt` is set, but differs from the observed UUID or adoption is not allowed | Error `AdoptionRejected` (names the observed UUID, or says that `policy.allowAdoption` is false). |
-| 5 | User or Role, valid claim, no `owned-id`, and either `external-create-pending` is newer than both `external-create-succeeded` and `external-create-failed`, or `create-outcome` is `unknown` and `external-create-failed` is the newest | **Recovered.** Treated as owned: write `owned-id` and emit event `CreateRecovered`. This is the crash or lost-response case. An object created by someone else inside that same window would also be claimed; the window is a single reconcile, and the risk is accepted. |
+| 5 | User or Role, valid claim, no `owned-id`, either `external-create-pending` is newer than both `external-create-succeeded` and `external-create-failed` or `create-outcome` is `unknown` and `external-create-failed` is the newest, **and the create journal of this provider process holds a record of a CREATE it sent for this MR, name and config whose outcome was not a rejection** (with a read-back UUID: that exact UUID) | **Recovered.** Treated as owned: write `owned-id` and emit event `CreateRecovered`. This is the lost-response case. The annotations alone never recover anything: a tenant can forge them on an MR that points at an existing entity (D-29). Without a journal record (for example after a provider restart) the result is `NotOwned`, with a hint to adopt by UUID. An object created by someone else between the provider's Observe and its CREATE, whose CREATE response was then lost, would still be claimed; that window is a few milliseconds of one reconcile, and the risk is accepted. |
 | 6 | valid claim, `owned-id` set and different from the observed UUID, and `external-create-succeeded` is the newest create annotation | **Replaced out of band.** Error `Replaced: <kind> "<name>" was replaced (id X, now Y); set clickhouse.m.infrabay.io/adopt="Y" to take over the new object`. |
 | 7 | anything else | **Not owned.** Error `NotOwned: <kind> "<name>" already exists (id Y) and was not created by this resource; to take it over set annotation clickhouse.m.infrabay.io/adopt="Y" (requires policy.allowAdoption on a ClusterProviderConfig)`. |
 
@@ -1163,19 +1171,37 @@ The table has these consequences:
 - **Management policies with only `Observe` and/or `LateInitialize`** (observe-only or import mode): rows 3 to 7 produce no error, status is filled, and no claim is written. Name policy still applies ([5.8](#58-policy-evaluation)). Switching such an MR to write policies later makes the initializer write a claim that does not match. The MR then needs adoption (row 3).
 - **The object does not exist:** `ResourceExists=false` and Create runs. An object deleted out of band is re-created, which is normal Crossplane behaviour. A Database is re-created with its recorded UUID.
 - **Annotations are writable by anyone who can edit the MR.** The claims prevent *accidents*: copy-pasted or restored manifests, name collisions with admin-created users, and lost responses. They do not stop a malicious tenant who forges `owner-uid` and `owned-id`. Protection against tenants comes from:
-  - the `ClusterProviderConfig` policy (`allowedNamespaces`, name patterns with `{namespace}`, `grantableRoles`, `zooKeeperPathPatterns`). Name checks also apply while the MR is being deleted ([5.8](#58-policy-evaluation)), so a forged claim on a name outside the tenant's patterns never leads to a DROP, and row 5 can only recover names inside them;
+  - the `ClusterProviderConfig` policy (`allowedNamespaces`, name patterns with `{namespace}`, `grantableRoles`, `zooKeeperPathPatterns`). Name checks also apply while the MR is being deleted ([5.8](#58-policy-evaluation)), so a forged claim on a name outside the tenant's patterns never leads to a DROP;
+  - the create journal (D-29): forged create annotations never make row 5 claim an entity;
   - server-side prefix grants for the identity ([9.4](#94-minimal-grants-for-the-provider-identity));
   - Kubernetes RBAC and admission control.
 
   See [9.3](#93-provider-identity-sources-and-tenancy).
-- **`CREATE OR REPLACE USER` by an administrator keeps the UUID and the grants** on 25.3, 26.6.4 and 26.8 [V]. Such a replacement is undetectable. `DROP` followed by `CREATE` changes the UUID and is detected (row 6). The provider itself never uses `OR REPLACE`.
+- **`CREATE USER OR REPLACE` by an administrator assigns a new UUID** and drops the entity's grants and role memberships, exactly like `DROP` followed by `CREATE` [V 25.3.3, 26.6, 26.8] (A30). Both are detected (row 6). `CREATE OR REPLACE USER` (the other word order) is a syntax error everywhere. The provider itself never uses `OR REPLACE`.
 - **Engines without a UUID** (`Memory`, `uuid = 00000000-...`) cannot be told apart from a re-created object. v1 only creates `Atomic` and `Replicated`, which have UUIDs. A Database MR whose observed UUID is zero is reported as `NotOwned` unless adopted, and its adoption annotation uses the value `00000000-0000-0000-0000-000000000000`.
 - **The provider never modifies its own identity.** Any write to a user named `currentUser()` fails with `SelfModification`. That covers User, and Grant or RoleGrant with that user as grantee. This holds even if the identity is an SQL user and an MR claims or adopts it.
 
-`Grant` and `RoleGrant` have no UUID, and GRANT is idempotent.
+`Grant` and `RoleGrant` have no UUID, and GRANT is idempotent. They are bound to their grantee instead ([4.3](#43-grants-and-role-grants-grantee-binding)).
 
-- They are bounded instead by policy on the grantee, the target and the role, and by the rule that the provider never creates partial revokes ([5.6](#56-grant)).
+**Implementation.** `internal/controller/ownership` holds the decision table, the initializer and the create journal. `internal/controller/access` runs the shared flow for User and Role: `Env.ObserveEntity` (name policy, self-modification, entity read, decision, claim patch, events, name collision), `Env.CreateEntity` (pre-checks, journal, `create-outcome`, read-back of `owned-id`) and `Env.VerifyOwned` (the re-check before every `ALTER` and `DROP`: claim, name policy, storage, topology and UUID).
+
+### 4.3 Grants and role grants: grantee binding
+
+`Grant` and `RoleGrant` have no UUID of their own. They are bounded by policy on the grantee, the target and the role, by the rule that the provider never creates partial revokes ([5.6](#56-grant)), and by binding every write to an **owned grantee** (D-30):
+
+- **Name policy.** The grantee matches `userNamePatterns` or `roleNamePatterns` on a `ClusterProviderConfig`, for every management policy and also while deleting (D-25).
+- **Unambiguous.** A role grantee must not share its name with a user: GRANT and REVOKE resolve grantees user-first (`AmbiguousGrantee`).
+- **When the management policies allow writes**, additionally:
+  - the grantee is not in `users.xml`/`users.d` (`ReadOnlyStorage`) and is not `currentUser()` (`SelfModification`);
+  - the grantee is **owned**: a `User` or `Role` MR in the MR's namespace that uses the same ProviderConfig holds a valid claim (`owner-uid` equals its UID) whose `owned-id` is the grantee's current UUID. Otherwise the result is `NotOwned`. The provider never grants to or revokes from an access entity that it did not create or adopt by UUID. To manage the grants of an existing user or role, adopt it with a `User` or `Role` first.
+- **A missing grantee** gives `DependencyMissing` when writes are allowed. Observe-only MRs report the grant as absent.
+- **Re-check before every write.** Immediately before a GRANT or REVOKE the binding is checked again, together with the topology guard of [section 8](#8-topology-replicas-and-clusters): the grantee must still exist, still be owned, still be unambiguous, and still have the UUID observed in the same reconcile (`Replaced` otherwise).
+- **While deleting**, every failed check orphans the MR (Warning event `Orphaned` or `OrphanedByPolicy`, `ResourceExists=false`, no SQL), and so do management policies without `Delete` (D-26). A grantee that no longer exists leaves nothing to revoke.
+
+Ownership claims are annotations, so a tenant who forges a claim on a `User` or `Role` can make a foreign entity look owned. As for users and roles, the name policy is the boundary between tenants; the binding prevents accidents (a grantee created by an administrator, a copied manifest, a replaced entity).
+
 - **Deleting a `Grant` or a `RoleGrant` revokes the privileges or the membership, even if someone else had granted them before.** To avoid that, for example when importing existing grants, use management policies without `Delete`.
+- **Implementation.** `access.Env.BindGrantee` (Observe) and `access.Env.RebindGrantee` (before each write). The checks of the other names (the target database, `memberOf`) are `providerconfig.Policy.CheckGrantTarget` and `CheckRoleGrantNames`.
 
 ---
 
@@ -1225,21 +1251,22 @@ A resource is reported as not existing (`ResourceExists=false`) **only** when an
 |---|---|---|---|
 | 516 | AUTHENTICATION_FAILED | any | Token sources: invalidate the token, rebuild the pool, retry **once** ([6.4](#64-516-retry)). Then error `AuthenticationFailed`. Also caused by clock skew beyond the 60 s server leeway. |
 | 497 | ACCESS_DENIED | any | Error `PermissionDenied`, with the server message (it names the missing grant). Never "not found". |
-| 495 | ACCESS_STORAGE_READONLY | writes | Error `ReadOnlyStorage` (the object is from users.xml/users.d). Returned even with `IF EXISTS` / `IF NOT EXISTS` [V 25.3, 26.6, 26.8]. |
+| 495 | ACCESS_STORAGE_READONLY | writes | Error `ReadOnlyStorage` (the object is from users.xml/users.d). Returned even with `IF EXISTS` / `IF NOT EXISTS` [V 25.3, 25.3.3, 26.6, 26.8]. |
 | 493 | ACCESS_ENTITY_ALREADY_EXISTS | Create User/Role | Error `AlreadyExists` (a concurrent creator). Not adopted. |
 | 82 | DATABASE_ALREADY_EXISTS | Create Database | Error `AlreadyExists`. |
 | 57 | TABLE_ALREADY_EXISTS | Create Database with UUID | The UUID is in use by another database. Not expected with random UUIDs. Error `InvalidSpec`. |
 | 192 | UNKNOWN_USER | ALTER USER | Error `DependencyMissing`. In Delete paths, treat as already gone. |
-| 511 | UNKNOWN_ROLE | GRANT, REVOKE, DEFAULT ROLE | Error `DependencyMissing`. Also returned for an unknown grantee in both `GRANT r TO x` and privilege `GRANT`/`REVOKE` [V 25.3, 26.6, 26.8]. In Delete paths, treat as already gone. |
+| 511 | UNKNOWN_ROLE | GRANT, REVOKE, DEFAULT ROLE | Error `DependencyMissing`. Also returned for an unknown grantee in both `GRANT r TO x` and privilege `GRANT`/`REVOKE` [V 25.3, 25.3.3, 26.6, 26.8]. In Delete paths, treat as already gone. |
 | 512 | SET_NON_GRANTED_ROLE | DEFAULT ROLE | Not expected: `Listed` applies only granted roles ([5.4](#54-user)). If it occurs (race with a revoke): error `DependencyMissing`. |
 | 180 | THERE_IS_NO_PROFILE | SETTINGS PROFILE | Error `DependencyMissing`. |
 | 81 | UNKNOWN_DATABASE | Database Update | The database disappeared between Observe and Update. Return without error; the next Observe decides. Delete uses `IF EXISTS`. |
-| 509 | INVALID_GRANT | GRANT | A privilege that does not exist at the target's level, e.g. "CREATE DATABASE cannot be granted on the table level" [V 25.3, 26.6, 26.8]. Means the catalogue model and the server disagree. Error `InvalidSpec`. |
+| 509 | INVALID_GRANT | GRANT | A privilege that does not exist at the target's level, e.g. "CREATE DATABASE cannot be granted on the table level" [V 25.3, 25.3.3, 26.6, 26.8]. Means the catalogue model and the server disagree. Error `InvalidSpec`. |
 | 458 | CANNOT_UNLINK | CREATE DATABASE | "File name too long" for an over-long escaped name [V]. Error `InvalidSpec`. The Go length check should catch it first. |
 | 36 | BAD_ARGUMENTS | Create, probes | From the jwt probe: JWT unsupported ([section 7](#7-server-capability-detection)). Otherwise a configuration error, e.g. a jwt user on upstream ("CREATE USER is not supported for JWT"): `Unsupported` or `InvalidSpec`. |
 | 159 | TIMEOUT_EXCEEDED | ON CLUSTER DDL | Transient. The DDL may finish in the background; the next Observe decides. In Create this sets `create-outcome: unknown` ([4.2](#42-ownership)). |
 | 62 | SYNTAX_ERROR | probes, any | From the jwt probe on 25.3: JWT unsupported. From `ALTER DATABASE ... MODIFY COMMENT` on 25.3: `Unsupported` (the capability check should prevent it). Otherwise a provider bug: `Internal`. Never echoed unredacted ([5.1](#51-sql-safety)). |
 | 457 | BAD_QUERY_PARAMETER | any | Provider bug. Error `Internal`. |
+| 47, 16 | UNKNOWN_IDENTIFIER, NO_SUCH_COLUMN_IN_TABLE | column probes | The probed system table column does not exist on this version ([section 7](#7-server-capability-detection)). Elsewhere a provider bug: `Internal`. |
 
 **How errors are reported.**
 
@@ -1254,7 +1281,7 @@ A resource is reported as not existing (`ResourceExists=false`) **only** when an
 - `system.databases` hides databases the identity has no privilege on. `EXISTS DATABASE` instead fails with 497 [V 25.3, 26.6, 26.8].
 - `system.tables` hides tables the identity cannot `SHOW` [V].
 
-In contrast, `system.users`, `system.roles`, `system.role_grants`, `system.grants` and `system.settings_profile_elements` fail with 497 without the required grant [V]. **`system.grants` and `system.role_grants` are not filtered by grantee:** with only `SELECT` on them, every user's and role's rows are visible [V 25.3, 26.6, 26.8]. `SHOW USERS` and `SHOW ROLES` are needed only for `system.users`, `system.roles` and `SHOW CREATE USER`.
+In contrast, `system.users`, `system.roles`, `system.role_grants`, `system.grants` and `system.settings_profile_elements` fail with 497 without the required grant [V]. **`system.grants` and `system.role_grants` are not filtered by grantee:** with only `SELECT` on them, every user's and role's rows are visible [V 25.3, 25.3.3, 26.6, 26.8]. `SHOW USERS` and `SHOW ROLES` are needed only for `system.users`, `system.roles` and `SHOW CREATE USER`.
 
 ### 5.3 Database
 
@@ -1353,7 +1380,7 @@ The re-check above runs first. 81 means the database is gone. The Update returns
    ```
 
    No row means `ResourceExists=false`. `system.users` is not filtered: without `SHOW USERS` it fails with 497. Then apply the ownership and storage rules ([4.2](#42-ownership)).
-2. **Name collision.** `SELECT count() FROM system.roles WHERE name = {name:String}`. A role with the same name gives error `NameCollision`: the server resolves grantee names user-first, so this user would capture every grant meant for that role [V 25.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
+2. **Name collision.** `SELECT count() FROM system.roles WHERE name = {name:String}`. A role with the same name gives error `NameCollision`: the server resolves grantee names user-first, so this user would capture every grant meant for that role [V 25.3, 25.3.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
 3. Run ``SHOW CREATE USER `name` `` and parse the `IDENTIFIED WITH` clause (see the parser below) when any of these holds:
    - the desired method is jwt;
    - `auth_type` contains `jwt`;
@@ -1382,8 +1409,8 @@ The re-check above runs first. 81 means the database is gone. The Update returns
 | Method | password | `auth_type` | Must be exactly `['sha256_password']`. `sha256_hash` users report `sha256_password` [V]. |
 | Password | `passwordSecretRef` value | connection Secret `password` | Equal. A missing connection Secret counts as drift: the desired password is re-applied and published. |
 | Password | `generate` | connection Secret `password`, `rotationToken` | A missing Secret or `password` key: generate a new password (Warning event `PasswordRegenerated`). `generate.rotationToken` set and different from the Secret's `rotationToken`: generate a new password (event `PasswordRotated`). |
-| Expiry | none | `valid_until` (an array, one entry per method, on A26.3, A26.6 and 26.8), or `VALID UNTIL` in `SHOW CREATE USER` (25.3, 25.8) | Any entry other than the epoch is drift. Re-applying `IDENTIFIED` clears it [V 25.3, 26.6, 26.8]. For a password user, the password re-applied is the desired one (`passwordSecretRef`) or the one in the connection Secret (`generate`). |
-| Hosts | `hostIP`, `hostNames` (empty means ANY) | `host_ip`, `host_names`, `host_names_regexp`, `host_names_like` | Set equality after normalisation (below). Any regexp or like entries count as drift. All four empty means `HOST NONE`, which is drift and never equals ANY [V 25.3, 26.6, 26.8]. |
+| Expiry | none | `valid_until` (an array, one entry per method, on A26.3, A26.6 and 26.8), or `VALID UNTIL` in `SHOW CREATE USER` (25.3, 25.8) | Any entry other than the epoch is drift. Re-applying `IDENTIFIED` clears it [V 25.3, 25.3.3, 26.6, 26.8]. For a password user, the password re-applied is the desired one (`passwordSecretRef`) or the one in the connection Secret (`generate`). |
+| Hosts | `hostIP`, `hostNames` (empty means ANY) | `host_ip`, `host_names`, `host_names_regexp`, `host_names_like` | Set equality after normalisation (below). Any regexp or like entries count as drift. All four empty means `HOST NONE`, which is drift and never equals ANY [V 25.3, 25.3.3, 26.6, 26.8]. |
 | Profile | `settingsProfile` (if not nil) | `inherit_profile` rows plus any `setting_name` rows | Exactly one profile equal to desired and no individual settings; for `""`, no rows. |
 | Default database | `defaultDatabase` (if not nil) | `default_database` | Equal; `""` means none [V all]. |
 | Default roles | `defaultRoles` (if not nil) | `default_roles_*` | All: `all=1, except=[]`. None: `all=0, list=[]`. AllExcept: `all=1`, set-equal except. Listed: `all=0`, list set-equal to **desired ∩ granted** (below). |
@@ -1391,14 +1418,14 @@ The re-check above runs first. 81 means the database is gone. The Update returns
 **Listed default roles.** The applied list is the desired roles that are currently granted to the user, according to `system.role_grants`.
 
 - Desired roles that are not granted are left out, and the provider emits Warning event `DefaultRoleNotGranted` naming them. It does not loop on 512.
-- Once a `RoleGrant` grants such a role, the next Observe sees the larger set and re-applies `DEFAULT ROLE`. A role granted to a `Listed` user does not become default by itself [V 25.3, 26.6, 26.8].
+- Once a `RoleGrant` grants such a role, the next Observe sees the larger set and re-applies `DEFAULT ROLE`. A role granted to a `Listed` user does not become default by itself [V 25.3, 25.3.3, 26.6, 26.8].
 - Server versions differ when a role is revoked:
   - On 26.6 and 26.8, `REVOKE` removes the role from `default_roles_list`, and a later `GRANT` does not restore it.
   - On 25.3 the stale entry stays in the list [V].
 
   Because the provider compares against desired ∩ granted and re-applies on drift, both behaviours converge.
 
-**Host normalisation.** The server rewrites the host list [V 25.3, 26.6, 26.8]:
+**Host normalisation.** The server rewrites the host list [V 25.3, 25.3.3, 26.6, 26.8]:
 
 - `'10.1.2.3/8'` becomes `'10.0.0.0/8'`;
 - `'10.0.0.0/255.0.0.0'` becomes `'10.0.0.0/8'`;
@@ -1434,8 +1461,10 @@ Desired entries that fail to parse are `InvalidSpec`, and so is a full-range ent
   method     := name [PROCESSOR lit] [CLAIMS lit] [BY lit] [SALT lit] [VALID UNTIL lit]
   ```
 
-  `PROCESSOR` is always printed before `CLAIMS` [V]. `VALID UNTIL` is a suffix of each method and can be followed by a comma and another method. For example, `IDENTIFIED WITH sha256_password VALID UNTIL '2031-01-01 00:00:00', plaintext_password HOST ...` [V 25.3, 26.6, 26.8].
+  `PROCESSOR` is always printed before `CLAIMS` [V]. `VALID UNTIL` is a suffix of each method and can be followed by a comma and another method. For example, `IDENTIFIED WITH sha256_password VALID UNTIL '2031-01-01 00:00:00', plaintext_password HOST ...` [V 25.3, 25.3.3, 26.6, 26.8].
 - **Stop.** The method list ends at a top-level `HOST`, `DEFAULT`, `SETTINGS`, `GRANTEES`, `IN` or end of input, **not** at `VALID`.
+- **Clause order.** `SHOW CREATE USER` prints `IDENTIFIED WITH ... [VALID UNTIL ...]`, `HOST`, `DEFAULT DATABASE`, `DEFAULT ROLE`, `SETTINGS`, and omits `HOST ANY` and `DEFAULT ROLE ALL`. `SETTINGS PROFILE` names the profile as a backtick identifier (``SETTINGS PROFILE `default` ``), not as a string literal [V 25.3.3, 26.6, 26.8].
+- **Lexer.** `sqlx.Lex` (shared with the `SHOW GRANTS` wildcard scanner of [5.6](#56-grant)) splits the statement into bare words, backtick identifiers, string literals and punctuation, with byte offsets; the grammar above is the User controller's.
 - **Ignored.** `BY`/`SALT` literals appear only when the server is configured to display secrets.
 - **Unknown method.** Reported as is, and it counts as drift.
 
@@ -1475,7 +1504,7 @@ ALTER USER `name` DEFAULT ROLE {ALL | NONE | `r1`, `r2` | ALL EXCEPT `r1`}
 ```
 
 - `ALTER USER ... IDENTIFIED WITH` replaces **all** authentication methods. That also removes extra methods added with `ADD IDENTIFIED` and clears `VALID UNTIL` [V].
-- `HOST` and `SETTINGS` replace the old values. `SETTINGS NONE` works [V 25.3, 26.6, 26.8].
+- `HOST` and `SETTINGS` replace the old values. `SETTINGS NONE` works [V 25.3, 25.3.3, 26.6, 26.8].
 - `DEFAULT ROLE` is kept separate so that an error in it does not block the other changes.
 - If the password changed, Update returns the new `password` (and, for `generate`, the new `rotationToken`) in `ConnectionDetails`. crossplane-runtime publishes them after Update returns. If the ALTER succeeds and publishing fails, the next Observe still sees the old `rotationToken` (or a mismatched password) in the Secret and rotates again. Server and Secret converge after the first successful publish.
 - **Switching from password to jwt.** Update returns `password: nil` and `rotationToken: nil` in `ConnectionDetails`. The local Secret publisher applies a JSON merge patch, and a null value removes the key [C]. An integration test confirms it [T].
@@ -1497,8 +1526,8 @@ DROP ROLE IF EXISTS `name`
 ```
 
 - Ownership and the storage rules are the same as for User.
-- **Name collision.** If a user with the same name exists, the result is error `NameCollision`, both before Create and in Observe. ClickHouse lets a user and a role share a name, even across storages. GRANT and REVOKE then resolve the grantee user-first, so grants meant for the role would land on the user [V 25.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
-- `DROP ROLE` removes the role from every grantee and from every `default_roles_list` [V 25.3, 26.6, 26.8]. This is the expected cascade.
+- **Name collision.** If a user with the same name exists, the result is error `NameCollision`, both before Create and in Observe. ClickHouse lets a user and a role share a name, even across storages. GRANT and REVOKE then resolve the grantee user-first, so grants meant for the role would land on the user [V 25.3, 25.3.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
+- `DROP ROLE` removes the role from every grantee and from every `default_roles_list` [V 25.3, 25.3.3, 26.6, 26.8]. This is the expected cascade.
 - v1 has nothing to update.
 
 ### 5.6 Grant
@@ -1512,7 +1541,7 @@ DROP ROLE IF EXISTS `name`
 
 **Unmanaged privileges: source privileges** (D-9). Source privileges cannot be modelled consistently across versions:
 
-- On 25.3, `S3`, `URL`, `REMOTE` and the rest are GLOBAL leaves under `SOURCES`, and `GRANT S3 ON *.*` is stored as an `S3` row [V 25.3].
+- On 25.3, `S3`, `URL`, `REMOTE` and the rest are GLOBAL leaves under `SOURCES`, and `GRANT S3 ON *.*` is stored as an `S3` row [V 25.3, 25.3.3].
 - From 25.8 on, they are GLOBAL leaves directly under `ALL`, and `READ`/`WRITE` exist at level `SOURCE` (aliases `SOURCE READ`/`SOURCE WRITE`). `GRANT S3, URL ON *.*` is stored as `READ`/`WRITE` rows with `access_object` `S3` and `URL`, while `SHOW GRANTS` still prints `GRANT S3 ON *.*` [V 25.8, A26.3, A26.6, 26.8].
 - New source privileges appear in new releases: `YTSAURUS` and `ARROW FLIGHT` on A26.6 and 26.8, and `BIGQUERY` and `DISK` on 26.8 [V].
 
@@ -1536,15 +1565,16 @@ A new leaf of that shape in a future version is treated as unmanaged until the a
    - COLUMN: COLUMN only.
 
    Unmanaged leaves are always dropped. A desired privilege with no applicable leaf is `InvalidSpec` (e.g. `CREATE DATABASE` on a table, which the server would reject with 509).
-4. **Unsupported levels.** Leaves of the levels NAMED_COLLECTION, USER_NAME, TABLE_ENGINE, DEFINER and SOURCE are rejected in v1. `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges [V 25.3, 26.6, 26.8]. `ALL` on `*.*` is therefore rejected. It would fail anyway for an identity bootstrapped with `access_management`, which has no named-collection rights.
+4. **Unsupported levels.** Leaves of the levels NAMED_COLLECTION, USER_NAME, TABLE_ENGINE, DEFINER and SOURCE are rejected in v1. `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges [V 25.3, 25.3.3, 26.6, 26.8]. `ALL` on `*.*` is therefore rejected. It would fail anyway for an identity bootstrapped with `access_management`, which has no named-collection rights.
 5. **The model was checked against the server.** Expanding `ALL`, `ALTER`, `SHOW`, `CREATE`, `DROP`, `SYSTEM`, `INTROSPECTION`, `SOURCES` and `dictGet` with these rules matches the server exactly at DATABASE and TABLE level on 25.3, 26.6 and 26.8. At GLOBAL level the only differences are unsupported-level and unmanaged leaves and `SHOW FILESYSTEM CACHES` [V]. The server stores grants in a **version-dependent** group-compressed form. For example, `GRANT ALTER ON app.*` is stored as one `ALTER` row on 25.3 and 26.6, and as `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8 [V]. The provider always compares expanded leaves, never the stored form. Recorded `system.privileges` fixtures for every version in the CI matrix keep the model honest (**OQ-14**).
 
 **Observe**
 
 1. **Grantee checks.**
-   - For a **role** grantee, `SELECT count() FROM system.users WHERE name = {g:String}` must be 0. Otherwise the result is error `AmbiguousGrantee`: the server resolves GRANT and REVOKE grantees user-first, so every statement would hit the user [V 25.3, 26.6, 26.8]. No SQL is sent.
+   - For a **role** grantee, `SELECT count() FROM system.users WHERE name = {g:String}` must be 0. Otherwise the result is error `AmbiguousGrantee`: the server resolves GRANT and REVOKE grantees user-first, so every statement would hit the user [V 25.3, 25.3.3, 26.6, 26.8]. No SQL is sent.
    - The grantee's storage comes from `system.users` or `system.roles`. A `users_xml` grantee is error `ReadOnlyStorage` when writes are allowed. The server would return 495 [V].
    - A grantee equal to `currentUser()` is error `SelfModification` when writes are allowed.
+   - When writes are allowed, the grantee must be owned by a `User` or `Role` MR of the namespace (`NotOwned` otherwise), and every GRANT and REVOKE re-checks the binding first ([4.3](#43-grants-and-role-grants-grantee-binding)).
 2. **Read the rows:**
 
    ```sql
@@ -1554,11 +1584,11 @@ A new leaf of that shape in a future version is treated as unmanaged until the a
    WHERE user_name = {grantee:String}                -- or: role_name = {grantee:String}
    ```
 
-3. **Wildcard check on servers without `is_wildcard`** (25.3, 25.8, A26.3, A26.6). A wildcard grant (`ON team_*.*`, `ON app.ev*`) is stored with the prefix as a plain name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant on a database or table with that name [V all]. The provider then runs ``SHOW GRANTS FOR <QuoteIdent(grantee)>`` and scans each `ON` object, aware of backtick quoting, for an unquoted `*` that directly follows an identifier character or a closing backtick. `SHOW GRANTS` prints wildcards unquoted (`team_*.*`, `` `team-a`*.* ``, `app.ev*`) and literal names with `*` quoted (`` `odd*name`.* ``) [V all]. If any wildcard is found, the result is error `Unsupported: grantee <g> has wildcard grants; managing its grants needs system.grants.is_wildcard (ClickHouse 26.8 or later)`. No SQL is sent.
+3. **Wildcard check on servers without `is_wildcard`** (25.3, 25.8, A26.3, A26.6). A wildcard grant (`ON team_*.*`, `ON app.ev*`) is stored with the prefix as a plain name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant on a database or table with that name [V all]. The provider then runs ``SHOW GRANTS FOR <QuoteIdent(grantee)>`` and scans each `ON` object, aware of backtick quoting, for an unquoted `*` that directly follows an identifier character or a closing backtick (with `sqlx.Lex`: a `*` token adjacent to the preceding word or quoted identifier). `SHOW GRANTS` prints wildcards unquoted (`team_*.*`, `` `team-a`*.* ``, `app.ev*`) and literal names with `*` quoted (`` `odd*name`.* ``) [V all]. If any wildcard is found, the result is error `Unsupported: grantee <g> has wildcard grants; managing its grants needs system.grants.is_wildcard (ClickHouse 26.8 or later)`. No SQL is sent.
 
 **Rows that are ignored.** These rows are never counted and never revoked:
 
-- `access_type` is unmanaged, or its level is unsupported (USER_NAME, NAMED_COLLECTION, TABLE_ENGINE, DEFINER, SOURCE). On 25.3, which has no `access_object`, a prefix-scoped `GRANT CREATE USER ON svc_*` looks like a global row [V 25.3]. Only the level rule keeps it out.
+- `access_type` is unmanaged, or its level is unsupported (USER_NAME, NAMED_COLLECTION, TABLE_ENGINE, DEFINER, SOURCE). On 25.3, which has no `access_object`, a prefix-scoped `GRANT CREATE USER ON svc_*` looks like a global row [V 25.3, 25.3.3]. Only the level rule keeps it out.
 - `access_object` is non-empty, where the column exists.
 
 **Classifying the remaining rows** relative to the Grant's target T:
@@ -1576,7 +1606,7 @@ Expand each row's `access_type` into applicable leaves. Then:
 - `exact` = leaves from exact rows. `exactGO` = those whose row has `grant_option = 1`.
 - Revoke rows strictly **below** T do not affect T. They are another target's business.
 
-Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows are `(SELECT, app, -, p=0)` and `(SELECT, app.t, p=1)`. A Grant of `SELECT ON app.t` therefore sees SELECT as **not** effective. The grantee really cannot read `app.t` [V 25.3, 26.6, 26.8].
+Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows are `(SELECT, app, -, p=0)` and `(SELECT, app.t, p=1)`. A Grant of `SELECT ON app.t` therefore sees SELECT as **not** effective. The grantee really cannot read `app.t` [V 25.3, 25.3.3, 26.6, 26.8].
 
 **ResourceExists**
 
@@ -1598,7 +1628,7 @@ Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows ar
 - Privileges at *other* targets are not touched, broader or narrower.
 - Two `Grant`s with the same grantee and the same exact target fight each other. That is unsupported and documented (**OQ-1**).
 
-**The server merges grants.** After `GRANT SELECT(a) ON app.t` and then `GRANT SELECT ON app.*`, only the database row remains. `REVOKE SELECT ON app.*` then removes both. Likewise, after `GRANT SELECT ON team_*.*`, a `GRANT SELECT ON team_a.*` adds no row [V 25.3, 26.6, 26.8].
+**The server merges grants.** After `GRANT SELECT(a) ON app.t` and then `GRANT SELECT ON app.*`, only the database row remains. `REVOKE SELECT ON app.*` then removes both. Likewise, after `GRANT SELECT ON team_*.*`, a `GRANT SELECT ON team_a.*` adds no row [V 25.3, 25.3.3, 26.6, 26.8].
 
 - A narrow Grant whose row was absorbed stays effective, so it stays up to date.
 - When such a Grant is deleted, `desired ∩ exact` is empty, so the MR goes away at once and nothing is revoked. The privilege remains through the broader grant.
@@ -1609,8 +1639,8 @@ Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows ar
 - A REVOKE at a narrow level under a broader grant creates a partial revoke. It removes part of someone else's grant [V].
 - So the provider only REVOKEs leaves that are present in exact rows **and** not covered by a broader row.
 - A leaf shadowed by a broader grant is left alone. The effective state is the same.
-- The one exception is grant option: `REVOKE GRANT OPTION FOR` on an exact row whose leaf is covered above without grant option removes the narrow row cleanly [V 25.3, 26.6, 26.8]. With no narrow row and a broader row that has grant option, the same statement creates a partial revoke of the grant option, so it is not issued then.
-- **Side effect to know:** any GRANT the provider issues at T erases third-party partial revokes at T and below T. Re-running `GRANT SELECT ON app.*` clears every partial revoke under `app.*` [V 25.3, 26.6, 26.8]. This is how a partial revoke at T is repaired, and it is documented.
+- The one exception is grant option: `REVOKE GRANT OPTION FOR` on an exact row whose leaf is covered above without grant option removes the narrow row cleanly [V 25.3, 25.3.3, 26.6, 26.8]. With no narrow row and a broader row that has grant option, the same statement creates a partial revoke of the grant option, so it is not issued then.
+- **Side effect to know:** any GRANT the provider issues at T erases third-party partial revokes at T and below T. Re-running `GRANT SELECT ON app.*` clears every partial revoke under `app.*` [V 25.3, 25.3.3, 26.6, 26.8]. This is how a partial revoke at T is repaired, and it is documented.
 
 **Create and Update** (idempotent statements, in this order):
 
@@ -1627,7 +1657,7 @@ REVOKE GRANT OPTION FOR <those leaves> ON <target> FROM `grantee`
 REVOKE GRANT OPTION FOR <those leaves> ON <target> FROM `grantee`
 ```
 
-- `toGrant = (desired − effective) ∪ (withGrantOption ? desired − effectiveGO : ∅)`. With `withGrantOption` the statement carries `WITH GRANT OPTION`. A leaf already effective without grant option must be granted again with it; a separate narrow row with grant option is then stored [V 25.3, 26.6, 26.8].
+- `toGrant = (desired − effective) ∪ (withGrantOption ? desired − effectiveGO : ∅)`. With `withGrantOption` the statement carries `WITH GRANT OPTION`. A leaf already effective without grant option must be granted again with it; a separate narrow row with grant option is then stored [V 25.3, 25.3.3, 26.6, 26.8].
 - The target is written as `*.*`, `` `db`.* ``, `` `db`.`t` ``, or column form ``SELECT(`a`, `b`), INSERT(`a`, `b`) ON `db`.`t` ``.
 - A REVOKE of a privilege that is not held is a no-op [V].
 
@@ -1646,7 +1676,7 @@ The **privilege ceiling** comes from the server. The identity can only grant wha
 
 **Observe**
 
-1. Grantee checks as for Grant: `AmbiguousGrantee` for a role grantee that shares its name with a user, the storage of the grantee from `system.users` or `system.roles`, and `SelfModification` for `currentUser()`.
+1. Grantee checks as for Grant: `AmbiguousGrantee` for a role grantee that shares its name with a user, the storage of the grantee from `system.users` or `system.roles`, `SelfModification` for `currentUser()`, and an owned grantee when writes are allowed ([4.3](#43-grants-and-role-grants-grantee-binding)). `memberOf` itself needs no owner: it may be a role from `users.d` that `grantableRoles` lists.
 2. Read the row:
 
    ```sql
@@ -1686,6 +1716,8 @@ The policy of the `ClusterProviderConfig` is evaluated in Observe, after the eff
 - **Deletion is gated by ownership and by the name checks.** The ownership claim is only annotations, which the tenant can edit (forging `owner-uid` and `owned-id`, or for User and Role the create annotations that row 5 reads), so the name policy is the boundary between tenants and must hold for the most destructive operation too. A name outside the policy never blocks deletion: the MR is orphaned (Warning event `OrphanedByPolicy`) and the object is left in place. Write, capability and collision checks are skipped while deleting, so tightening a policy never leaves finalizers stuck. User and Role follow the same rule.
 - A failed check returns `PolicyViolation` (or the listed reason) before any read of the object's details and before any write.
 - With `unrestricted: true` every policy check passes. Adoption still needs `allowAdoption`.
+- **JWT processor names** are validated on every config kind, before the policy (D-32): a processor is a key under `token_processors` in the server configuration, so a name that is not a letter or `_` followed by letters, digits, `_` or `-` (at most 128 characters) can never be configured. The server accepts any name at DDL time [V A26.6], and no system table lists the configured processors [V A26.6], so the user would silently be unable to log in. The result is `InvalidSpec`.
+- **Implementation.** `providerconfig.Policy` holds the checks; a nil `*Policy` is a namespaced ProviderConfig, where every policy check passes. `CheckUserWrite`, `CheckGrantee`, `CheckGrantTarget`, `CheckGrantWrite`, `CheckRoleGrantNames` and `CheckRoleGrantWrite` bundle the checks of each kind; `ValidateJWTProcessorName` is the syntax check.
 
 | Kind | Name checks | Write checks |
 |---|---|---|
@@ -1715,13 +1747,15 @@ The policy of the `ClusterProviderConfig` is evaluated in Observe, after the eff
        - otherwise, error `PolicyViolation`.
 
        Secrets are read from the namespace in each selector.
-     - **`ProviderConfig`.** Refused with `InvalidConfig` if `--enable-namespaced-provider-configs=false`. Get it from `mg.GetNamespace()`. Check `host:port` against `--namespaced-endpoint-pattern`. Its Secrets come from the same namespace.
+     - **`ProviderConfig`.** Refused with `InvalidConfig` if `--enable-namespaced-provider-configs=false`. Get it from `mg.GetNamespace()`. Check `host:port` against `--namespaced-endpoint-pattern`. Its Secrets come from the same namespace. While the MR is being deleted, a ProviderConfig that either flag forbids orphans the MR like a denied namespace (Warning event `OrphanedByPolicy`, no connection, no SQL), so that changing the flags never leaves finalizers stuck (D-31).
   2. **Then** track usage with `resource.NewProviderConfigUsageTracker(c, &v1alpha1.ProviderConfigUsage{}).Track(ctx, mg)`. Reading a config is not using it, so this keeps Crossplane's "track before use" rule. A namespace the config denies therefore never creates a usage that would block deleting the config.
   3. Check that referenced MRs use the same ProviderConfig ([3.1](#31-conventions)).
   4. Get a client from the cache ([6.3](#63-client-cache)).
   5. Return an external client holding the client, the effective policy, the capabilities, `currentUser()`, the kube client and the uncached API reader.
 
   `Disconnect` releases the client reference.
+
+  The access entity kinds share this flow as `access.Connector[T]` (`access.NewConnector` wires it to the manager and `access.Dependencies`), their external clients embed `access.Env` (which also carries the uncached API reader for the User's connection Secret), and `access.Setup` builds their controllers with the options above (`WithInitializers` is always passed, empty for Grant and RoleGrant, so crossplane-runtime's default `NameAsExternalName` never runs). `providerconfig.NewReferenceResolver` wraps the generated resolver with the namespace check, and `providerconfig.CheckReferencedConfigs` is step 3.
 - **Config controllers.** There are two `providerconfig.NewReconciler` instances, one per config kind. Both watch `ProviderConfigUsage` with `resource.EnqueueRequestForProviderConfig{Kind: ...}`. The usage tracker labels each usage with the config kind, so the two controllers do not count each other's usages [C].
 
 ### 5.10 Conditions and readiness
@@ -1894,18 +1928,18 @@ Capabilities are detected per client entry and refreshed every 10 minutes, which
 |---|---|---|---|
 | Version | `SELECT version()` | Connect | Shown in events and errors. `altinityantalya` in the string identifies Antalya, for information only. |
 | Current user | `SELECT currentUser()` | Connect | Self-modification guard ([4.2](#42-ownership)). No grant needed. |
-| Server UUID | `SELECT serverUUID()` | Connect, refresh, before access-entity writes | Multi-server detection ([section 8](#8-topology-replicas-and-clusters)). No grant needed [V 25.3, 26.8]. |
-| JWT users | `EXPLAIN AST CREATE USER capability_probe IDENTIFIED WITH jwt` | first jwt User | No side effects. AST: supported (A26.3, A26.6). Code 36 "CREATE USER is not supported for JWT" (25.8, 26.8) or 62 `SYNTAX_ERROR` (25.3): unsupported [V all]. Any other error goes on that MR only. Ran with the minimal identity on 26.6.4 [V]; on the other versions only as an administrator (**OQ-17**). |
+| Server UUID | `SELECT serverUUID()` | Connect, refresh, before access-entity writes | Multi-server detection ([section 8](#8-topology-replicas-and-clusters)). No grant needed [V 25.3, 25.3.3, 26.8]. |
+| JWT users | `EXPLAIN AST CREATE USER capability_probe IDENTIFIED WITH jwt` | first jwt User | No side effects. AST: supported (A26.3, A26.6). Code 36 "CREATE USER is not supported for JWT" (25.8, 26.8) or 62 `SYNTAX_ERROR` (25.3, 25.3.3): unsupported [V all]. Any other error goes on that MR only. Needs no grant: it runs with the minimal identity on every image [V all, including 25.3.3]. |
 | Access storage | `SELECT name, type, precedence FROM system.user_directories ORDER BY precedence` | first User, Role, Grant or RoleGrant | The first writable directory is where new entities go: `local_directory` or `replicated`. |
 | Cluster hosts | `SELECT count() FROM system.clusters WHERE cluster = {c:String}` | when `spec.cluster` is set | 0 means `InvalidConfig: unknown cluster`. |
-| `system.grants` columns | `SELECT name FROM system.columns WHERE database = 'system' AND table = 'grants'` | first Grant | `access_object` and `is_wildcard` ([5.6](#56-grant)). |
-| `system.users` columns | the same for `table = 'users'` | first User | `valid_until` ([5.4](#54-user)). |
+| `system.grants` columns | ``SELECT `access_object` FROM system.`grants` LIMIT 0``, the same for `is_wildcard` | first Grant | `access_object` and `is_wildcard` ([5.6](#56-grant)). Success means present; 47 `UNKNOWN_IDENTIFIER` (16 without the analyzer) means absent; any other error goes on that MR. |
+| `system.users` columns | ``SELECT `valid_until` FROM system.`users` LIMIT 0`` | first User | `valid_until` ([5.4](#54-user)). `system.columns` is not used: it is filtered by `SHOW COLUMNS`, and the minimal identity (which has `SHOW USERS`, not `SELECT ON system.users`) sees none of the columns of `system.users` there [V 25.3.3, 26.6, 26.8] (A41). The direct probe needs exactly the grant the kind needs anyway. |
 | Database comment | `ALTER MODIFY DATABASE COMMENT` present in the cached `system.privileges` | first Database with a comment change | Missing on 25.3. |
-| Privilege catalogue | `SELECT privilege, aliases, level, parent_group FROM system.privileges` | first Grant | [5.6](#56-grant). |
+| Privilege catalogue | `SELECT privilege, aliases, level, parent_group FROM system.privileges` (enums as strings, NULL as `''`) | first Grant | [5.6](#56-grant). |
 
 **Version matrix** [V all]:
 
-| | 25.3.14 | 25.8.33 | 26.8.23 | Antalya 26.3.13 | Antalya 26.6.4 |
+| | 25.3.14, 25.3.3 | 25.8.33 | 26.8.23 | Antalya 26.3.13 | Antalya 26.6.4 |
 |---|---|---|---|---|---|
 | jwt users (probe result) | no (62) | no (36) | no (36) | yes | yes |
 | `system.grants.access_object` | no | yes | yes | yes | yes |
@@ -1915,7 +1949,9 @@ Capabilities are detected per client entry and refreshed every 10 minutes, which
 | Source privileges | children of `SOURCES` | `READ`/`WRITE` + `access_object` | same | same | same |
 | `system.privileges` rows | 206 | 211 | 248 | 233 | 246 |
 
-**Supported versions** (D-17). Upstream 25.3 and later; Antalya 26.3 and later. Older servers are untested and not supported. 25.3 stays in the list on purpose: it is still widely deployed, including early patch releases, so CI tests the early patch `25.3.3.42` rather than the latest 25.3 patch. On 25.3, database comments cannot be changed after creation and wildcard coverage is not available. The README carries this matrix.
+**Supported versions** (D-17). Upstream 25.3 and later; Antalya 26.3 and later. Older servers are untested and not supported. 25.3 stays in the list on purpose: it is still widely deployed, including early patch releases, so CI tests the early patch `25.3.3.42` rather than the latest 25.3 patch. The matrix above holds for 25.3.3.42 as well [V 25.3.3]. On 25.3, database comments cannot be changed after creation, wildcard coverage is not available, and `VALID UNTIL` is visible only in `SHOW CREATE USER`. The README carries this matrix.
+
+**Implementation.** `internal/clients/clickhouse` caches every probe per client entry: `JWTUsers`, `UsersValidUntil`, `GrantsAccessObject`, `GrantsIsWildcard`, `DatabaseCommentChange`, `Privileges`, `AccessStorage` and `ClusterHosts`. A failed probe is not cached. `fake.Profile` scripts the probes of each image of the matrix for unit tests.
 
 **Reporting.**
 
@@ -2052,7 +2088,7 @@ Real isolation between tenants needs both name patterns and server-side scoping.
 
 ### 9.4 Minimal grants for the provider identity
 
-In `users.d` the same lines go under `grants: {query: [...]}`. That the prefix syntax works there is [T]. Each row was verified with an SQL identity unless marked.
+In `users.d` the same lines go under `grants: {query: [...]}`; the prefix syntax works there [V all, including 25.3.3]. Each row was verified with an SQL identity unless marked.
 
 | Feature | Grants | Why |
 |---|---|---|
@@ -2121,7 +2157,7 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
   - source rows (`S3` on 25.3; `READ`/`WRITE` + `access_object` on 25.8+) and USER_NAME-level rows are ignored and never revoked;
   - the unmanaged-privilege classification, including the allow-list;
   - partial-revoke avoidance.
-- **Ownership decision table.** Every row of [4.2](#42-ownership), crossed with deleting/not deleting and with observe-only vs write policies. Plus:
+- **Ownership decision table.** Every row of [4.2](#42-ownership), crossed with deleting/not deleting and with observe-only vs write policies, and row 5 with and without a create journal record (forged `external-create-pending` and `create-outcome`, a read-back UUID that differs). Plus:
   - a copied manifest (`owner-uid` mismatch);
   - a restored manifest;
   - import followed by a switch to `["*"]`;
@@ -2157,6 +2193,7 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
   - pre-send checks: audience present, API-server audience rejected, expired token rejected, automount path refused, non-JWT rejected;
   - service account key validation, and rejection of an `external_account` file.
 - **Connection Secret handling:** only a Secret controlled by the MR is trusted; reads use the API reader; the rotation token comparison; `password: nil` on the switch to jwt.
+- **Grantee binding** ([4.3](#43-grants-and-role-grants-grantee-binding)): owned, not owned, owner with another ProviderConfig or namespace, copied or stale owner claim, missing, ambiguous, users.xml, self, and each of them while deleting; the re-check before a write.
 - **External clients per kind.** A mock `DB` interface (in the style of provider-sql's `mockDB`, with `MockExec`/`MockQuery`), `test.MockClient`, `cmp` with `test.EquateErrors()`/`EquateConditions()`. They cover Observe, Create, Update and Delete, including every "never treat as not found" path and the `Ready` table of [5.10](#510-conditions-and-readiness).
 
 ### 10.2 Integration tests (build tag `integration`)
@@ -2219,6 +2256,8 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
   12. 516: an expired token followed by a valid file triggers exactly one retry and succeeds.
   13. Names: `@`, `.`, quote, backslash, TAB, backtick, `*` and Unicode through every kind.
   14. Redaction: a forced syntax error on an `IDENTIFIED` statement leaves no hash or salt in conditions or events.
+  15. Shared foundations (`TestAccessFoundation`, all images, minimal prefix-scoped identity): capability probes agree with the administrator's view and with section 7; entity reads with adversarial names; the ownership flow of a role (create, lost response recovered through the journal, forged create annotations refused, replacement detected, nothing touched while deleting); the grantee binding; the lexer on `SHOW CREATE USER` and `SHOW GRANTS` read through the driver.
+- **Harness.** `mrHarness[T]` drives any kind's external client like crossplane-runtime's managed reconciler (initializers, references, Observe, Create/Update/Delete, critical annotations, the connection Secret through crossplane-runtime's publisher). `accessFixture` starts a server with the identity of [9.4](#94-minimal-grants-for-the-provider-identity) for every access kind (password on upstream, JWT with two token processors on Antalya) and builds connectors, environments and owned grantee MRs.
 
 ### 10.3 API tests (mandatory)
 
@@ -2258,12 +2297,13 @@ Installing the real xpkg into kind needs a local registry, so it is deferred.
 ├── internal/
 │   ├── clients/clickhouse/         # DB interface, options, cache, errors, redaction, quote, params, capabilities
 │   │   ├── auth/                   # token sources, pre-send checks, key validation
-│   │   └── sqlx/                   # builders, SHOW CREATE parser, SHOW GRANTS wildcard scanner, hosts, claims, privileges
+│   │   └── sqlx/                   # builders, shared entity reads, SQL lexer, SHOW CREATE parser, SHOW GRANTS wildcard scanner, hosts, claims, privileges
 │   ├── controller/
 │   │   ├── register.go             # SetupGated
 │   │   ├── config/                 # ProviderConfig + ClusterProviderConfig controllers
 │   │   ├── providerconfig/         # Resolve(), policy, flags
-│   │   ├── ownership/              # initializer, decision table, annotation patching
+│   │   ├── ownership/              # initializer, decision table, create journal, annotation patching
+│   │   ├── access/                 # shared by User, Role, Grant, RoleGrant: entity ownership flow, grantee binding, topology guard, connector, setup
 │   │   └── database/ user/ role/ grant/ rolegrant/
 │   └── version/
 ├── package/
@@ -2462,7 +2502,7 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | D-14 | RoleGrant field names | Usability review: `memberOf` plus `user`/`role` as the grantee. | Adopted before the first release. | Same meaning as in Grant and in provider-sql. Renaming after v0.1.0 would be breaking. |
 | D-15 | JWT claims type | Usability review: a YAML object. | `*apiextensionsv1.JSON` with `type: object`. Provider-side canonicalisation is kept. | Easier to read and diff, with no escaping. |
 | D-16 | `DEFAULT DATABASE` | Usability review: in scope. Semantics review: it can block logins. | In scope as `defaultDatabase` (tri-state, late-initialized). | Cheap, observable, and needed by most application users. |
-| D-17 | Supported versions and CI | Semantics review: declare a minimum, test 25.3 or exclude it. Usability review: add the 25.3 and 25.8 LTS lines. | Upstream 25.3+ and Antalya 26.3+. CI covers 25.3 (patch 25.3.3.42), 25.8, 26.8, Antalya 26.3 and 26.6. | All five were probed during this revision. Capability detection makes the differences explicit. 25.3 is kept, not raised to 25.8: early 25.3 patches are still in production use. The Database integration tests pass on 25.3.3.42; facts marked [V 25.3] were probed on 25.3.14.14 and are re-checked on 25.3.3.42 when the User, Role and Grant controllers are built. |
+| D-17 | Supported versions and CI | Semantics review: declare a minimum, test 25.3 or exclude it. Usability review: add the 25.3 and 25.8 LTS lines. | Upstream 25.3+ and Antalya 26.3+. CI covers 25.3 (patch 25.3.3.42), 25.8, 26.8, Antalya 26.3 and 26.6. | All five were probed during this revision. Capability detection makes the differences explicit. 25.3 is kept, not raised to 25.8: early 25.3 patches are still in production use. The Database integration tests pass on 25.3.3.42. The access entity facts marked [V 25.3] (probed on 25.3.14.14) were re-checked on 25.3.3.42 in revision 4 and hold there ([V 25.3.3]). |
 | D-18 | Cluster Database deletion | Usability review; code review: the `clusterAllReplicas(system.tables)` count can be filtered on remote hosts and silently return 0. | **Revised:** in cluster mode Delete always needs `forceDrop`. Before every ON CLUSTER ALTER or DROP the UUID is checked on every host (`REMOTE`), and another UUID on any host refuses the write. Examples omit `Delete` for cluster Databases. | Neither the single-replica check nor the `DROP TABLE` backstop protects data on other shards, and no unfilterable remote emptiness check exists. ON CLUSTER writes go by name to every host, so ownership must hold on every host. |
 | D-19 | When `Ready` is true | Security review: Available when the object exists, is owned and is up to date. | Available when the object exists and ownership is fine, **regardless of drift**. | Update runs in the same reconcile. Requiring "up to date" would keep `Ready=False` for a whole poll interval after every repaired drift. Failures still show as `Synced=False`. |
 | D-20 | Namespace removed from `allowedNamespaces` while MRs are deleted there | Security review: orphan with an event, or document the hang. | Orphan, with Warning event `OrphanedByPolicy`. | Unblocks namespace deletion and never drops data. |
@@ -2474,6 +2514,10 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | D-26 | Management policies | Code review: crossplane-runtime honours them only with `managed.WithManagementPolicies()`, which was tied to `--enable-management-policies`. | Always passed. The flag is hidden and `false` is refused at startup. Second guard: while deleting, Decide reports only Owned, Adopted and Recovered as existing, whatever the policies; Update and Delete refuse without a valid claim. | Ownership depends on policies: an observe-only MR must never alter or drop anything. |
 | D-27 | Replicated engine Keeper path | Code review: a tenant registered a replica under another tenant's Replicated database path (verified on 26.8: the victim's DDL failed with 159). | Without `unrestricted`, only `/clickhouse/databases/{uuid}` and paths matching `policy.zooKeeperPathPatterns` are allowed, checked before CREATE. | "Contains `{uuid}`" is not enough: a path nested under another database's node (`.../victim/replicas/{uuid}`) is just as harmful. |
 | D-28 | HTTP bearer transport over TLS | Code review. | The transport strips every credential header the server reads (including `X-ClickHouse-SSL-Certificate-Auth`) and the `user`/`password` URL parameters. Covered by an HTTPS integration test. | clickhouse-go asks for certificate authentication with user `default` over TLS when the password is empty; the server rejects that with a bearer token (verified on Antalya 26.6). |
+| D-29 | Recovery of a lost User or Role create (row 5) | Code review of the access entity foundations: a tenant who forges `external-create-pending` (or `create-outcome: unknown`) on an MR that points at an existing entity inside its name patterns would have it claimed, then altered or dropped. | Row 5 also needs a record in an in-memory create journal: this provider process sent the CREATE for the same MR UID, name, ProviderConfig and server, and its outcome was not a rejection; a record with a read-back UUID only recovers that UUID. Records expire after an hour and are dropped once the entity is owned. Without a record the result is `NotOwned` with a hint to adopt. | The annotations are tenant-writable; process memory is not. The cost: a create interrupted by a provider restart needs adoption by UUID (on a ClusterProviderConfig, with `allowAdoption`). Persisting the journal is **OQ-28**. |
+| D-30 | Ownership of grants and role grants | Code review of the access entity foundations: the provider must never grant to or revoke from an access entity it did not create, unless adopted by UUID. | A Grant or RoleGrant writes only when its grantee is owned by a User or Role MR in the same namespace with the same ProviderConfig (a valid claim on the grantee's current UUID), in addition to the name policy. The binding is re-checked before every GRANT and REVOKE. While deleting, an unowned grantee orphans the MR ([4.3](#43-grants-and-role-grants-grantee-binding)). | Grants carry no UUID, so the grantee's claim is the only ownership anchor. Granting to an entity managed elsewhere needs adopting it first; observe-only Grants can still report the grants of any grantee that the name policy allows. |
+| D-31 | Provider flags while an MR is deleted | Review of the namespaced ProviderConfig rules. | A namespaced ProviderConfig forbidden by `--enable-namespaced-provider-configs=false` or `--namespaced-endpoint-pattern` orphans a deleting MR (`OrphanedByPolicy`, no SQL); a live MR still fails with `InvalidConfig`. | Same reasoning as D-20: changing provider flags must never leave finalizers stuck, and orphaning writes nothing. |
+| D-32 | JWT processor names | Code review of the access entity foundations: the server accepts any processor name. | Validated on every config kind (`InvalidSpec` unless a configuration key: a letter or `_`, then letters, digits, `_` or `-`, at most 128 characters), then `allowedJWTProcessors` on a ClusterProviderConfig. | No system table lists the configured processors on Antalya 26.6 [V], so syntax and the policy allow-list are the checks available. |
 
 ---
 
@@ -2493,7 +2537,6 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-11 | Settings profiles, quotas, row policies, per-user settings, `VALID UNTIL`, `HOST REGEXP/LIKE`, role settings, role-level profiles. | Later versions. |
 | OQ-14 | The privilege expansion model must match the server for every supported version. | Verified at DATABASE and TABLE level on 25.3, 26.6 and 26.8. Per-version fixtures and integration tests gate releases. 25.8 and A26.3 fixtures still to be recorded. |
 | OQ-16 | Behaviour differences in Antalya 26.6.8+ (OR REPLACE, native Hello marker) and newer upstream releases. | Add to the CI matrix when available. No OR REPLACE is used. |
-| OQ-17 | Does the `EXPLAIN AST` jwt probe need privileges on any supported version? | Verified with the minimal identity on 26.6.4 only; integration tests run it with the minimal identity on every image. |
 | OQ-18 | HTTP(S) transport. | Deferred; design in [6.6](#66-deferred-http-transport). |
 | OQ-19 | An `OIDCClientCredentials` token source (token URL, client ID, client secret Secret, scopes/audience) for non-Google identity providers, cluster-scoped only. | Not in v1; the sidecar pattern in `docs/auth.md` covers it meanwhile. |
 | OQ-20 | Deterministic multi-server detection: run `serverUUID()` on every new pooled connection (needs a per-connection hook in clickhouse-go). | Best effort through repeated probes ([section 8](#8-topology-replicas-and-clusters)). |
@@ -2504,15 +2547,17 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-25 | `allowedNamespaces` as a `namespaceSelector` (label-based). | Not in v1: it needs RBAC on Namespaces. |
 | OQ-26 | Is `REMOTE` acceptable for the cluster ownership check, or should the provider connect to each host listed in the config instead? | `REMOTE` for cluster Databases that Update or Delete; Delete also needs `forceDrop`, and examples omit `Delete`. |
 | OQ-27 | Warn when `defaultDatabase` names a database that does not exist, which blocks logins? | Not in v1; documented. |
+| OQ-28 | Persist the create journal of D-29 (for example in a provider-owned Secret or as an HMAC-signed annotation with a provider-held key), so that a create interrupted by a provider restart is recovered without adoption. | Not in v1: in memory only. |
 
 **Closed in revision 2:**
 
 | # | Question | Answer |
 |---|---|---|
-| OQ-2 | Partial revokes below a Grant's target. | A partial revoke at the target, under a covering row, makes the privilege not effective, and `GRANT` at the target repairs it. Revokes below the target are ignored. Any provider GRANT at T erases third-party revokes at and below T, which is documented [V 25.3, 26.6, 26.8]. |
+| OQ-2 | Partial revokes below a Grant's target. | A partial revoke at the target, under a covering row, makes the privilege not effective, and `GRANT` at the target repairs it. Revokes below the target are ignored. Any provider GRANT at T erases third-party revokes at and below T, which is documented [V 25.3, 25.3.3, 26.6, 26.8]. |
 | OQ-12 | A `databaseNamePatterns` policy. | Added. Server grants alone cannot separate tenants who share one identity ([9.3](#93-provider-identity-sources-and-tenancy)). |
 | OQ-13 | Referenced MRs must use the same ProviderConfig. | Yes, for `*Ref` and `*Selector`, and references cannot leave the namespace ([3.1](#31-conventions)). Plain names are not checked. |
-| OQ-15 | Is `system.grants` filtered for grantees the identity cannot see? | No. With only `SELECT ON system.grants`, all rows are visible; `system.role_grants` is the same [V 25.3, 26.6, 26.8]. |
+| OQ-15 | Is `system.grants` filtered for grantees the identity cannot see? | No. With only `SELECT ON system.grants`, all rows are visible; `system.role_grants` is the same [V 25.3, 25.3.3, 26.6, 26.8]. |
+| OQ-17 | Does the `EXPLAIN AST` jwt probe need privileges on any supported version? (closed in revision 4) | No: it runs with the minimal identity on every image of the CI matrix [V all]. |
 
 ---
 
@@ -2528,40 +2573,43 @@ Versions as defined at the top: plain [V] means Antalya 26.6.4 and upstream 26.8
 | A4 | Native login: user `" JWT AUTHENTICATION "` with the token as password (clickhouse-go `GetJWT`, once per new connection). HTTP: `Authorization: Bearer` only. clickhouse-go over plain HTTP ignores `GetJWT` and sends `default`. | [V] (prior tests) + [C] |
 | A5 | HTTP GET forces `readonly=2`. clickhouse-go always POSTs. | [V] + [C] |
 | A6 | Native tokens are checked only at handshake; 516 on an invalid or expired token; 60 s default leeway. | [V] (prior tests) |
-| A7 | users.xml/users.d entities are read-only: ALTER, GRANT, or CREATE with the same name returns 495, even with `IF EXISTS` / `IF NOT EXISTS`. | [V 25.3, 26.6, 26.8] |
+| A7 | users.xml/users.d entities are read-only: ALTER, GRANT, or CREATE with the same name returns 495, even with `IF EXISTS` / `IF NOT EXISTS`. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A8 | A users.d role granted to an SQL user survives a restart. `GRANT <SQL role> TO <users.d user>` returns 495. A users.d user whose `grants:` configuration references an SQL role loses it at startup. | [V] |
-| A9 | Plain `CREATE USER` on an existing name returns 493. `CREATE USER IF NOT EXISTS` silently succeeds, changes nothing and keeps the UUID. | [V 25.3, 26.6, 26.8] |
+| A9 | Plain `CREATE USER` on an existing name returns 493. `CREATE USER IF NOT EXISTS` silently succeeds, changes nothing and keeps the UUID. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A10 | `CREATE USER` without `IDENTIFIED` creates a `no_password` user. | [V] |
-| A11 | `sha256_hash BY hex(SHA256(pw ‖ salt-as-text)) SALT salt` logs in with `pw`; hashing the hex-decoded salt bytes gives 516. Test vector: `Pa55word` + `00112233445566778899aabbccddeeff` → `6257310c…61848188`. Every build requires a 64-hex-digit hash (36 otherwise). `SHOW CREATE USER` shows `IDENTIFIED WITH sha256_password` only. `query_log` is masked. | [V 25.3, 26.6, 26.8] |
-| A12 | `ALTER USER ... IDENTIFIED WITH ...` replaces all methods, including ones added with `ADD IDENTIFIED`, and clears `VALID UNTIL`. `HOST` and `SETTINGS` replace the old values; `SETTINGS NONE` works. A combined `ALTER USER ... IDENTIFIED ... HOST ... SETTINGS NONE DEFAULT ROLE ALL` works. | [V 25.3, 26.6, 26.8] |
-| A13 | Host rewrites: CIDR masked, mask notation converted (`/255.0.0.0` → `/8`), `/32` and `/128` shown bare, IPv6 compressed, order changed. `0.0.0.0/0` collapses to ANY (`['::/0']`) and drops host names. Host names keep their case. `HOST NONE` gives four empty arrays. `HOST LOCAL` gives `host_names=['localhost']`. | [V 25.3, 26.6, 26.8] |
-| A14 | `DEFAULT ROLE` with a non-granted role returns 512; with an unknown role, 511. `DEFAULT ROLE ALL EXCEPT r` with an existing but not granted role works. An unknown grantee returns 511 in `GRANT r TO x` and in privilege `GRANT`/`REVOKE`. REVOKE of a privilege or role that is not held is a no-op. | [V 25.3, 26.6, 26.8] |
-| A15 | New users start with `DEFAULT ROLE ALL`. With `Listed` or `NONE`, a later `GRANT` does not make the role default. REVOKE removes the role from `default_roles_list` on 26.6 and 26.8, and a later GRANT does not restore it; on 25.3 the stale entry stays. `DROP ROLE` removes the role from every list. | [V 25.3, 26.6, 26.8] |
-| A16 | Grants are stored expanded to level-applicable privileges in a version-dependent group-compressed form (`GRANT ALTER ON app.*`: `ALTER` on 25.3 and 26.6; `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8). A narrow grant is absorbed by a broader one. `REVOKE` at the broader level removes both. A narrow REVOKE under a broad grant creates a partial revoke row. `GRANT` at T removes partial revokes at T and below. Grants on nonexistent databases are accepted. | [V 25.3, 26.6, 26.8] |
-| A17 | `REVOKE GRANT OPTION FOR` works. `GRANT ... WITH GRANT OPTION` under a broader row without grant option stores a separate narrow row; `REVOKE GRANT OPTION FOR` then removes it cleanly. With only a broader row holding grant option, `REVOKE GRANT OPTION FOR` at a narrow level creates a partial revoke of the option (`is_partial_revoke = 1, grant_option = 1`). | [V 25.3, 26.6, 26.8] |
+| A11 | `sha256_hash BY hex(SHA256(pw ‖ salt-as-text)) SALT salt` logs in with `pw`; hashing the hex-decoded salt bytes gives 516. Test vector: `Pa55word` + `00112233445566778899aabbccddeeff` → `6257310c…61848188`. Every build requires a 64-hex-digit hash (36 otherwise). `SHOW CREATE USER` shows `IDENTIFIED WITH sha256_password` only. `query_log` is masked. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A12 | `ALTER USER ... IDENTIFIED WITH ...` replaces all methods, including ones added with `ADD IDENTIFIED`, and clears `VALID UNTIL`. `HOST` and `SETTINGS` replace the old values; `SETTINGS NONE` works. A combined `ALTER USER ... IDENTIFIED ... HOST ... SETTINGS NONE DEFAULT ROLE ALL` works. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A13 | Host rewrites: CIDR masked, mask notation converted (`/255.0.0.0` → `/8`), `/32` and `/128` shown bare, IPv6 compressed, order changed. `0.0.0.0/0` collapses to ANY (`['::/0']`) and drops host names. Host names keep their case. `HOST NONE` gives four empty arrays. `HOST LOCAL` gives `host_names=['localhost']`. In a `HOST` list, the entries after a `REGEXP` or `LIKE` entry are silently dropped on 25.3.3 and A26.6 (`HOST LIKE 'a', LIKE 'b'` stores only `a`); 26.8 keeps them. The provider never writes `REGEXP` or `LIKE`, it only reports them as drift. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A14 | `ALTER USER ... DEFAULT ROLE` with a non-granted role returns 512; `CREATE USER ... DEFAULT ROLE` accepts an existing role that is not granted yet, stores it in `default_roles_list`, and the role is active once granted; with an unknown role, 511. `DEFAULT ROLE ALL EXCEPT r` with an existing but not granted role works. An unknown grantee returns 511 in `GRANT r TO x` and in privilege `GRANT`/`REVOKE`. REVOKE of a privilege or role that is not held is a no-op. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A15 | New users start with `DEFAULT ROLE ALL`. With `Listed` or `NONE`, a later `GRANT` does not make the role default. REVOKE removes the role from `default_roles_list` on 26.6 and 26.8, and a later GRANT does not restore it; on 25.3 the stale entry stays. `DROP ROLE` removes the role from every list. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A16 | Grants are stored expanded to level-applicable privileges in a version-dependent group-compressed form (`GRANT ALTER ON app.*`: `ALTER` on 25.3 and 26.6; `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8). A narrow grant is absorbed by a broader one. `REVOKE` at the broader level removes both. A narrow REVOKE under a broad grant creates a partial revoke row. `GRANT` at T removes partial revokes at T and below. Grants on nonexistent databases are accepted. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A17 | `REVOKE GRANT OPTION FOR` works. `GRANT ... WITH GRANT OPTION` under a broader row without grant option stores a separate narrow row; `REVOKE GRANT OPTION FOR` then removes it cleanly. With only a broader row holding grant option, `REVOKE GRANT OPTION FOR` at a narrow level creates a partial revoke of the option (`is_partial_revoke = 1, grant_option = 1`). | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A18 | Wildcard grants `ON team_*.*` and `ON app.ev*` are stored with the prefix as the name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant without `is_wildcard` (only 26.8 has it). `SHOW GRANTS` prints wildcards unquoted and literal `*` names quoted. Wildcards absorb narrower grants; a narrow REVOKE under one creates a partial revoke. | [V all] |
 | A19 | Source privileges: on 25.3 `S3`, `URL`, ... are children of `SOURCES` and stored by name. From 25.8 they are GLOBAL leaves under `ALL`, `READ`/`WRITE` exist at level `SOURCE`, and `GRANT S3 ON *.*` is stored as `READ`/`WRITE` with `access_object = 'S3'` while `SHOW GRANTS` prints `GRANT S3 ON *.*`. New sources per version: `YTSAURUS`, `ARROW FLIGHT` (A26.6, 26.8), `BIGQUERY`, `DISK` (26.8). | [V all] |
-| A20 | A user and a role may share a name, even across storages. GRANT and REVOKE resolve the grantee user-first. `CREATE ROLE <users.d user name>` succeeds, and a later GRANT to that name returns 495. `CREATE USER <users.d role name>` succeeds, and grants to that name land on the new user. | [V 25.3, 26.6, 26.8] |
+| A20 | A user and a role may share a name, even across storages. GRANT and REVOKE resolve the grantee user-first. `CREATE ROLE <users.d user name>` succeeds, and a later GRANT to that name returns 495. `CREATE USER <users.d role name>` succeeds, and grants to that name land on the new user. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A21 | `system.grants` columns: 25.3 `user_name, role_name, access_type, database, table, column, is_partial_revoke, grant_option`; 25.8, A26.3 and A26.6 add `access_object`; 26.8 also adds `is_wildcard`. `system.users.valid_until`: absent on 25.3 and 25.8, `Array(DateTime)` on A26.3 and A26.6, `Array(DateTime64(0))` on 26.8, one entry per method. `default_database` exists everywhere. `auth_params` is `Array(String)`. | [V all] |
-| A22 | `system.databases` and `system.tables` are silently filtered by privileges; `EXISTS DATABASE` fails with 497 instead. `system.users`, `roles`, `role_grants`, `grants` and `settings_profile_elements` fail with 497 without a grant. `system.grants` and `system.role_grants` are not filtered by grantee. `system.privileges` needs no grant. | [V 25.3, 26.6, 26.8] |
+| A22 | `system.databases` and `system.tables` are silently filtered by privileges; `EXISTS DATABASE` fails with 497 instead. `system.users`, `roles`, `role_grants`, `grants` and `settings_profile_elements` fail with 497 without a grant. `system.grants` and `system.role_grants` are not filtered by grantee. `system.privileges` needs no grant. | [V 25.3, 26.6, 26.8]; access tables also [V 25.3.3] |
 | A23 | `DROP DATABASE` on a non-empty database needs `DROP TABLE` on its tables (497 otherwise) on a single server. With `ON CLUSTER`, remote hosts do not enforce it, even with `distributed_ddl_use_initial_user_and_roles = 1`. | [V]; [V 26.8 two shards] |
 | A24 | `CREATE DATABASE ... COMMENT` works everywhere and stores the comment unescaped. `ALTER DATABASE ... MODIFY COMMENT` works on A26.6 and 26.8. The privilege `ALTER MODIFY DATABASE COMMENT` exists on 25.8, A26.3, A26.6 and 26.8. On 25.3 the privilege is missing, and both the statement and the GRANT are syntax errors (62). | [V all] (statement: [V 25.3, 26.6, 26.8]) |
 | A25 | ``CREATE DATABASE `n` UUID '<uuid>' ENGINE = Atomic`` works. The order name, UUID, ON CLUSTER, ENGINE, COMMENT parses. After `DROP DATABASE` (empty or not), the same UUID can be reused immediately. Reusing a UUID that is in use fails with 57. `Replicated('/clickhouse/databases/{uuid}', ...)` needs an explicit UUID or `ON CLUSTER` (36 otherwise). `engine_full` keeps macros unexpanded. | [V all]; Replicated [V A26.6 with Keeper] |
 | A26 | Database names are escaped into file names; a 164-character name containing `@` fails with 458 "File name too long". | [V] |
 | A27 | Server-side parameters work over Native and HTTP for names with `@`, `.`, quote, backslash, backtick and Unicode. TAB and newline need escaped-format encoding (`ParamValue`). | [V] both protocols |
 | A28 | `SHOW CREATE USER` through the driver returns raw SQL with escaped literals; clickhouse-client TSV output double-escapes. `VALID UNTIL` is a per-method suffix that can precede `,` and another method. | [V] |
-| A29 | `CREATE USER ... COMMENT` is a syntax error. There is no server-side ownership marker. | [V 25.3, 26.6, 26.8] |
-| A30 | `CREATE OR REPLACE USER` keeps the same id and the existing grants on 25.3, 26.6.4 and 26.8. DROP followed by CREATE changes the UUID. | [V 25.3, 26.6, 26.8] |
+| A29 | `CREATE USER ... COMMENT` is a syntax error. There is no server-side ownership marker. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A30 | `CREATE USER OR REPLACE x` and `CREATE ROLE OR REPLACE x` assign a new UUID and drop the entity's grants and role memberships (a replaced role is also removed from its grantees), like `DROP` followed by `CREATE`. `CREATE OR REPLACE USER` is a syntax error (62). Revision 3 claimed the UUID and grants were kept; that was wrong on every version. | [V 25.3.3, 26.6, 26.8] |
 | A31 | The minimal identity can create jwt users with HOST and SETTINGS PROFILE, grant and revoke roles, set default roles, and drop users. Without `SELECT ON system.grants`/`system.settings_profile_elements` those reads fail with 497. | [V A26.6] |
 | A32 | `ON CLUSTER` with `local_directory` gives different UUIDs per host. With replicated storage, `ON CLUSTER` on access entities fails on all but one host. `ON CLUSTER` needs the `CLUSTER` privilege. | [V] (prior tests) + [C]; CLUSTER [V] |
 | A33 | Prefix grants: ``CREATE USER, ALTER USER, DROP USER ON `p`*`` and ``CREATE ROLE, DROP ROLE ON `p`*`` restrict DDL to names starting with `p` (497 otherwise). Only prefixes work. `SHOW USERS` cannot be scoped (509). Per-role `WITH ADMIN OPTION` restricts which roles the identity may grant; the role must be active for it. A role's creator gets no admin option on it. | [V all]; admin option [V 26.8, A26.6] |
-| A34 | `CHECK GRANT <privilege> ON <target>` returns 1 or 0 for the current user, including privileges held through roles. | [V 25.3, 26.6, 26.8] |
+| A34 | `CHECK GRANT <privilege> ON <target>` returns 1 or 0 for the current user, including privileges held through roles. | [V 25.3, 26.6, 26.8]; without roles also [V 25.3.3] |
 | A35 | A jwt user without PROCESSOR accepts a token from any processor whose username claim matches (cross-issuer login). CLAIMS arrays match by inclusion. | [V A26.6] |
 | A36 | `DEFAULT DATABASE <name>` is accepted for a nonexistent database; `DEFAULT DATABASE NONE` clears it; `SHOW CREATE USER` prints it before `DEFAULT ROLE`. The clause order `HOST ... DEFAULT ROLE ... DEFAULT DATABASE ... SETTINGS ...` is accepted. | [V all] |
-| A37 | `serverUUID()` and `currentUser()` need no grant. | [V 25.3, 26.8] |
+| A37 | `serverUUID()` and `currentUser()` need no grant. | [V 25.3, 25.3.3, 26.8] |
 | A38 | `SYNTAX_ERROR` messages quote the statement from the failure position, including password hashes and salts; 36 and 180 do not. | [V 26.8] |
-| A39 | 509 `INVALID_GRANT` for privileges at the wrong level, e.g. "CREATE DATABASE cannot be granted on the table level". | [V 25.3, 26.6, 26.8] |
-| A40 | `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges. On 25.3, a prefix-scoped `GRANT CREATE USER ON svc_*` appears in `system.grants` with `database = NULL` and no way to see the prefix. | [V 25.3, 26.6, 26.8] |
+| A39 | 509 `INVALID_GRANT` for privileges at the wrong level, e.g. "CREATE DATABASE cannot be granted on the table level". | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A40 | `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges. On 25.3, a prefix-scoped `GRANT CREATE USER ON svc_*` appears in `system.grants` with `database = NULL` and no way to see the prefix. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A41 | `system.columns` is filtered by `SHOW COLUMNS`: an identity with `SHOW USERS` but no `SELECT ON system.users` sees no columns of `system.users` there, and one without grants sees none at all. ``SELECT `col` FROM system.`t` LIMIT 0`` succeeds when the column exists and fails with 47 `UNKNOWN_IDENTIFIER` when it does not, with exactly the grant that reading the table needs. | [V 25.3.3, 26.6, 26.8] |
+| A42 | `users.d` YAML: `grants: {query: [...]}` accepts prefix grants (``ON `app_`*``); a `roles:` section defines roles with `storage = users_xml`. A users.d role can be granted to an SQL user, and becomes one of its default roles under `DEFAULT ROLE ALL`. | [V all] (prefix grants); [V 25.3.3, 26.6, 26.8] (roles) |
+| A43 | `system.users.valid_until` holds `1970-01-01 00:00:00` for a method without expiry. `SHOW CREATE USER` prints `SETTINGS PROFILE` with the profile as a backtick identifier and omits `HOST ANY` and `DEFAULT ROLE ALL`. No system table lists the configured token processors. | [V 26.6, 26.8] (valid_until); [V 25.3.3, 26.6, 26.8] (SHOW CREATE USER); [V A26.6] (processors) |
 
 ---
 

@@ -33,9 +33,11 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcclickhouse "github.com/testcontainers/testcontainers-go/modules/clickhouse"
 	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
@@ -245,6 +247,9 @@ func grantsYAML(grants []string) string {
 
 const namespace = "team-a"
 
+// newKube returns a fake Kubernetes API with the provider's types, in which
+// the status of every managed resource kind is a subresource, as in a real
+// API server.
 func newKube(t *testing.T, objs ...client.Object) client.Client {
 	t.Helper()
 	s := runtime.NewScheme()
@@ -255,17 +260,7 @@ func newKube(t *testing.T, objs ...client.Object) client.Client {
 		t.Fatal(err)
 	}
 	return clientfake.NewClientBuilder().WithScheme(s).WithObjects(objs...).
-		WithStatusSubresource(&v1alpha1.Database{}).Build()
-}
-
-// harness drives the Database external client the way crossplane-runtime's
-// managed reconciler does, against a fake Kubernetes API.
-type harness struct {
-	t         *testing.T
-	kube      client.Client
-	connector *database.Connector
-	init      managed.Initializer
-	cache     *ch.Cache
+		WithStatusSubresource(&v1alpha1.Database{}, &v1alpha1.User{}, &v1alpha1.Role{}, &v1alpha1.Grant{}, &v1alpha1.RoleGrant{}).Build()
 }
 
 type nopTracker struct{}
@@ -288,24 +283,10 @@ func (h hookedResolver) Resolve(ctx context.Context, mg resource.ModernManaged) 
 	return res, err
 }
 
-func newHarness(t *testing.T, kube client.Client, hook resolveHook) *harness {
-	t.Helper()
-	cache := ch.NewCache(ch.OpenDriver)
-	t.Cleanup(cache.Close)
-	return &harness{
-		t:    t,
-		kube: kube,
-		connector: &database.Connector{
-			Kube:     kube,
-			Usage:    nopTracker{},
-			Resolver: hookedResolver{r: &providerconfig.APIResolver{Kube: kube, APIReader: kube, Flags: providerconfig.Flags{EnableNamespacedProviderConfigs: true}}, hook: hook},
-			Cache:    cache,
-		},
-		init: ownership.NewInitializer(kube, func(mg resource.Managed) *string {
-			return mg.(*v1alpha1.Database).Spec.ForProvider.Name
-		}, ownership.WithPreassignedID()),
-		cache: cache,
-	}
+// newResolver returns the resolver the tests use: the real API resolver
+// over the fake Kubernetes API, with namespaced ProviderConfigs enabled.
+func newResolver(kube client.Client, hook resolveHook) providerconfig.Resolver {
+	return hookedResolver{r: &providerconfig.APIResolver{Kube: kube, APIReader: kube, Flags: providerconfig.Flags{EnableNamespacedProviderConfigs: true}}, hook: hook}
 }
 
 // outcome of one reconcile.
@@ -316,6 +297,9 @@ type outcome struct {
 	updated bool
 	deleted bool
 	gone    bool // the MR's finalizer was released
+	// details are the connection details of the last Observe, Create or
+	// Update of the reconcile, as published to the connection Secret.
+	details managed.ConnectionDetails
 }
 
 func (o outcome) String() string {
@@ -325,125 +309,246 @@ func (o outcome) String() string {
 
 const finalizer = "finalizer.managedresource.crossplane.io"
 
-// createMR stores a Database MR with the managed resource finalizer, so that
-// deleting it sets a deletion timestamp, as for a real MR.
-func (h *harness) createMR(name string, p v1alpha1.DatabaseParameters, pcKind, pcName string) {
+// mrHarness drives the external client of one managed resource kind the way
+// crossplane-runtime's managed reconciler does, against a fake Kubernetes
+// API: initializers, reference resolution, Observe, then Create, Update or
+// Delete, the critical create annotations and the connection Secret. Every
+// kind's integration tests use it; see harness for Database and
+// accessFixture for the access entity kinds.
+type mrHarness[T resource.ModernManaged] struct {
+	t         *testing.T
+	kube      client.Client
+	connector managed.TypedExternalConnector[T]
+	inits     []managed.Initializer
+	resolver  managed.ReferenceResolver
+	newObj    func() T
+	publisher *managed.APILocalSecretPublisher
+}
+
+// newMRHarness returns a harness for the kind that newObj creates empty
+// objects of, connected through connector. inits are the kind's
+// initializers (none for Grant and RoleGrant).
+func newMRHarness[T resource.ModernManaged](t *testing.T, kube client.Client, connector managed.TypedExternalConnector[T], newObj func() T, inits ...managed.Initializer) *mrHarness[T] {
+	t.Helper()
+	return &mrHarness[T]{
+		t: t, kube: kube, connector: connector, inits: inits, newObj: newObj,
+		publisher: managed.NewAPILocalSecretPublisher(kube, kube.Scheme()),
+	}
+}
+
+// withReferences makes reconcile resolve references before Observe (not
+// while deleting), as crossplane-runtime does.
+func (h *mrHarness[T]) withReferences(r managed.ReferenceResolver) *mrHarness[T] {
+	h.resolver = r
+	return h
+}
+
+// create stores an MR with the managed resource finalizer, so that deleting
+// it sets a deletion timestamp, as for a real MR. The namespace defaults to
+// the test namespace. The fake API server assigns no UIDs; a real one always
+// does, so create assigns a random one.
+func (h *mrHarness[T]) create(obj T) {
 	h.t.Helper()
-	d := &v1alpha1.Database{}
-	d.SetNamespace(namespace)
-	d.SetName(name)
-	// The fake API server assigns no UIDs; a real one always does.
-	d.SetUID(types.UID("uid-" + name + "-" + randHex(4)))
-	d.SetFinalizers([]string{finalizer})
-	d.Spec.ForProvider = p
-	d.Spec.ProviderConfigReference = &xpv2.ProviderConfigReference{Kind: pcKind, Name: pcName}
-	if err := h.kube.Create(context.Background(), d); err != nil {
+	if obj.GetNamespace() == "" {
+		obj.SetNamespace(namespace)
+	}
+	obj.SetUID(types.UID("uid-" + obj.GetName() + "-" + randHex(4)))
+	obj.SetFinalizers([]string{finalizer})
+	if err := h.kube.Create(context.Background(), obj); err != nil {
 		h.t.Fatal(err)
 	}
 }
 
-func (h *harness) get(name string) *v1alpha1.Database {
+func (h *mrHarness[T]) get(name string) T {
 	h.t.Helper()
-	d := &v1alpha1.Database{}
-	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, d); err != nil {
+	obj := h.newObj()
+	if err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: name}, obj); err != nil {
 		h.t.Fatal(err)
 	}
-	return d
+	gvk, err := apiutil.GVKForObject(obj, h.kube.Scheme())
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	obj.GetObjectKind().SetGroupVersionKind(gvk)
+	return obj
 }
 
-func (h *harness) mutate(name string, fn func(*v1alpha1.Database)) {
+func (h *mrHarness[T]) mutate(name string, fn func(T)) {
 	h.t.Helper()
-	d := h.get(name)
-	fn(d)
-	if err := h.kube.Update(context.Background(), d); err != nil {
+	obj := h.get(name)
+	fn(obj)
+	if err := h.kube.Update(context.Background(), obj); err != nil {
 		h.t.Fatal(err)
 	}
 }
 
-func (h *harness) delete(name string) {
+func (h *mrHarness[T]) delete(name string) {
 	h.t.Helper()
 	if err := h.kube.Delete(context.Background(), h.get(name)); err != nil {
 		h.t.Fatal(err)
 	}
 }
 
-// reconcile runs one reconcile: initialize, connect, observe, then create,
-// update or delete as the managed reconciler would. Like crossplane-runtime
-// with management policies, it releases a deleted MR without Observe when
-// the policies do not include Delete.
-func (h *harness) reconcile(name string) outcome {
+// secret returns the MR's connection Secret data, or nil if there is none.
+func (h *mrHarness[T]) secret(name string) map[string][]byte {
+	h.t.Helper()
+	ref := h.get(name).GetWriteConnectionSecretToReference()
+	if ref == nil {
+		return nil
+	}
+	s := &corev1.Secret{}
+	err := h.kube.Get(context.Background(), client.ObjectKey{Namespace: namespace, Name: ref.Name}, s)
+	if kerrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	return s.Data
+}
+
+func (h *mrHarness[T]) publish(ctx context.Context, obj T, d managed.ConnectionDetails, o *outcome) {
+	h.t.Helper()
+	o.details = d
+	if _, err := h.publisher.PublishConnection(ctx, obj, d); err != nil {
+		h.t.Fatalf("cannot publish connection details: %v", err)
+	}
+}
+
+// reconcile runs one reconcile: initialize, resolve references, connect,
+// observe, publish connection details, then create, update or delete as the
+// managed reconciler would. Like crossplane-runtime with management
+// policies, it releases a deleted MR without Observe when the policies do
+// not include Delete, and calls Update only when they include Update.
+func (h *mrHarness[T]) reconcile(name string) outcome {
 	h.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	d := h.get(name)
+	obj := h.get(name)
 	var o outcome
-	if meta.WasDeleted(d) && !ownership.PoliciesOf(d).Delete() {
-		meta.RemoveFinalizer(d, finalizer)
-		if err := h.kube.Update(ctx, d); err != nil {
+	if meta.WasDeleted(obj) && !ownership.PoliciesOf(obj).Delete() {
+		meta.RemoveFinalizer(obj, finalizer)
+		if err := h.kube.Update(ctx, obj); err != nil {
 			h.t.Fatal(err)
 		}
 		o.gone = true
 		return o
 	}
-	if err := h.init.Initialize(ctx, d); err != nil {
-		o.err = err
-		return o
+	for _, i := range h.inits {
+		if err := i.Initialize(ctx, obj); err != nil {
+			o.err = err
+			return o
+		}
 	}
-	ext, err := h.connector.Connect(ctx, d)
+	if h.resolver != nil && !meta.WasDeleted(obj) {
+		if err := h.resolver.ResolveReferences(ctx, obj); err != nil {
+			o.err = err
+			return o
+		}
+	}
+	ext, err := h.connector.Connect(ctx, obj)
 	if err != nil {
 		o.err = err
 		return o
 	}
 	defer func() { _ = ext.Disconnect(ctx) }()
 
-	o.obs, o.err = ext.Observe(ctx, d)
+	o.obs, o.err = ext.Observe(ctx, obj)
 	if o.err != nil {
 		return o
 	}
-	pol := ownership.PoliciesOf(d)
-	if meta.WasDeleted(d) {
+	pol := ownership.PoliciesOf(obj)
+	if meta.WasDeleted(obj) {
 		if o.obs.ResourceExists {
-			_, o.err = ext.Delete(ctx, d)
+			_, o.err = ext.Delete(ctx, obj)
 			o.deleted = o.err == nil
 			return o
 		}
-		meta.RemoveFinalizer(d, finalizer)
-		if err := h.kube.Update(ctx, d); err != nil {
+		meta.RemoveFinalizer(obj, finalizer)
+		if err := h.kube.Update(ctx, obj); err != nil {
 			h.t.Fatal(err)
 		}
 		o.gone = true
 		return o
 	}
+	h.publish(ctx, obj, o.obs.ConnectionDetails, &o)
 	if !o.obs.ResourceExists {
 		if !pol.Create() {
 			return o
 		}
-		meta.SetExternalCreatePending(d, time.Now())
-		if err := h.kube.Update(ctx, d); err != nil {
+		meta.SetExternalCreatePending(obj, time.Now())
+		if err := h.kube.Update(ctx, obj); err != nil {
 			h.t.Fatal(err)
 		}
-		_, o.err = ext.Create(ctx, d)
+		var c managed.ExternalCreation
+		c, o.err = ext.Create(ctx, obj)
 		if o.err != nil {
-			meta.SetExternalCreateFailed(d, time.Now())
+			meta.SetExternalCreateFailed(obj, time.Now())
 		} else {
-			meta.SetExternalCreateSucceeded(d, time.Now())
+			meta.SetExternalCreateSucceeded(obj, time.Now())
 			o.created = true
 		}
-		if err := h.kube.Update(ctx, d); err != nil {
+		// The critical annotation update persists every annotation that
+		// Create set in memory (owned-id, create-outcome).
+		if err := h.kube.Update(ctx, obj); err != nil {
 			h.t.Fatal(err)
+		}
+		if o.err == nil {
+			h.publish(ctx, obj, c.ConnectionDetails, &o)
 		}
 		return o
 	}
 	if o.obs.ResourceLateInitialized && pol.LateInitialize() {
-		if err := h.kube.Update(ctx, d); err != nil {
+		if err := h.kube.Update(ctx, obj); err != nil {
 			h.t.Fatal(err)
 		}
 	}
-	if !o.obs.ResourceUpToDate {
-		_, o.err = ext.Update(ctx, d)
+	if !o.obs.ResourceUpToDate && pol.Update() {
+		var u managed.ExternalUpdate
+		u, o.err = ext.Update(ctx, obj)
 		o.updated = o.err == nil
+		if o.err == nil {
+			h.publish(ctx, obj, u.ConnectionDetails, &o)
+		}
 	}
 	return o
+}
+
+// harness drives the Database external client.
+type harness struct {
+	*mrHarness[*v1alpha1.Database]
+	connector *database.Connector
+	cache     *ch.Cache
+}
+
+func newHarness(t *testing.T, kube client.Client, hook resolveHook) *harness {
+	t.Helper()
+	cache := ch.NewCache(ch.OpenDriver)
+	t.Cleanup(cache.Close)
+	conn := &database.Connector{
+		Kube:     kube,
+		Usage:    nopTracker{},
+		Resolver: newResolver(kube, hook),
+		Cache:    cache,
+	}
+	init := ownership.NewInitializer(kube, func(mg resource.Managed) *string {
+		return mg.(*v1alpha1.Database).Spec.ForProvider.Name
+	}, ownership.WithPreassignedID())
+	return &harness{
+		mrHarness: newMRHarness[*v1alpha1.Database](t, kube, conn, func() *v1alpha1.Database { return &v1alpha1.Database{} }, init),
+		connector: conn,
+		cache:     cache,
+	}
+}
+
+// createMR stores a Database MR.
+func (h *harness) createMR(name string, p v1alpha1.DatabaseParameters, pcKind, pcName string) {
+	h.t.Helper()
+	d := &v1alpha1.Database{}
+	d.SetName(name)
+	d.Spec.ForProvider = p
+	d.Spec.ProviderConfigReference = &xpv2.ProviderConfigReference{Kind: pcKind, Name: pcName}
+	h.create(d)
 }
 
 // --- tokens ---

@@ -6,6 +6,7 @@ package providerconfig
 import (
 	"context"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -126,6 +127,46 @@ func TestResolveClusterNamespacePolicy(t *testing.T) {
 	res, err := r.Resolve(ctx, deleting)
 	if err != nil || !res.NamespaceDenied {
 		t.Fatalf("denied namespace while deleting: %+v, %v; want NamespaceDenied", res, err)
+	}
+	if !strings.Contains(res.DenyReason, "allowedNamespaces") || res.Config.Host != "" {
+		t.Errorf("deny reason %q, config %+v", res.DenyReason, res.Config)
+	}
+}
+
+// The provider flags govern namespaced ProviderConfigs (D-3). While an MR is
+// being deleted, a ProviderConfig the flags forbid orphans the MR instead of
+// blocking its deletion: no connection is made and no SQL runs.
+func TestResolveNamespacedFlagsWhileDeleting(t *testing.T) {
+	ctx := context.Background()
+	pw := v1alpha1.LocalCredentials{Source: v1alpha1.CredentialsSourcePasswordSecret, PasswordSecret: &v1alpha1.LocalPasswordCredentials{
+		Username: "tenant", PasswordSecretRef: xpv2.LocalSecretKeySelector{LocalSecretReference: xpv2.LocalSecretReference{Name: "pw"}, Key: "password"},
+	}}
+	kube := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(namespacedPC("team-a", pw), secret("team-a", "pw", "password", "tenant-secret")).Build()
+	deleting := func() *v1alpha1.Database {
+		d := mr("team-a", "ProviderConfig", "own")
+		now := metav1.NewTime(time.Now())
+		d.SetDeletionTimestamp(&now)
+		return d
+	}
+	for name, flags := range map[string]Flags{
+		"Disabled": {EnableNamespacedProviderConfigs: false},
+		"Endpoint": {EnableNamespacedProviderConfigs: true, NamespacedEndpointPattern: regexp.MustCompile(`^(?:clickhouse-[a-z]+\.clickhouse\.svc:9440)$`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := &APIResolver{Kube: kube, APIReader: kube, Flags: flags}
+			if _, err := r.Resolve(ctx, mr("team-a", "ProviderConfig", "own")); !reason.Is(err, reason.InvalidConfig) {
+				t.Fatalf("not deleting: %v, want InvalidConfig", err)
+			}
+			res, err := r.Resolve(ctx, deleting())
+			if err != nil || !res.NamespaceDenied || !strings.Contains(res.DenyReason, "--") || res.Config.Password != "" {
+				t.Fatalf("deleting: %+v, %v; want NamespaceDenied with the flag named", res, err)
+			}
+		})
+	}
+	// Allowed by the flags: a deleting MR resolves normally.
+	r := &APIResolver{Kube: kube, APIReader: kube, Flags: Flags{EnableNamespacedProviderConfigs: true}}
+	if res, err := r.Resolve(ctx, deleting()); err != nil || res.NamespaceDenied {
+		t.Fatalf("allowed while deleting: %+v, %v", res, err)
 	}
 }
 

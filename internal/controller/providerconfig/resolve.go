@@ -68,11 +68,16 @@ type Resolved struct {
 	// Name of the config.
 	Name string
 
-	// NamespaceDenied is set when a ClusterProviderConfig's
-	// allowedNamespaces does not allow the MR's namespace and the MR is being
-	// deleted. The MR is then orphaned: no connection is made, and nothing
-	// else in Resolved is set.
+	// NamespaceDenied is set when the MR is being deleted and may not use
+	// the config: a ClusterProviderConfig's allowedNamespaces does not allow
+	// its namespace, or the provider flags forbid its namespaced
+	// ProviderConfig (--enable-namespaced-provider-configs=false, or an
+	// endpoint outside --namespaced-endpoint-pattern). The MR is then
+	// orphaned: no connection is made and no SQL runs, so deletion never
+	// hangs (D-20). Only Kind, Name and DenyReason are set besides it.
 	NamespaceDenied bool
+	// DenyReason says why NamespaceDenied is set, for the Warning event.
+	DenyReason string
 
 	// CacheKey identifies the connection pool.
 	CacheKey ch.Key
@@ -133,11 +138,8 @@ func (r *APIResolver) resolveCluster(ctx context.Context, mg resource.ModernMana
 	}
 	ns := mg.GetNamespace()
 	if !policy.NamespaceAllowed(ns) {
-		if meta.WasDeleted(mg) {
-			return &Resolved{Kind: v1alpha1.ClusterProviderConfigKind, Name: name, NamespaceDenied: true}, nil
-		}
-		return nil, reason.Errorf(reason.PolicyViolation,
-			"namespace %q is not in policy.allowedNamespaces of ClusterProviderConfig %q", ns, name)
+		return denied(mg, v1alpha1.ClusterProviderConfigKind, name, reason.Errorf(reason.PolicyViolation,
+			"namespace %q is not in policy.allowedNamespaces of ClusterProviderConfig %q", ns, name))
 	}
 
 	b := &builder{kind: v1alpha1.ClusterProviderConfigKind, name: name}
@@ -216,7 +218,8 @@ func (r *APIResolver) resolveCluster(ctx context.Context, mg resource.ModernMana
 
 func (r *APIResolver) resolveNamespaced(ctx context.Context, mg resource.ModernManaged, name string) (*Resolved, error) {
 	if !r.Flags.EnableNamespacedProviderConfigs {
-		return nil, reason.Errorf(reason.InvalidConfig, "namespaced ProviderConfigs are disabled by the provider flag --enable-namespaced-provider-configs=false; use a ClusterProviderConfig")
+		return denied(mg, v1alpha1.ProviderConfigKind, name, reason.Errorf(reason.InvalidConfig,
+			"namespaced ProviderConfigs are disabled by the provider flag --enable-namespaced-provider-configs=false; use a ClusterProviderConfig"))
 	}
 	ns := mg.GetNamespace()
 	pc := &v1alpha1.ProviderConfig{}
@@ -230,7 +233,8 @@ func (r *APIResolver) resolveNamespaced(ctx context.Context, mg resource.ModernM
 		return nil, err
 	}
 	if p := r.Flags.NamespacedEndpointPattern; p != nil && !p.MatchString(b.cfg.Addr()) {
-		return nil, reason.Errorf(reason.InvalidConfig, "endpoint %s of ProviderConfig %s/%s is not allowed by the provider flag --namespaced-endpoint-pattern", b.cfg.Addr(), ns, name)
+		return denied(mg, v1alpha1.ProviderConfigKind, name, reason.Errorf(reason.InvalidConfig,
+			"endpoint %s of ProviderConfig %s/%s is not allowed by the provider flag --namespaced-endpoint-pattern", b.cfg.Addr(), ns, name))
 	}
 	var err error
 	if t := pc.Spec.TLS; t != nil && t.Enabled {
@@ -295,6 +299,16 @@ func (r *APIResolver) resolveNamespaced(ctx context.Context, mg resource.ModernM
 	res := b.resolved()
 	res.AdoptionAllowed = true
 	return res, nil
+}
+
+// denied returns err, or, while mg is being deleted, a Resolved with
+// NamespaceDenied that orphans the MR: the policy or the provider flags forbid
+// the connection, and deletion must not hang on that.
+func denied(mg resource.Managed, kind, name string, err error) (*Resolved, error) {
+	if meta.WasDeleted(mg) {
+		return &Resolved{Kind: kind, Name: name, NamespaceDenied: true, DenyReason: err.Error()}, nil
+	}
+	return nil, err
 }
 
 type builder struct {

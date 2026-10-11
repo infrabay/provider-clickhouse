@@ -5,6 +5,7 @@ package ownership
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +96,7 @@ func TestDecide(t *testing.T) {
 		decision    Decision
 		exists      bool
 		reason      reason.Reason // "" means no error
+		message     string        // a substring of the error, if set
 		ready       bool
 		setOwnedID  string
 		removeAdopt bool
@@ -142,24 +144,52 @@ func TestDecide(t *testing.T) {
 			decision: AdoptionRejected, exists: false,
 		},
 		"Row5RecoveredPending": {
-			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true},
+			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true}},
 			decision: Recovered, exists: true, ready: true, setOwnedID: observed, event: "CreateRecovered",
 		},
 		"Row5RecoveredUnknownOutcome": {
-			mr: newMR(validClaim(""), created(t0, zero, t1), withAnn(v1alpha1.AnnotationCreateOutcome, v1alpha1.CreateOutcomeUnknown)), in: Input{Recoverable: true},
+			mr: newMR(validClaim(""), created(t0, zero, t1), withAnn(v1alpha1.AnnotationCreateOutcome, v1alpha1.CreateOutcomeUnknown)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true}},
 			decision: Recovered, exists: true, ready: true, setOwnedID: observed, event: "CreateRecovered",
 		},
+		"Row5RecoveredReadBackID": {
+			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true, ID: observed}},
+			decision: Recovered, exists: true, ready: true, setOwnedID: observed, event: "CreateRecovered",
+		},
+		// The CREATE succeeded with another UUID; the entity was replaced
+		// since. Only the read-back UUID can be recovered.
+		"Row5ReadBackIDMismatchIsNotRecovered": {
+			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true, ID: other}},
+			decision: NotOwned, exists: true, reason: reason.NotOwned,
+		},
+		// A tenant points a User at an existing user and forges
+		// external-create-pending. The provider never sent a CREATE for it.
+		"Row5ForgedPendingIsNotRecovered": {
+			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true},
+			decision: NotOwned, exists: true, reason: reason.NotOwned, message: "no record of sending it",
+		},
+		"Row5ForgedUnknownOutcomeIsNotRecovered": {
+			mr: newMR(validClaim(""), created(t0, zero, t1), withAnn(v1alpha1.AnnotationCreateOutcome, v1alpha1.CreateOutcomeUnknown)), in: Input{Recoverable: true},
+			decision: NotOwned, exists: true, reason: reason.NotOwned, message: "no record of sending it",
+		},
+		"Row5ForgedPendingWhileDeleting": {
+			mr: newMR(validClaim(""), created(t1, zero, zero), deleting()), in: Input{Recoverable: true},
+			decision: NotOwned, exists: false,
+		},
 		"Row5RejectedOutcomeIsNotRecovered": {
-			mr: newMR(validClaim(""), created(t0, zero, t1), withAnn(v1alpha1.AnnotationCreateOutcome, v1alpha1.CreateOutcomeRejected)), in: Input{Recoverable: true},
+			mr: newMR(validClaim(""), created(t0, zero, t1), withAnn(v1alpha1.AnnotationCreateOutcome, v1alpha1.CreateOutcomeRejected)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true}},
 			decision: NotOwned, exists: true, reason: reason.NotOwned,
 		},
 		"Row5NotForDatabase": {
-			mr:       newMR(validClaim(""), created(t1, zero, zero)),
+			mr: newMR(validClaim(""), created(t1, zero, zero)), in: Input{CreateEvidence: Evidence{Recorded: true}},
 			decision: NotOwned, exists: true, reason: reason.NotOwned,
 		},
 		"Row5CopiedClaimNotRecovered": {
-			mr: newMR(copiedClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true},
+			mr: newMR(copiedClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true}},
 			decision: NotOwned, exists: true, reason: reason.NotOwned,
+		},
+		"Row5ObserveOnlyNeverClaims": {
+			mr: newMR(policies(xpv2.ManagementActionObserve), validClaim(""), created(t1, zero, zero)), in: Input{Recoverable: true, CreateEvidence: Evidence{Recorded: true}},
+			decision: Recovered, exists: true, ready: true,
 		},
 		"Row6Replaced": {
 			mr:       newMR(validClaim(other), created(t0, t1, zero)),
@@ -230,6 +260,9 @@ func TestDecide(t *testing.T) {
 			}
 			if tc.reason != "" && !reason.Is(r.Err, tc.reason) {
 				t.Errorf("Err = %v, want %s", r.Err, tc.reason)
+			}
+			if tc.message != "" && (r.Err == nil || !strings.Contains(r.Err.Error(), tc.message)) {
+				t.Errorf("Err = %v, want it to contain %q", r.Err, tc.message)
 			}
 			if r.Ready() != tc.ready {
 				t.Errorf("Ready() = %t, want %t", r.Ready(), tc.ready)
@@ -388,5 +421,68 @@ func TestPatch(t *testing.T) {
 	}
 	if err := Patch(ctx, kube, d, nil, nil); err != nil {
 		t.Errorf("empty patch: %v", err)
+	}
+}
+
+func TestJournal(t *testing.T) {
+	now := t0
+	j := NewJournal()
+	j.now = func() time.Time { return now }
+	k := CreateKey{Kind: "User", UID: uid, Name: "app_u", Scope: "ClusterProviderConfig//main|server-1"}
+
+	if ev := j.Evidence(k); ev.Recorded {
+		t.Fatalf("empty journal: %+v", ev)
+	}
+	j.Begin(k)
+	if ev := j.Evidence(k); !ev.Recorded || ev.ID != "" {
+		t.Errorf("in flight: %+v", ev)
+	}
+	j.Unknown(k)
+	if ev := j.Evidence(k); !ev.Recorded || ev.ID != "" {
+		t.Errorf("unknown: %+v", ev)
+	}
+	j.Succeeded(k, observed)
+	if ev := j.Evidence(k); !ev.Recorded || ev.ID != observed {
+		t.Errorf("succeeded: %+v", ev)
+	}
+	// A record never carries over to another name, MR, kind or scope.
+	for _, other := range []CreateKey{
+		{Kind: "User", UID: uid, Name: "app_v", Scope: k.Scope},
+		{Kind: "User", UID: "other-uid", Name: k.Name, Scope: k.Scope},
+		{Kind: "Role", UID: uid, Name: k.Name, Scope: k.Scope},
+		{Kind: "User", UID: uid, Name: k.Name, Scope: "ProviderConfig/ns/pc|server-1"},
+	} {
+		if j.Evidence(other).Recorded {
+			t.Errorf("record leaked to %+v", other)
+		}
+	}
+	j.Rejected(k)
+	if j.Evidence(k).Recorded {
+		t.Error("a rejected create must leave no evidence")
+	}
+	j.Unknown(k)
+	now = now.Add(DefaultJournalTTL + time.Second)
+	if j.Evidence(k).Recorded {
+		t.Error("records expire")
+	}
+	j.Begin(k)
+	j.Forget(k)
+	if j.Evidence(k).Recorded {
+		t.Error("Forget removes the record")
+	}
+}
+
+func TestPolicies(t *testing.T) {
+	all := PoliciesOf(newMR())
+	if !all.Create() || !all.Update() || !all.Delete() || !all.LateInitialize() || !all.Writes() {
+		t.Error("empty policies mean '*'")
+	}
+	obs := PoliciesOf(newMR(policies(xpv2.ManagementActionObserve, xpv2.ManagementActionLateInitialize)))
+	if obs.Create() || obs.Update() || obs.Delete() || obs.Writes() || !obs.LateInitialize() {
+		t.Error("import mode allows no writes")
+	}
+	upd := PoliciesOf(newMR(policies(xpv2.ManagementActionObserve, xpv2.ManagementActionUpdate)))
+	if !upd.Update() || upd.Create() || upd.Delete() || !upd.Writes() {
+		t.Error("Update only")
 	}
 }

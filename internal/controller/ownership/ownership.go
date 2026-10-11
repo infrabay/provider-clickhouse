@@ -70,6 +70,9 @@ func (p Policies) Create() bool { return p.has(xpv2.ManagementActionCreate) }
 // LateInitialize reports whether LateInitialize is allowed.
 func (p Policies) LateInitialize() bool { return p.has(xpv2.ManagementActionLateInitialize) }
 
+// Update reports whether Update is allowed.
+func (p Policies) Update() bool { return p.has(xpv2.ManagementActionUpdate) }
+
 // Delete reports whether Delete is allowed.
 func (p Policies) Delete() bool { return p.has(xpv2.ManagementActionDelete) }
 
@@ -159,6 +162,10 @@ type Input struct {
 	Storage string
 	// Recoverable enables row 5 (User and Role).
 	Recoverable bool
+	// CreateEvidence is what the create journal knows about a CREATE this
+	// provider process sent for the MR (User and Role). Row 5 needs it: the
+	// create annotations alone can be forged.
+	CreateEvidence Evidence
 	// AdoptionAllowed is policy.allowAdoption of a ClusterProviderConfig, or
 	// true for a namespaced ProviderConfig.
 	AdoptionAllowed bool
@@ -212,8 +219,12 @@ func (r Result) Ready() bool {
 //  2. valid claim, owned-id equals the observed UUID: owned;
 //  3. adopt equals the observed UUID and adoption is allowed: adopted;
 //  4. adopt is set otherwise: adoption rejected;
-//  5. (User, Role) valid claim, no owned-id, and the create is incomplete or
-//     its outcome unknown: recovered;
+//  5. (User, Role) valid claim, no owned-id, the create is incomplete or its
+//     outcome unknown, and the create journal holds a record of a CREATE this
+//     process sent for the MR whose outcome was not a rejection (and, if its
+//     UUID was read back, the same UUID): recovered. Without the journal
+//     record a forged external-create-pending or create-outcome annotation
+//     could claim a foreign entity;
 //  6. valid claim, owned-id differs, and the create succeeded last: replaced;
 //  7. anything else: not owned.
 //
@@ -252,10 +263,12 @@ func Decide(mg resource.Managed, in Input) Result {
 	if !writes {
 		// Observe-only or import: report the object, claim nothing. While
 		// deleting, the object is not this MR's to delete.
-		return Result{Decision: decideRow3to7(mg, in, c, valid), Exists: !deleting, ObserveOnly: true}
+		d, _ := decideRow3to7(mg, in, c, valid)
+		return Result{Decision: d, Exists: !deleting, ObserveOnly: true}
 	}
 
-	switch d := decideRow3to7(mg, in, c, valid); d {
+	d, unrecovered := decideRow3to7(mg, in, c, valid)
+	switch d {
 	case Adopted:
 		return Result{
 			Decision: Adopted, Exists: true, Event: "Adopted",
@@ -290,19 +303,28 @@ func Decide(mg resource.Managed, in Input) Result {
 		if deleting {
 			return Result{Decision: NotOwned}
 		}
+		if unrecovered {
+			return Result{Decision: NotOwned, Exists: true, Err: reason.Errorf(reason.NotOwned,
+				"%s %q exists (id %s) and a create by this resource did not complete, but this provider process has no record of sending it "+
+					"(for example after a restart), so it cannot tell it from an object created by someone else; if this resource created it, set annotation %s=%q "+
+					"(requires policy.allowAdoption on a ClusterProviderConfig)",
+				in.Kind, in.Name, in.ObservedID, v1alpha1.AnnotationAdopt, in.ObservedID)}
+		}
 		return Result{Decision: NotOwned, Exists: true, Err: reason.Errorf(reason.NotOwned,
 			"%s %q already exists (id %s) and was not created by this resource; to take it over set annotation %s=%q (requires policy.allowAdoption on a ClusterProviderConfig)",
 			in.Kind, in.Name, in.ObservedID, v1alpha1.AnnotationAdopt, in.ObservedID)}
 	}
 }
 
-func decideRow3to7(mg resource.Managed, in Input, c Claim, valid bool) Decision {
+// decideRow3to7 applies rows 3 to 7. unrecovered is set when row 5 matched
+// on the annotations but the create journal had no evidence for it.
+func decideRow3to7(mg resource.Managed, in Input, c Claim, valid bool) (d Decision, unrecovered bool) {
 	// Row 3 and 4.
 	if c.Adopt != "" {
 		if c.Adopt == in.ObservedID && in.AdoptionAllowed {
-			return Adopted
+			return Adopted, false
 		}
-		return AdoptionRejected
+		return AdoptionRejected, false
 	}
 	pending := meta.GetExternalCreatePending(mg)
 	succeeded := meta.GetExternalCreateSucceeded(mg)
@@ -312,15 +334,19 @@ func decideRow3to7(mg resource.Managed, in Input, c Claim, valid bool) Decision 
 		incomplete := meta.ExternalCreateIncomplete(mg)
 		unknown := c.CreateOutcome == v1alpha1.CreateOutcomeUnknown && newest(failed, pending, succeeded)
 		if incomplete || unknown {
-			return Recovered
+			ev := in.CreateEvidence
+			if ev.Recorded && (ev.ID == "" || ev.ID == in.ObservedID) {
+				return Recovered, false
+			}
+			return NotOwned, true
 		}
 	}
 	// Row 6.
 	if valid && c.OwnedID != "" && c.OwnedID != in.ObservedID && newest(succeeded, pending, failed) {
-		return Replaced
+		return Replaced, false
 	}
 	// Row 7.
-	return NotOwned
+	return NotOwned, false
 }
 
 // newest reports whether t is set and not older than any of others. Create
