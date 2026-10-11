@@ -1,0 +1,49 @@
+# A role of team A. On the shared ClusterProviderConfig its name must match
+# policy.roleNamePatterns ({namespace}_...). The provider creates the role,
+# records its UUID in the clickhouse.m.infrabay.io/owned-id annotation and
+# drops it when the MR is deleted. It never takes over a role that it did not
+# create, never writes a role from users.xml/users.d, and refuses a name that
+# a user already has: ClickHouse resolves grantees user-first, so grants meant
+# for the role would land on the user.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Role
+metadata:
+  name: reader
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    name: team-a_reader
+---
+# A role used as a grantee (role inheritance, see rolegrant.yaml).
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Role
+metadata:
+  name: writer
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    name: team-a_writer
+---
+# An existing role, observed only: status.atProvider shows its id and storage,
+# and nothing is claimed, changed or dropped. To take it over, set the
+# annotation clickhouse.m.infrabay.io/adopt to status.atProvider.id (on a
+# ClusterProviderConfig this needs policy.allowAdoption) and switch
+# managementPolicies to ["*"].
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Role
+metadata:
+  name: legacy
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  managementPolicies: ["Observe"]
+  forProvider:
+    name: team-a_legacy

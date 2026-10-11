@@ -1,0 +1,80 @@
+# Grant the role of the Role MR team-a/reader (team-a_reader) to the user of
+# the User MR team-a/reporting-api. References resolve to the referenced MRs'
+# ClickHouse names; they never leave the namespace, and the referenced MRs
+# must use the same ProviderConfig.
+#
+# The provider grants to and revokes from a grantee only when a User or Role
+# MR of this namespace, on the same ProviderConfig, created or adopted it. It
+# re-checks that, and the grantee's UUID, right before every GRANT and
+# REVOKE. Deleting the RoleGrant revokes this membership and nothing else.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: RoleGrant
+metadata:
+  name: reporting-api-reader
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    memberOfRef:
+      name: reader
+    userRef:
+      name: reporting-api
+---
+# A role defined in the server's users.d, granted by name. On a
+# ClusterProviderConfig it must be listed in policy.grantableRoles. New users
+# start with DEFAULT ROLE ALL, so the role is active at login; use
+# User.defaultRoles to change that (status.atProvider.isDefault reports it).
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: RoleGrant
+metadata:
+  name: reporting-api-analytics
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    memberOf: analytics_reader
+    userRef:
+      name: reporting-api
+---
+# Role inheritance: team-a_writer gets the privileges of team-a_reader. A role
+# grantee must not share its name with a user.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: RoleGrant
+metadata:
+  name: writer-reader
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    memberOfRef:
+      name: reader
+    roleRef:
+      name: writer
+---
+# With the admin option the grantee may grant and revoke the role itself,
+# outside the provider. On a ClusterProviderConfig it needs
+# policy.allowAdminOption; this one uses the namespaced ProviderConfig of
+# providerconfig-password.yaml, which has no policy. Delete is left out of the
+# management policies, so deleting the MR never revokes the membership: use
+# this to import an existing membership (with Delete, the membership is
+# revoked even if it existed before the MR).
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: RoleGrant
+metadata:
+  name: etl-loader
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  managementPolicies: ["Observe", "Create", "Update"]
+  forProvider:
+    memberOf: loader
+    user: etl
+    adminOption: true
