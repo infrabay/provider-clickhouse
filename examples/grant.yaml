@@ -1,0 +1,58 @@
+# Privileges on one table for a Role. The database and the role are
+# referenced through MRs of the same namespace that use the same
+# ProviderConfig; the Role MR must own the role (the provider grants only to
+# users and roles that a User or Role MR created or adopted). A Grant owns its
+# exact target for its grantee: privileges that someone else adds to the
+# role on team-a_analytics.events are revoked, and deleting the Grant revokes
+# its privileges.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Grant
+metadata:
+  name: reader-events
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    privileges: ["SELECT", "SHOW TABLES"]
+    databaseRef:
+      name: analytics   # Database MR team-a/analytics, ClickHouse name team-a_analytics
+    table: events
+    roleRef:
+      name: reader      # Role MR team-a/reader
+---
+# Column privileges for a user, by ClickHouse names. The user must be owned
+# by a User MR in this namespace that uses the same ProviderConfig.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Grant
+metadata:
+  name: api-events-columns
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    privileges: ["SELECT"]
+    database: team-a_analytics
+    table: events
+    columns: ["id", "created_at"]
+    user: team-a_api
+---
+# Taking over grants that existed before the MR: without Delete in the
+# management policies, deleting the MR never revokes anything.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Grant
+metadata:
+  name: etl-writer
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  managementPolicies: ["Observe", "Create", "Update"]
+  forProvider:
+    privileges: ["SELECT", "INSERT"]
+    database: team-a_etl
+    role: team-a_etl_writer
