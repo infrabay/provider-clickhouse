@@ -1,0 +1,107 @@
+# A JWT user on Altinity Antalya for a workload that logs in with its own
+# Kubernetes service account token through the server's "kubernetes" token
+# processor. The processor is always pinned: without it the server would
+# accept a token from any configured processor whose username claim matches.
+# The connection Secret carries no secret material (username, endpoint, port,
+# protocol, tls, jwtProcessor); the workload brings its own token.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: User
+metadata:
+  name: reporting-api
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  forProvider:
+    name: system:serviceaccount:team-a:reporting-api
+    authentication:
+      jwt:
+        processor: kubernetes
+    hostIP: ["10.0.0.0/8"]
+    defaultDatabase: team-a_analytics
+  writeConnectionSecretToRef:
+    name: reporting-api-clickhouse
+---
+# A JWT user that may log in only with tokens whose groups claim contains
+# ch-analysts. Claims are matched as a subset; arrays match by inclusion.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: User
+metadata:
+  name: analyst
+  namespace: data
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: analytics-clickhouse
+  forProvider:
+    name: alice@example.com
+    authentication:
+      jwt:
+        processor: keycloak
+        claims:
+          groups: [ch-analysts]
+    # Of the listed roles, those granted with RoleGrants are active at login;
+    # the others become active once they are granted.
+    defaultRoles:
+      policy: Listed
+      roles: [analytics_reader]
+  writeConnectionSecretToRef:
+    name: analyst-clickhouse
+---
+# A password user with a generated password. The password is sent to the
+# server only as a salted SHA-256 hash and published in the connection Secret
+# (username, password, endpoint, port, protocol, tls, rotationToken). Change
+# rotationToken to rotate the password.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: User
+metadata:
+  name: etl
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  forProvider:
+    name: team-a_etl
+    authentication:
+      password:
+        generate:
+          rotationToken: "2026-10"
+    hostIP: ["10.0.0.0/8"]
+    settingsProfile: default
+  writeConnectionSecretToRef:
+    name: etl-clickhouse
+---
+# A password user whose password is taken from a Secret in the same
+# namespace: changing the Secret's value changes the password. The Secret's
+# owner is responsible for its strength.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: loader-password
+  namespace: team-a
+type: Opaque
+stringData:
+  password: change-me-to-a-long-random-value # gitleaks:allow (placeholder)
+---
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: User
+metadata:
+  name: loader
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  forProvider:
+    name: team-a_loader
+    authentication:
+      password:
+        passwordSecretRef:
+          name: loader-password
+          key: password
+    defaultRoles:
+      policy: None
+  writeConnectionSecretToRef:
+    name: loader-clickhouse
