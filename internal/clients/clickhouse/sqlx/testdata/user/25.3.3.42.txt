@@ -1,0 +1,14 @@
+added_method	CREATE USER fx_added_method IDENTIFIED WITH sha256_password, plaintext_password VALID UNTIL '2032-02-02 00:00:00'
+default_role	CREATE USER fx_default_role IDENTIFIED WITH sha256_password DEFAULT ROLE ALL EXCEPT `fx_ro'le`
+every_clause	CREATE USER fx_every_clause IDENTIFIED WITH sha256_password VALID UNTIL '2031-01-01 00:00:00' HOST IP '10.0.0.0/8' DEFAULT DATABASE fx_db DEFAULT ROLE NONE SETTINGS PROFILE `default`
+host_like	CREATE USER fx_host_like IDENTIFIED WITH sha256_password HOST LIKE '%.example.org'
+host_local	CREATE USER fx_host_local IDENTIFIED WITH sha256_password HOST LOCAL
+host_none	CREATE USER fx_host_none IDENTIFIED WITH sha256_password HOST NONE
+host_regexp	CREATE USER fx_host_regexp IDENTIFIED WITH sha256_password HOST REGEXP '.*\\.example\\.com'
+hosts	CREATE USER fx_hosts IDENTIFIED WITH sha256_password HOST IP '2001:db8::1', 'fd00::1', '10.0.0.0/8', NAME 'Host.Example.COM'
+no_password	CREATE USER fx_no_password IDENTIFIED WITH no_password
+password	CREATE USER fx_password IDENTIFIED WITH sha256_password
+quoted_name	CREATE USER `fx_we!rd.n@me\`q'\\z` IDENTIFIED WITH sha256_password HOST NAME 'h\'1'
+settings	CREATE USER fx_settings IDENTIFIED WITH sha256_password SETTINGS PROFILE `default`, max_threads = 2
+two_expiring	CREATE USER fx_two_expiring IDENTIFIED WITH sha256_password VALID UNTIL '2031-01-01 00:00:00', plaintext_password VALID UNTIL '2031-01-01 00:00:00'
+valid_until	CREATE USER fx_valid_until IDENTIFIED WITH sha256_password VALID UNTIL '2031-01-01 00:00:00'
