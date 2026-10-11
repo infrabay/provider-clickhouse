@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  exclusions:
+    # Unchecked Close/Remove/Fprint* calls: cleanup on an error path, where
+    # there is nothing better to do with a second error.
+    presets:
+      - std-error-handling
+    rules:
+      # Test fixtures and fakes write to things that cannot fail in a way the
+      # test cares about.
+      - path: _test\.go
+        linters:
+          - errcheck

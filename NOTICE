@@ -1,0 +1,27 @@
+provider-clickhouse
+Copyright 2026 The provider-clickhouse Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes portions adapted from the following projects, both
+Copyright 2020 The Crossplane Authors and licensed under the Apache License,
+Version 2.0:
+
+- crossplane/provider-template (https://github.com/crossplane/provider-template)
+- crossplane-contrib/provider-sql (https://github.com/crossplane-contrib/provider-sql)
+
+These files contain adapted portions. Each keeps The Crossplane Authors'
+copyright notice in its header, names the upstream file and states that it
+was modified:
+
+- cmd/provider/main.go: command-line flags, manager options and feature
+  wiring, from cmd/provider/main.go of provider-template and provider-sql.
+- internal/controller/config/config.go: the ProviderConfig and
+  ClusterProviderConfig usage controllers, from
+  pkg/controller/namespaced/mysql/config/config.go of provider-sql.
+- apis/clickhouse.go and apis/v1alpha1/register.go: API scheme registration,
+  from the corresponding files of provider-template and provider-sql.
+
+The repository layout follows provider-template, and resolving a managed
+resource's ProviderConfig or ClusterProviderConfig by the kind of its
+reference follows provider-sql.

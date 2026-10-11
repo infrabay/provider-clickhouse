@@ -1,0 +1,3 @@
+# Fingerprints of gitleaks findings that are known false positives, one per
+# line (gitleaks prints the fingerprint of each finding). Prefer an inline
+# "gitleaks:allow" comment on fake test secrets instead.

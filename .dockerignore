@@ -1,0 +1,3 @@
+# The image build only needs the cross-compiled binaries.
+*
+!bin/linux_*/provider

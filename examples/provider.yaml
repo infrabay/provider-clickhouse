@@ -1,0 +1,9 @@
+# Installs the provider. Pin the version you tested.
+apiVersion: pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-clickhouse
+spec:
+  package: ghcr.io/infrabay/provider-clickhouse:v0.1.0
+  # runtimeConfigRef:
+  #   name: provider-clickhouse   # runtime/projected-token.yaml

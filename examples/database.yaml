@@ -1,0 +1,32 @@
+# A Database. Delete is left out of the management policies, so deleting the
+# MR never drops data (recommended; with spec.cluster on the config, Delete
+# would always need forceDrop).
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Database
+metadata:
+  name: analytics
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ClusterProviderConfig
+    name: shared-clickhouse
+  managementPolicies: ["Observe", "Create", "Update", "LateInitialize"]
+  forProvider:
+    name: team-a_analytics
+    comment: Analytics events of team A
+    engine:
+      name: Atomic
+---
+# A Database the MR may drop. Delete refuses while the database has tables,
+# or while its emptiness cannot be verified, unless forceDrop is set.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Database
+metadata:
+  name: scratch
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  forProvider:
+    name: team-a_scratch

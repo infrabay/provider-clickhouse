@@ -1,0 +1,9 @@
+# The provider declares safe-start: its managed resource controllers start
+# only for activated CRDs. Activate every kind of this provider.
+apiVersion: apiextensions.crossplane.io/v1alpha1
+kind: ManagedResourceActivationPolicy
+metadata:
+  name: provider-clickhouse
+spec:
+  activate:
+    - "*.clickhouse.m.infrabay.io"

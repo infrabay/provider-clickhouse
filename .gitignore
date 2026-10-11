@@ -1,0 +1,22 @@
+# Go
+bin/
+_output/
+*.test
+*.out
+coverage.*
+vendor/
+
+# Crossplane packages built locally
+*.xpkg
+
+# Local scratch
+tmp/
+.DS_Store
+
+# JetBrains IDE and VS Code
+.idea/
+.vscode/
+
+# Local private material (any top-level "_<name>-private/" directory) that
+# must never be committed
+/_*-private/

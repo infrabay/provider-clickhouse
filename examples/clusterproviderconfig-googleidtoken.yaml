@@ -1,0 +1,36 @@
+# A shared ClusterProviderConfig on Altinity Antalya. The provider logs in
+# with a Google ID token from the GKE metadata server (Workload Identity, see
+# runtime/gke-workload-identity.yaml). The server validates it with a token
+# processor whose expected_audience equals the audience below.
+#
+# Tenants get names prefixed with their namespace; the policy is closed by
+# default and only opens what is listed.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: ClusterProviderConfig
+metadata:
+  name: shared-clickhouse
+spec:
+  endpoint:
+    host: clickhouse.clickhouse.svc.cluster.local
+  tls:
+    enabled: true
+    caCertSecretRef:
+      namespace: crossplane-system
+      name: clickhouse-ca
+      key: ca.crt
+  credentials:
+    source: GoogleIDToken
+    googleIDToken:
+      # Unique per deployment; equals expected_audience of the processor.
+      audience: https://clickhouse.example.com
+  cluster: my-cluster
+  policy:
+    allowedNamespaces: ["team-.*"]
+    databaseNamePatterns: ["{namespace}_[a-z0-9_]+"]
+    userNamePatterns:
+      - "{namespace}_[a-z0-9_]+"
+      - "system:serviceaccount:{namespace}:[a-z0-9-]+"
+    roleNamePatterns: ["{namespace}_[a-z0-9_]+"]
+    grantableRoles: ["{namespace}_[a-z0-9_]+", "analytics_reader"]
+    allowedAuthentication: [JWT]
+    allowedJWTProcessors: [kubernetes]

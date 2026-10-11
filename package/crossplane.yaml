@@ -1,0 +1,25 @@
+apiVersion: meta.pkg.crossplane.io/v1
+kind: Provider
+metadata:
+  name: provider-clickhouse
+  annotations:
+    meta.crossplane.io/maintainer: The provider-clickhouse Authors
+    meta.crossplane.io/source: github.com/infrabay/provider-clickhouse
+    meta.crossplane.io/license: Apache-2.0
+    meta.crossplane.io/description: >-
+      Self-hosted ClickHouse SQL access management (not ClickHouse Cloud):
+      databases, users, roles and grants, with JWT users on Altinity Antalya.
+    meta.crossplane.io/readme: >-
+      Manages databases, users, roles, grants and role membership on
+      self-hosted ClickHouse with Crossplane v2 namespaced managed resources.
+      The provider authenticates with a password, a Google ID token, a token
+      file (for example a projected service account token) or a token stored
+      in a Secret. See https://github.com/infrabay/provider-clickhouse.
+spec:
+  crossplane:
+    # Must equal the oldest Crossplane version the end-to-end tests run.
+    version: ">=v2.0.0"
+  # Managed resource controllers start once their CRDs are activated
+  # (ManagedResourceActivationPolicy, see examples/mrap.yaml).
+  capabilities:
+    - safe-start

@@ -1,0 +1,14 @@
+# Runs the provider under a fixed Kubernetes service account bound to a Google
+# service account, for the GoogleIDToken credentials source without a key.
+# The Kubernetes service account must be allowed to impersonate the Google
+# service account (roles/iam.workloadIdentityUser).
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-clickhouse-gke
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-clickhouse
+      annotations:
+        iam.gke.io/gcp-service-account: provider-clickhouse@my-project.iam.gserviceaccount.com

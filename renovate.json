@@ -1,0 +1,48 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": "Extends the org preset local>infrabay/renovate (grouped Go minor/patch and GitHub Actions updates, pinned action digests, and the `# renovate:`-annotated *_VERSION tool pins in the workflows and the Makefile). This file adds the provider rules: the Kubernetes modules move only in lockstep with crossplane-runtime, which pins them, and the code generators stay on the versions that match that Kubernetes line.",
+  "extends": [
+    "local>infrabay/renovate"
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions annotated with `# renovate:` in the Makefile",
+      "managerFilePatterns": [
+        "/^Makefile$/"
+      ],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n[A-Z_]+ \\?= (?<currentValue>\\S+)"
+      ]
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "k8s.io/* and sigs.k8s.io/* (controller-runtime, controller-tools) are pinned by crossplane-runtime; they move only together with it, never on their own",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "k8s.io/**",
+        "sigs.k8s.io/**",
+        "github.com/crossplane/crossplane-tools"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "crossplane-runtime and the shared Crossplane APIs move together and need make generate; never automerge",
+      "matchManagers": [
+        "gomod"
+      ],
+      "matchPackageNames": [
+        "github.com/crossplane/crossplane-runtime/v2",
+        "github.com/crossplane/crossplane/apis/v2"
+      ],
+      "groupName": "crossplane",
+      "automerge": false
+    }
+  ],
+  "ignorePaths": [
+    "testdata/**"
+  ]
+}

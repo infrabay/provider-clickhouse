@@ -1,0 +1,26 @@
+# A ClusterProviderConfig that logs in with a projected Kubernetes service
+# account token (see runtime/projected-token.yaml). The file is re-read on
+# every new connection, so kubelet rotation needs no restart. The token's aud
+# claim must contain the audience below; tokens minted for the Kubernetes API
+# server are never sent.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: ClusterProviderConfig
+metadata:
+  name: clickhouse-tokenfile
+spec:
+  endpoint:
+    host: clickhouse.clickhouse.svc.cluster.local
+  tls:
+    enabled: true
+    caCertSecretRef:
+      namespace: crossplane-system
+      name: clickhouse-ca
+      key: ca.crt
+  credentials:
+    source: TokenFile
+    tokenFile:
+      path: /var/run/secrets/clickhouse/token
+      audience: clickhouse
+  policy:
+    allowedNamespaces: ["team-a"]
+    databaseNamePatterns: ["{namespace}_[a-z0-9_]+"]

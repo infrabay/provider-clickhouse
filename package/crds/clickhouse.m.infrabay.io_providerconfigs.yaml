@@ -1,0 +1,338 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.20.0
+  name: providerconfigs.clickhouse.m.infrabay.io
+spec:
+  group: clickhouse.m.infrabay.io
+  names:
+    categories:
+    - crossplane
+    - provider
+    - clickhouse
+    kind: ProviderConfig
+    listKind: ProviderConfigList
+    plural: providerconfigs
+    shortNames:
+    - chpc
+    singular: providerconfig
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.endpoint.host
+      name: ENDPOINT
+      type: string
+    - jsonPath: .spec.credentials.source
+      name: SOURCE
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: AGE
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: |-
+          A ProviderConfig configures how the provider connects to a ClickHouse server
+          for managed resources in its own namespace.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: |-
+              ProviderConfigSpec configures a namespaced ProviderConfig. It is owned by
+              the namespace tenant together with its credentials and carries no policy.
+            properties:
+              allowInsecureTransport:
+                default: false
+                description: |-
+                  AllowInsecureTransport permits a connection without TLS. The native
+                  protocol then sends the provider's password or token in clear text. Only
+                  for lab setups or traffic that is encrypted below ClickHouse.
+                type: boolean
+              cluster:
+                description: |-
+                  Cluster names a cluster from <remote_servers>. When set, Database DDL
+                  uses ON CLUSTER <cluster>. Before every ON CLUSTER ALTER or DROP the
+                  provider reads the database's UUID on every host of the cluster
+                  (clusterAllReplicas, which needs the REMOTE privilege) and refuses the
+                  write if any host has a database of that name with another UUID.
+                  Deleting a Database then always needs forceDrop. The provider refuses
+                  to write access entities unless they are stored in a replicated user
+                  directory. Access entities never use ON CLUSTER.
+                minLength: 1
+                type: string
+              credentials:
+                description: Credentials of the provider identity.
+                properties:
+                  googleIDToken:
+                    description: |-
+                      GoogleIDToken authenticates with a Google ID token. On a namespaced
+                      ProviderConfig a credentials Secret is mandatory: ambient Google identity
+                      is not available to tenants.
+                    properties:
+                      audience:
+                        description: |-
+                          Audience requested in the ID token. It must equal expected_audience of
+                          the server's token processor. Use a value unique to this ClickHouse
+                          deployment, for example its URL.
+                        minLength: 1
+                        type: string
+                      credentialsSecretRef:
+                        description: |-
+                          CredentialsSecretRef selects a service account key JSON. It is validated
+                          before use.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            description: Name of the secret.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - audience
+                    - credentialsSecretRef
+                    type: object
+                  passwordSecret:
+                    description: PasswordSecret authenticates with a user name and
+                      a password.
+                    properties:
+                      passwordSecretRef:
+                        description: PasswordSecretRef selects the password.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            description: Name of the secret.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      username:
+                        description: Username of the provider identity.
+                        minLength: 1
+                        type: string
+                    required:
+                    - passwordSecretRef
+                    - username
+                    type: object
+                  source:
+                    description: Source of the credentials.
+                    enum:
+                    - PasswordSecret
+                    - TokenSecret
+                    - GoogleIDToken
+                    - TokenFile
+                    type: string
+                  tokenSecret:
+                    description: TokenSecret authenticates with a JWT stored in a
+                      Secret.
+                    properties:
+                      audience:
+                        description: |-
+                          Audience the token must carry in its aud claim. Checked before the token
+                          is sent.
+                        minLength: 1
+                        type: string
+                      secretRef:
+                        description: |-
+                          SecretRef selects the Secret key that holds a JWT. It is re-read
+                          (uncached) on every new connection, so external rotation needs no
+                          restart.
+                        properties:
+                          key:
+                            type: string
+                          name:
+                            description: Name of the secret.
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - audience
+                    - secretRef
+                    type: object
+                required:
+                - source
+                type: object
+                x-kubernetes-validations:
+                - message: set exactly the block that matches source
+                  rule: (self.source == 'PasswordSecret') == has(self.passwordSecret)
+                    && (self.source == 'TokenSecret') == has(self.tokenSecret) &&
+                    (self.source == 'GoogleIDToken') == has(self.googleIDToken)
+                - message: TokenFile is only allowed on ClusterProviderConfig
+                  rule: self.source != 'TokenFile'
+              defaultDatabase:
+                default: default
+                description: DefaultDatabase is the database selected for the provider's
+                  session.
+                type: string
+              endpoint:
+                description: Endpoint of the ClickHouse server.
+                properties:
+                  host:
+                    description: Host name or IP address.
+                    minLength: 1
+                    type: string
+                  port:
+                    description: Port. Defaults to 9000, or 9440 with TLS.
+                    format: int32
+                    maximum: 65535
+                    minimum: 1
+                    type: integer
+                required:
+                - host
+                type: object
+              pool:
+                description: Pool configures the provider's connection pool.
+                properties:
+                  connMaxLifetime:
+                    default: 30m
+                    description: |-
+                      ConnMaxLifetime bounds how long a pooled connection is reused. Native
+                      connections are authenticated only at handshake, so this also bounds how
+                      long a revoked or expired provider token keeps working.
+                    type: string
+                  maxOpenConns:
+                    default: 4
+                    description: MaxOpenConns bounds the connections the provider
+                      opens to this server.
+                    format: int32
+                    maximum: 64
+                    minimum: 1
+                    type: integer
+                type: object
+              protocol:
+                default: Native
+                description: Protocol to use. Only Native is supported in v1alpha1.
+                enum:
+                - Native
+                type: string
+              tls:
+                description: TLS configures transport encryption.
+                properties:
+                  caCertSecretRef:
+                    description: CACertSecretRef selects a CA bundle (PEM). Defaults
+                      to the system roots.
+                    properties:
+                      key:
+                        type: string
+                      name:
+                        description: Name of the secret.
+                        type: string
+                    required:
+                    - key
+                    - name
+                    type: object
+                  enabled:
+                    default: false
+                    description: Enabled turns on TLS. Required unless allowInsecureTransport
+                      is true.
+                    type: boolean
+                  insecureSkipVerify:
+                    description: |-
+                      InsecureSkipVerify disables certificate verification. Not allowed with
+                      token credentials. Discouraged with passwords: the password then travels
+                      to an unauthenticated peer. Use caCertSecretRef instead.
+                    type: boolean
+                  serverName:
+                    description: ServerName overrides the name used for SNI and certificate
+                      checks.
+                    type: string
+                required:
+                - enabled
+                type: object
+            required:
+            - credentials
+            - endpoint
+            type: object
+            x-kubernetes-validations:
+            - message: 'tls.enabled must be true unless allowInsecureTransport is
+                true: the native protocol sends the password or token in clear text'
+              rule: (has(self.tls) && self.tls.enabled) || (has(self.allowInsecureTransport)
+                && self.allowInsecureTransport)
+            - message: insecureSkipVerify is not allowed with token credentials
+              rule: self.credentials.source == 'PasswordSecret' || !has(self.tls)
+                || !has(self.tls.insecureSkipVerify) || !self.tls.insecureSkipVerify
+          status:
+            description: A ProviderConfigStatus is the status of a ProviderConfig.
+            properties:
+              conditions:
+                description: Conditions of the resource.
+                items:
+                  description: A Condition that may apply to a resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        LastTransitionTime is the last time this condition transitioned from one
+                        status to another.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        A Message containing details about this condition's last transition from
+                        one status to another, if any.
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        ObservedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      type: integer
+                    reason:
+                      description: A Reason for this condition's last transition from
+                        one status to another.
+                      type: string
+                    status:
+                      description: Status of this condition; is it currently True,
+                        False, or Unknown?
+                      type: string
+                    type:
+                      description: |-
+                        Type of this condition. At most one of each condition type may apply to
+                        a resource at any point in time.
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              users:
+                description: Users of this provider configuration.
+                format: int64
+                type: integer
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
