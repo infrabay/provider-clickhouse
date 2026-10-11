@@ -22,6 +22,14 @@ const (
 	AnnotationAdopt = Group + "/adopt"
 )
 
+// AnnotationGrantOption is a Grant's record of the grant option it gave at
+// its target: the privileges it granted WITH GRANT OPTION there and has not
+// revoked since, and the UUID of the grantee, as JSON
+// ({"granteeID":"<uuid>","privileges":["SELECT"]}). The server leaves some
+// grant options out of system.grants, and the record stands in for them
+// (design 5.6, D-35).
+const AnnotationGrantOption = Group + "/grant-option"
+
 // Values of AnnotationCreateOutcome.
 const (
 	CreateOutcomeRejected = "rejected"

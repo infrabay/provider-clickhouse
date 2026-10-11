@@ -83,6 +83,41 @@ func TestObserve(t *testing.T) {
 			mr:  newUser(claimed()),
 			srv: newServer(fake.Upstream268, row{}, ""),
 		},
+		// crossplane-runtime publishes the connection details before
+		// Create, and its publisher takes over a Secret of the connection
+		// type that nothing controls. Such a Secret is refused before that,
+		// so it never becomes the record of the user's password.
+		"NotFoundUncontrolledSecret": {
+			mr:     newUser(claimed()),
+			srv:    newServer(fake.Upstream268, row{}, ""),
+			objs:   []client.Object{connSecret("", map[string]string{v1alpha1.ConnectionKeyPassword: "Planted-Passw0rd"})},
+			reason: reason.SecretConflict, ready: "False",
+		},
+		"NotFoundForeignSecret": {
+			mr:     newUser(claimed(), jwtUser("kubernetes", "")),
+			srv:    newServer(fake.Antalya266, row{}, ""),
+			objs:   []client.Object{connSecret("someone-else", nil)},
+			reason: reason.SecretConflict, ready: "False",
+		},
+		// Re-created after an out-of-band drop: the MR's own Secret is the
+		// record of the password.
+		"NotFoundOwnSecret": {
+			mr:   newUser(owned(userID)),
+			srv:  newServer(fake.Upstream268, row{}, ""),
+			objs: []client.Object{recorded(recordedPassword, "")},
+		},
+		// Without Create nothing would be published or created: the Secret is
+		// not read.
+		"NotFoundObserveOnly": {
+			mr:   newUser(policies(xpv2.ManagementActionObserve)),
+			srv:  newServer(fake.Upstream268, row{}, ""),
+			objs: []client.Object{connSecret("", nil)},
+		},
+		"DeletingNotFound": {
+			mr:   newUser(owned(userID), deleting()),
+			srv:  newServer(fake.Upstream268, row{}, ""),
+			objs: []client.Object{connSecret("", nil)},
+		},
 		"PolicyViolation": {
 			mr:     newUser(owned(userID), named("team-b_etl")),
 			srv:    newServer(fake.Upstream268, passwordRow(), ""),

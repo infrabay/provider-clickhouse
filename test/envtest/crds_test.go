@@ -269,15 +269,20 @@ func TestGrantValidation(t *testing.T) {
 		"ColumnsNoTable": {doc: grantHeader + "spec:\n  forProvider: {privileges: [SELECT], database: app, columns: [a], role: r}\n", wantErr: "columns require a specific table"},
 		"TableOnGlobal":  {doc: grantHeader + "spec:\n  forProvider: {privileges: [SELECT], database: \"*\", table: t, role: r}\n", wantErr: "a specific table requires a specific database"},
 		"BadPrivilege":   {doc: grantHeader + "spec:\n  forProvider: {privileges: [\"SELECT; DROP\"], database: app, role: r}\n", wantErr: "privileges"},
-		"CrossNamespaceRef": {
-			doc:     grantHeader + "spec:\n  forProvider: {privileges: [SELECT], databaseRef: {name: d, namespace: team-b}, role: r}\n",
-			wantErr: "cross-namespace references are not allowed",
-		},
 		"CrossNamespaceSelector": {
 			doc:     grantHeader + "spec:\n  forProvider: {privileges: [SELECT], database: app, userSelector: {matchLabels: {a: b}, namespace: team-b}}\n",
 			wantErr: "cross-namespace selectors are not allowed",
 		},
-		"SameNamespaceRef": {doc: grantHeader + "spec:\n  forProvider: {privileges: [SELECT], databaseRef: {name: d, namespace: \"\"}, role: r}\n"},
+		"OwnNamespaceSelector": {
+			doc:     grantHeader + "spec:\n  forProvider: {privileges: [SELECT], database: app, userSelector: {matchLabels: {a: b}, namespace: team-a}}\n",
+			wantErr: "cross-namespace selectors are not allowed",
+		},
+		"EmptyNamespaceRef": {doc: grantHeader + "spec:\n  forProvider: {privileges: [SELECT], databaseRef: {name: d, namespace: \"\"}, role: r}\n"},
+		// A resolved selector names the MR's own namespace in the reference.
+		// CEL cannot see metadata.namespace, so a reference's namespace is
+		// checked by the provider before resolution
+		// (providerconfig.CheckReferenceNamespaces).
+		"OwnNamespaceRef": {doc: grantHeader + "spec:\n  forProvider: {privileges: [SELECT], databaseRef: {name: d, namespace: team-a}, roleRef: {name: r, namespace: team-a}}\n"},
 	})
 }
 
@@ -289,10 +294,11 @@ func TestRoleAndRoleGrantValidation(t *testing.T) {
 		"ValidRoleGrant": {doc: roleGrantHeader + "spec:\n  forProvider: {memberOf: analytics_reader, userRef: {name: api}}\n"},
 		"NoMemberOf":     {doc: roleGrantHeader + "spec:\n  forProvider: {user: u}\n", wantErr: "memberOf is required"},
 		"NoGrantee":      {doc: roleGrantHeader + "spec:\n  forProvider: {memberOf: r}\n", wantErr: "set exactly one grantee"},
-		"CrossNamespace": {
-			doc:     roleGrantHeader + "spec:\n  forProvider: {memberOfRef: {name: r, namespace: team-b}, user: u}\n",
-			wantErr: "cross-namespace references are not allowed",
+		"CrossNamespaceSelector": {
+			doc:     roleGrantHeader + "spec:\n  forProvider: {memberOfSelector: {matchLabels: {a: b}, namespace: team-b}, user: u}\n",
+			wantErr: "cross-namespace selectors are not allowed",
 		},
+		"OwnNamespaceRef": {doc: roleGrantHeader + "spec:\n  forProvider: {memberOfRef: {name: r, namespace: team-a}, userRef: {name: u, namespace: team-a}}\n"},
 	})
 }
 

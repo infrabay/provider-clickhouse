@@ -23,11 +23,8 @@ var (
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.memberOf) || (has(self.memberOf) && self.memberOf == oldSelf.memberOf)",message="memberOf is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.user) || (has(self.user) && self.user == oldSelf.user)",message="user is immutable"
 // +kubebuilder:validation:XValidation:rule="!has(oldSelf.role) || (has(self.role) && self.role == oldSelf.role)",message="role is immutable"
-// +kubebuilder:validation:XValidation:rule="!has(self.memberOfRef) || !has(self.memberOfRef.__namespace__) || self.memberOfRef.__namespace__.size() == 0",message="cross-namespace references are not allowed"
 // +kubebuilder:validation:XValidation:rule="!has(self.memberOfSelector) || !has(self.memberOfSelector.__namespace__) || self.memberOfSelector.__namespace__.size() == 0",message="cross-namespace selectors are not allowed"
-// +kubebuilder:validation:XValidation:rule="!has(self.userRef) || !has(self.userRef.__namespace__) || self.userRef.__namespace__.size() == 0",message="cross-namespace references are not allowed"
 // +kubebuilder:validation:XValidation:rule="!has(self.userSelector) || !has(self.userSelector.__namespace__) || self.userSelector.__namespace__.size() == 0",message="cross-namespace selectors are not allowed"
-// +kubebuilder:validation:XValidation:rule="!has(self.roleRef) || !has(self.roleRef.__namespace__) || self.roleRef.__namespace__.size() == 0",message="cross-namespace references are not allowed"
 // +kubebuilder:validation:XValidation:rule="!has(self.roleSelector) || !has(self.roleSelector.__namespace__) || self.roleSelector.__namespace__.size() == 0",message="cross-namespace selectors are not allowed"
 type RoleGrantParameters struct {
 	// MemberOf is the role being granted; the grantee becomes a member of it.
@@ -40,7 +37,9 @@ type RoleGrantParameters struct {
 	// +crossplane:generate:reference:type=Role
 	MemberOf *string `json:"memberOf,omitempty"`
 
-	// MemberOfRef references a Role MR in the same namespace.
+	// MemberOfRef references a Role MR in the same namespace. A namespace, if
+	// set, must be this resource's own: a resolved selector writes it, and any
+	// other namespace is refused before anything is read.
 	// +optional
 	MemberOfRef *xpv2.NamespacedReference `json:"memberOfRef,omitempty"`
 
@@ -56,7 +55,9 @@ type RoleGrantParameters struct {
 	// +crossplane:generate:reference:type=User
 	User *string `json:"user,omitempty"`
 
-	// UserRef references a User MR in the same namespace.
+	// UserRef references a User MR in the same namespace. A namespace, if
+	// set, must be this resource's own: a resolved selector writes it, and any
+	// other namespace is refused before anything is read.
 	// +optional
 	UserRef *xpv2.NamespacedReference `json:"userRef,omitempty"`
 
@@ -72,7 +73,9 @@ type RoleGrantParameters struct {
 	// +crossplane:generate:reference:type=Role
 	Role *string `json:"role,omitempty"`
 
-	// RoleRef references a Role MR in the same namespace.
+	// RoleRef references a Role MR in the same namespace. A namespace, if
+	// set, must be this resource's own: a resolved selector writes it, and any
+	// other namespace is refused before anything is read.
 	// +optional
 	RoleRef *xpv2.NamespacedReference `json:"roleRef,omitempty"`
 

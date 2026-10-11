@@ -19,6 +19,7 @@ import (
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
 	"github.com/infrabay/provider-clickhouse/internal/clients/clickhouse/fake"
 	"github.com/infrabay/provider-clickhouse/internal/clients/clickhouse/sqlx"
+	"github.com/infrabay/provider-clickhouse/internal/controller/access/accesstest"
 	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/controller/providerconfig"
 	"github.com/infrabay/provider-clickhouse/internal/reason"
@@ -30,7 +31,7 @@ func TestReadEntity(t *testing.T) {
 	ctx := context.Background()
 	db := fake.NewDB().WithUser("a`b'c\\d", userID, ch.StorageLocalDirectory)
 	e, ok, err := ReadEntity(ctx, db, User, "a`b'c\\d")
-	if err != nil || !ok || e.ID != userID || e.ReadOnly() {
+	if err != nil || !ok || e.ID != userID || e.Storage != ch.StorageLocalDirectory {
 		t.Fatalf("ReadEntity() = %+v, %t, %v", e, ok, err)
 	}
 	if db.Params[0]["name"] != "a`b'c\\d" {
@@ -473,6 +474,57 @@ func TestVerifyOwned(t *testing.T) {
 	env := newEnv(t, fake.NewDB(), namespacedResolved())
 	if _, err := env.VerifyOwned(context.Background(), newRole(provider, claimed(userID)), User, provider); !reason.Is(err, reason.SelfModification) {
 		t.Errorf("self: %v", err)
+	}
+}
+
+// TestRenamedUserDirectories: system.users.storage and system.roles.storage
+// hold the name of the entity's user directory, which the server
+// configuration may change (<users_xml><name>cfg_users</name>) [verified on
+// 25.3.3]. An entity of users.xml under another name is still never written:
+// adoption is refused, a deleting MR is released without SQL, and no grant is
+// made to it. An entity of the SQL directory under another name is managed as
+// usual.
+func TestRenamedUserDirectories(t *testing.T) {
+	ctx := context.Background()
+	renamed := func(db *fake.DB, res *providerconfig.Resolved, objs ...client.Object) *testEnv {
+		env := newEnv(t, db, res, objs...)
+		db.On(ch.QueryUserDirectories, fake.Rows(
+			[]any{"cfg_users", ch.StorageUsersXML, `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+			[]any{"sql_users", ch.StorageLocalDirectory, `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(2)},
+		))
+		return env
+	}
+	adopt := newRole(roleName, claimed(""), annotated(v1alpha1.AnnotationAdopt, roleID))
+	env := renamed(fake.NewDB().WithRole(roleName, roleID, "cfg_users"), namespacedResolved(), adopt.DeepCopy())
+	if obs, err := env.ObserveEntity(ctx, adopt, Role, adopt.Spec.ForProvider.Name); !reason.Is(err, reason.ReadOnlyStorage) || obs.Decision.Decision != ownership.ReadOnly {
+		t.Errorf("adopting a users.xml role under another directory name: %+v, %v; want ReadOnlyStorage", obs.Decision, err)
+	}
+	if c := ownership.ClaimOf(adopt); c.OwnedID != "" || c.Adopt != roleID {
+		t.Errorf("nothing may be claimed: %+v", c)
+	}
+
+	gone := newRole(roleName, claimed(roleID), deleting())
+	env = renamed(fake.NewDB().WithRole(roleName, roleID, "cfg_users"), clusterResolved(t, sharedPolicy()))
+	if obs, err := env.ObserveEntity(ctx, gone, Role, gone.Spec.ForProvider.Name); err != nil || obs.Exists || !obs.Orphaned {
+		t.Errorf("a deleting MR of a users.xml role must be released: %+v, %v", obs, err)
+	}
+	if exists, err := env.VerifyOwned(ctx, newRole(roleName, claimed(roleID)), Role, roleName); exists || !reason.Is(err, reason.ReadOnlyStorage) {
+		t.Errorf("VerifyOwned() = %t, %v; want ReadOnlyStorage", exists, err)
+	}
+
+	owner := accesstest.OwnedUser(ns, "api", userName, userID, sharedPC)
+	env = renamed(fake.NewDB().WithUser(userName, userID, "cfg_users"), clusterResolved(t, sharedPolicy()), owner)
+	if _, err := env.BindGrantee(ctx, newGrant(), Grantee{Kind: User, Name: userName}); !reason.Is(err, reason.ReadOnlyStorage) {
+		t.Errorf("BindGrantee() of a users.xml user = %v, want ReadOnlyStorage", err)
+	}
+
+	mine := newRole(roleName, claimed(roleID))
+	env = renamed(fake.NewDB().WithRole(roleName, roleID, "sql_users"), clusterResolved(t, sharedPolicy()), mine.DeepCopy())
+	if obs, err := env.ObserveEntity(ctx, mine, Role, mine.Spec.ForProvider.Name); err != nil || !obs.Exists || obs.Decision.Decision != ownership.Owned {
+		t.Errorf("a role of the SQL directory under another name: %+v, %v; want owned", obs.Decision, err)
+	}
+	if exists, err := env.VerifyOwned(ctx, mine, Role, roleName); err != nil || !exists {
+		t.Errorf("VerifyOwned() = %t, %v", exists, err)
 	}
 }
 

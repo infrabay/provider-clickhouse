@@ -267,6 +267,12 @@ type pointState struct {
 	// above and aboveGO are effective and effectiveGO from rows strictly
 	// above the point only.
 	above, aboveGO PrivilegeSet
+	// hidden is set when the server may leave grant option information about
+	// the point out of system.grants and SHOW GRANTS (see goMayBeHidden): a
+	// grant option granted or partially revoked there, or between the point
+	// and the deepest object above it that the rows show, would be missing
+	// from the rows.
+	hidden bool
 }
 
 // An Analysis is what system.grants says about one target of one grantee
@@ -280,6 +286,8 @@ type Analysis struct {
 	points  []pointState
 	// privileges are the access types of the exact rows, for status.
 	privileges []string
+	// cat expands a revoked privilege to the flags the REVOKE removes.
+	cat *Catalogue
 }
 
 type expandedRow struct {
@@ -290,7 +298,9 @@ type expandedRow struct {
 }
 
 // Analyze computes the analysis of the target t of a grantee with the rows
-// of system.grants, for the desired flags (Catalogue.Expand). Without
+// of system.grants, for the desired flags (Catalogue.Expand). rows are all
+// the grantee's rows, including those Grant ignores: they decide where the
+// server shows grant options (goMayBeHidden). Without
 // system.grants.is_wildcard, wildcard grants look like literal ones; Grant
 // refuses such grantees before it analyses their rows (WildcardObjects).
 func Analyze(c *Catalogue, t GrantTarget, desired PrivilegeSet, rows []GrantRow) *Analysis {
@@ -306,11 +316,12 @@ func Analyze(c *Catalogue, t GrantTarget, desired PrivilegeSet, rows []GrantRow)
 		}
 		ers = append(ers, expandedRow{scope: s, accessType: r.AccessType, flags: NewPrivilegeSet(flags...), revoke: r.PartialRevoke, option: r.GrantOption})
 	}
-	a := &Analysis{target: t, desired: desired}
+	a := &Analysis{target: t, desired: desired, cat: c}
 	privileges := PrivilegeSet{}
 	for _, p := range t.points() {
 		st := pointState{column: p.column,
-			effective: PrivilegeSet{}, effectiveGO: PrivilegeSet{}, exact: PrivilegeSet{}, exactGO: PrivilegeSet{}, above: PrivilegeSet{}, aboveGO: PrivilegeSet{}}
+			effective: PrivilegeSet{}, effectiveGO: PrivilegeSet{}, exact: PrivilegeSet{}, exactGO: PrivilegeSet{}, above: PrivilegeSet{}, aboveGO: PrivilegeSet{},
+			hidden: goMayBeHidden(c, rows, p)}
 		var covering []expandedRow
 		for _, r := range ers {
 			if covers(r.scope, p) {
@@ -366,6 +377,93 @@ func Analyze(c *Catalogue, t GrantTarget, desired PrivilegeSet, rows []GrantRow)
 	return a
 }
 
+// goMayBeHidden reports whether the server may leave grant option
+// information about the point p out of system.grants and SHOW GRANTS.
+//
+// The server keeps a grantee's privileges in two radix trees of object
+// names, one for the privileges and one for their grant options, and lists
+// both together by walking the first. A node of the grant option tree that
+// has no counterpart in the first tree, because the privileges there equal
+// those inherited from above (for example SELECT ON app.events WITH GRANT
+// OPTION under SELECT ON app.*), is listed only if no sibling in the first
+// tree begins with the same character. So with a row on app.events_raw or
+// app.evil, the grant option on app.events is listed nowhere, although it is
+// in effect; a partial revoke of a grant option is hidden the same way. This
+// is a server bug, seen on every supported version, in
+// AccessRights::Node::getElementsRec.
+//
+// Every row the server lists comes from a node it visited, so any row at or
+// below an object proves that the object's grant option information is
+// listed. For each object on the path from the database down to the point,
+// the check is therefore: if the rows show nothing at or below it, its grant
+// option information is missing when another name at its level that the
+// rows show begins with the same character. This over-approximates the
+// server, which splits names at their common prefixes, and it treats every
+// row of a parameterized level without an access_object (on 25.3, a grant
+// on a user name prefix, which the server keeps among the database names) as
+// a name that may begin with any character.
+func goMayBeHidden(c *Catalogue, rows []GrantRow, p scope) bool {
+	if p.level == TargetGlobal {
+		return false
+	}
+	at := func(match func(GrantRow) bool) bool {
+		for _, r := range rows {
+			if match(r) {
+				return true
+			}
+		}
+		return false
+	}
+	sibling := func(name string, names func(GrantRow) string) bool {
+		if name == "" {
+			return true
+		}
+		for _, r := range rows {
+			if n := names(r); n != "" && n != name && n[0] == name[0] {
+				return true
+			}
+		}
+		return false
+	}
+	// A wildcard row's object is its prefix, not the object of that name:
+	// it does not count as a row at the database (or table) it names.
+	dbWildcard := func(r GrantRow) bool { return r.Wildcard && r.Table == "" }
+	tableWildcard := func(r GrantRow) bool { return r.Wildcard && r.Column == "" }
+	// The database, among the names at the database level: databases,
+	// wildcard prefixes and the parameters of parameterized grants.
+	if !at(func(r GrantRow) bool { return r.Database == p.db && !dbWildcard(r) }) {
+		unknown := at(func(r GrantRow) bool {
+			return r.Database == "" && r.AccessObject == "" && c.Parameterized(r.AccessType)
+		})
+		return unknown ||
+			sibling(p.db, func(r GrantRow) string { return r.Database }) ||
+			sibling(p.db, func(r GrantRow) string { return r.AccessObject })
+	}
+	if p.level == TargetDatabase {
+		return false
+	}
+	if !at(func(r GrantRow) bool { return r.Database == p.db && r.Table == p.table && !tableWildcard(r) }) {
+		return sibling(p.table, func(r GrantRow) string {
+			if r.Database != p.db {
+				return ""
+			}
+			return r.Table
+		})
+	}
+	if p.level == TargetTable {
+		return false
+	}
+	if !at(func(r GrantRow) bool { return r.Database == p.db && r.Table == p.table && r.Column == p.column }) {
+		return sibling(p.column, func(r GrantRow) string {
+			if r.Database != p.db || r.Table != p.table {
+				return ""
+			}
+			return r.Column
+		})
+	}
+	return false
+}
+
 // Privileges returns the access types of the rows at exactly the target,
 // sorted, in the server's group-compressed form (status.atProvider).
 func (a *Analysis) Privileges() []string { return a.privileges }
@@ -398,6 +496,17 @@ func (a *Analysis) Exists() bool {
 	return a.Effective()
 }
 
+// Hidden reports whether the server may leave grant option information
+// about some point of the target out of system.grants (goMayBeHidden).
+func (a *Analysis) Hidden() bool {
+	for _, st := range a.points {
+		if st.hidden {
+			return true
+		}
+	}
+	return false
+}
+
 func (a *Analysis) all(l string, set func(pointState) PrivilegeSet) bool {
 	for _, st := range a.points {
 		if !set(st).Has(l) {
@@ -415,7 +524,9 @@ type Revocation struct {
 }
 
 // A Plan is the statements that bring a target to its desired state, as
-// flags. The order is GRANT, REVOKE, REVOKE GRANT OPTION FOR.
+// flags. The order is REVOKE, REVOKE GRANT OPTION FOR, GRANT: a REVOKE also
+// removes the flags of the privilege's children, so the GRANT, which repeats
+// every desired flag a REVOKE removes, comes last.
 type Plan struct {
 	// Grant are the flags granted on the whole target, WITH GRANT OPTION
 	// when WithGrantOption is set.
@@ -425,9 +536,13 @@ type Plan struct {
 	// grant option is revoked.
 	Revoke            []Revocation
 	RevokeGrantOption []Revocation
+	// Record is the Grant's record of the grant option it gave at the
+	// target once the statements ran (see Analysis.Apply). Revoke leaves it
+	// empty: a deleted Grant gave nothing.
+	Record PrivilegeSet
 }
 
-// Empty reports whether the plan has nothing to do.
+// Empty reports whether the plan has no statements.
 func (p Plan) Empty() bool {
 	return len(p.Grant) == 0 && len(p.Revoke) == 0 && len(p.RevokeGrantOption) == 0
 }
@@ -440,7 +555,34 @@ func (r revocations) add(l, column string) {
 		r[l] = nil
 		return
 	}
-	r[l] = append(r[l], column)
+	if !slices.Contains(r[l], column) {
+		r[l] = append(r[l], column)
+	}
+}
+
+// has reports whether l is revoked from column (or from the whole target).
+func (r revocations) has(l, column string) bool {
+	cols, ok := r[l]
+	return ok && (column == "" || cols == nil || slices.Contains(cols, column))
+}
+
+// drop removes the revocation of l from column (from the whole target when
+// column is "").
+func (r revocations) drop(l, column string) {
+	cols, ok := r[l]
+	if !ok {
+		return
+	}
+	if column == "" || cols == nil {
+		delete(r, l)
+		return
+	}
+	cols = slices.DeleteFunc(slices.Clone(cols), func(c string) bool { return c == column })
+	if len(cols) == 0 {
+		delete(r, l)
+		return
+	}
+	r[l] = cols
 }
 
 func (r revocations) sorted() []Revocation {
@@ -452,51 +594,157 @@ func (r revocations) sorted() []Revocation {
 	return out
 }
 
+// removes returns the flags that revoking the privileges r removes at the
+// point of the target with the given column ("" for every point): each
+// privilege's own flag and those of its children (REVOKE CREATE ARBITRARY
+// TEMPORARY TABLE also removes CREATE TEMPORARY TABLE).
+func (a *Analysis) removes(r revocations, column string) PrivilegeSet {
+	out := PrivilegeSet{}
+	for l := range r {
+		if column != "" && !r.has(l, column) {
+			continue
+		}
+		out[l] = struct{}{}
+		for _, f := range a.cat.RowFlags(l, a.target.Level()) {
+			out[f] = struct{}{}
+		}
+	}
+	return out
+}
+
+// dedupe drops from revokeGO what a REVOKE in revoke removes at the same
+// point anyway: a REVOKE removes a flag together with its grant option.
+func (a *Analysis) dedupe(revoke, revokeGO revocations) {
+	for _, st := range a.points {
+		for l := range a.removes(revoke, st.column) {
+			revokeGO.drop(l, st.column)
+		}
+	}
+}
+
+// canRevoke reports whether REVOKE l at the point creates no partial revoke:
+// l is granted at the point and no broader row grants it (the caller
+// checks), and no broader row grants one of the flags of its children
+// either, unless the plan grants that flag again (regrant), which removes
+// the partial revoke the REVOKE made.
+func (a *Analysis) canRevoke(st pointState, l string, regrant func(string) bool) bool {
+	for _, f := range a.cat.RowFlags(l, a.target.Level()) {
+		if f != l && st.above.Has(f) && !regrant(f) {
+			return false
+		}
+	}
+	return true
+}
+
+// canRevokeGO reports whether REVOKE GRANT OPTION FOR l at the point creates
+// no partial revoke of a grant option: no broader row grants l with grant
+// option, nor one of the flags of its children, unless the plan grants that
+// flag again WITH GRANT OPTION (regrant).
+func (a *Analysis) canRevokeGO(st pointState, l string, regrant func(string) bool) bool {
+	if st.aboveGO.Has(l) {
+		return false
+	}
+	for _, f := range a.cat.RowFlags(l, a.target.Level()) {
+		if f != l && st.aboveGO.Has(f) && !regrant(f) {
+			return false
+		}
+	}
+	return true
+}
+
 // Apply returns the plan of Create and Update (design 5.6). A Grant owns its
 // exact target for its grantee:
 //
-//  1. GRANT the desired flags that are not effective, and with
-//     withGrantOption those without an effective grant option, WITH GRANT
-//     OPTION;
-//  2. REVOKE the other flags granted at exactly the target that no broader
+//  1. REVOKE the other flags granted at exactly the target that no broader
 //     row grants;
-//  3. REVOKE GRANT OPTION FOR the other flags that a broader row grants
+//  2. REVOKE GRANT OPTION FOR the other flags that a broader row grants
 //     without grant option while the row at the target has it, which
 //     removes the narrow row cleanly;
-//  4. without withGrantOption, REVOKE GRANT OPTION FOR the desired flags
-//     that hold grant option at the target, unless a broader row holds it.
+//  3. without withGrantOption, REVOKE GRANT OPTION FOR the desired flags
+//     that hold grant option at the target, unless a broader row holds it;
+//  4. REVOKE GRANT OPTION FOR the flags of record whose grant option is no
+//     longer wanted, where the server may not show it (see below);
+//  5. GRANT the desired flags that are not effective, those a REVOKE above
+//     removed (a privilege's children lose their flags with it), and with
+//     withGrantOption those without an effective grant option, WITH GRANT
+//     OPTION.
 //
 // The provider never creates a partial revoke: it revokes only what a row at
 // exactly the target grants and no broader row covers, so a flag shadowed by
-// a broader grant is left alone. The plan is empty exactly when the Grant is
-// up to date.
-func (a *Analysis) Apply(withGrantOption bool) Plan {
+// a broader grant is left alone.
+//
+// record is the Grant's record of the flags it granted WITH GRANT OPTION at
+// the target and has not revoked since. The server leaves some grant options
+// out of system.grants (goMayBeHidden); where it may, a flag of record counts
+// as holding grant option, so that withGrantOption converges instead of
+// granting again on every reconcile, and a flag of record whose grant option
+// is no longer wanted has it revoked although no row shows it (step 4, which
+// creates no partial revoke where no broader row with grant option is
+// shown). Plan.Record is the record once the statements ran; the Grant saves
+// it with them. The Grant is up to date exactly when the plan is empty: a
+// record entry that no row confirms any more, where the server shows the
+// grant option, is dropped with the next statements.
+func (a *Analysis) Apply(withGrantOption bool, record PrivilegeSet) Plan {
 	p := Plan{WithGrantOption: withGrantOption}
-	for _, l := range a.desired.Sorted() {
-		missing := !a.all(l, func(st pointState) PrivilegeSet { return st.effective })
-		missingGO := withGrantOption && !a.all(l, func(st pointState) PrivilegeSet { return st.effectiveGO })
-		if missing || missingGO {
-			p.Grant = append(p.Grant, l)
-		}
-	}
+	wantGO := func(l string) bool { return withGrantOption && a.desired.Has(l) }
 	revoke, revokeGO := revocations{}, revocations{}
 	for _, st := range a.points {
 		for _, l := range st.exact.Sorted() {
 			switch {
 			case a.desired.Has(l):
-				if !withGrantOption && st.exactGO.Has(l) && !st.aboveGO.Has(l) {
+				if !withGrantOption && st.exactGO.Has(l) && a.canRevokeGO(st, l, wantGO) {
 					revokeGO.add(l, st.column)
 				}
 			case !st.above.Has(l):
-				revoke.add(l, st.column)
-			case st.exactGO.Has(l) && !st.aboveGO.Has(l):
+				if a.canRevoke(st, l, a.desired.Has) {
+					revoke.add(l, st.column)
+				}
+			case st.exactGO.Has(l) && a.canRevokeGO(st, l, wantGO):
 				revokeGO.add(l, st.column)
 			}
+		}
+		for _, l := range record.Sorted() {
+			if !wantGO(l) && st.hidden && st.effective.Has(l) && st.above.Has(l) &&
+				!revoke.has(l, st.column) && !revokeGO.has(l, st.column) && a.canRevokeGO(st, l, wantGO) {
+				revokeGO.add(l, st.column)
+			}
+		}
+	}
+	a.dedupe(revoke, revokeGO)
+	removed, removedGO := a.removes(revoke, ""), a.removes(revokeGO, "")
+	for _, l := range a.desired.Sorted() {
+		missing := !a.all(l, func(st pointState) PrivilegeSet { return st.effective })
+		missingGO := false
+		if withGrantOption {
+			for _, st := range a.points {
+				// Where the server may hide the grant option, a recorded flag
+				// counts as holding it.
+				recorded := st.hidden && record.Has(l)
+				if !st.effectiveGO.Has(l) && !recorded {
+					missingGO = true
+				}
+			}
+		}
+		if missing || missingGO || removed.Has(l) || (withGrantOption && removedGO.Has(l)) {
+			p.Grant = append(p.Grant, l)
 		}
 	}
 	p.Revoke, p.RevokeGrantOption = revoke.sorted(), revokeGO.sorted()
 	if len(p.Grant) == 0 {
 		p.WithGrantOption = false
+	}
+	p.Record = PrivilegeSet{}
+	if withGrantOption {
+		for l := range a.desired {
+			granted := p.WithGrantOption && slices.Contains(p.Grant, l)
+			shown := false
+			for _, st := range a.points {
+				shown = shown || st.exactGO.Has(l)
+			}
+			if granted || shown || (record.Has(l) && a.Hidden()) {
+				p.Record[l] = struct{}{}
+			}
+		}
 	}
 	return p
 }
@@ -504,36 +752,43 @@ func (a *Analysis) Apply(withGrantOption bool) Plan {
 // Revoke returns the plan of Delete: for every desired flag granted at
 // exactly the target, REVOKE it if no broader row grants it, or REVOKE GRANT
 // OPTION FOR it if a broader row grants it without grant option while the
-// row at the target has it (which removes the narrow row). Privileges that
-// someone else granted at the target, and desired flags that are only
-// covered by a broader grant, are left alone. The Grant exists while it is
-// being deleted exactly when this plan is not empty.
-func (a *Analysis) Revoke() Plan {
+// row at the target has it (which removes the narrow row). Where the server
+// may not show the grant option (goMayBeHidden), REVOKE GRANT OPTION FOR
+// every flag of record, the Grant's record of the grant option it gave at
+// the target (see Apply), unless a broader row with grant option is shown.
+// Privileges that someone else granted at the target, and desired flags that
+// are only covered by a broader grant, are left alone. The Grant exists
+// while it is being deleted exactly when this plan is not empty.
+func (a *Analysis) Revoke(record PrivilegeSet) Plan {
+	never := func(string) bool { return false }
 	revoke, revokeGO := revocations{}, revocations{}
 	for _, st := range a.points {
 		for _, l := range st.exact.Sorted() {
 			switch {
 			case !a.desired.Has(l):
 			case !st.above.Has(l):
-				revoke.add(l, st.column)
-			case st.exactGO.Has(l) && !st.aboveGO.Has(l):
+				if a.canRevoke(st, l, never) {
+					revoke.add(l, st.column)
+				}
+			case st.exactGO.Has(l) && a.canRevokeGO(st, l, never):
+				revokeGO.add(l, st.column)
+			}
+		}
+		for _, l := range record.Sorted() {
+			if st.hidden && st.effective.Has(l) && st.above.Has(l) &&
+				!revoke.has(l, st.column) && !revokeGO.has(l, st.column) && a.canRevokeGO(st, l, never) {
 				revokeGO.add(l, st.column)
 			}
 		}
 	}
+	a.dedupe(revoke, revokeGO)
 	return Plan{Revoke: revoke.sorted(), RevokeGrantOption: revokeGO.sorted()}
 }
 
-// Statements renders the plan for the target and grantee.
+// Statements renders the plan for the target and grantee, in the order
+// REVOKE, REVOKE GRANT OPTION FOR, GRANT.
 func (p Plan) Statements(t GrantTarget, grantee string) ([]string, error) {
 	var out []string
-	if len(p.Grant) > 0 {
-		s, err := GrantStmt(p.Grant, t, grantee, p.WithGrantOption)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, s)
-	}
 	for _, r := range []struct {
 		revs     []Revocation
 		goOption bool
@@ -542,6 +797,13 @@ func (p Plan) Statements(t GrantTarget, grantee string) ([]string, error) {
 			continue
 		}
 		s, err := RevokeStmt(r.revs, t, grantee, r.goOption)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	if len(p.Grant) > 0 {
+		s, err := GrantStmt(p.Grant, t, grantee, p.WithGrantOption)
 		if err != nil {
 			return nil, err
 		}

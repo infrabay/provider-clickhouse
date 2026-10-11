@@ -379,13 +379,13 @@ func TestAnalyze(t *testing.T) {
 		"ForeignOnlyAtTarget": {target: app, privileges: []string{"SELECT"},
 			rows:   []GrantRow{gr("INSERT", "app.*", "")},
 			exists: true,
-			apply:  []string{"GRANT SELECT ON `app`.* TO `g`", "REVOKE INSERT ON `app`.* FROM `g`"}, privs: []string{"INSERT"}},
+			apply:  []string{"REVOKE INSERT ON `app`.* FROM `g`", "GRANT SELECT ON `app`.* TO `g`"}, privs: []string{"INSERT"}},
 		// A foreign privilege covered above without option but holding it at
 		// the target: only the option is revoked, which removes the row.
 		"ForeignOptionCoveredAbove": {target: appT, privileges: []string{"SELECT"},
 			rows:   []GrantRow{gr("INSERT", "app.*", ""), gr("INSERT", "app.t", "g")},
 			exists: true,
-			apply:  []string{"GRANT SELECT ON `app`.`t` TO `g`", "REVOKE GRANT OPTION FOR INSERT ON `app`.`t` FROM `g`"}, privs: []string{"INSERT"}},
+			apply:  []string{"REVOKE GRANT OPTION FOR INSERT ON `app`.`t` FROM `g`", "GRANT SELECT ON `app`.`t` TO `g`"}, privs: []string{"INSERT"}},
 		// Wildcards on 26.8 (is_wildcard) [W5]: GRANT SELECT ON team_*.*,
 		// REVOKE SELECT ON team_b*.*, REVOKE SELECT ON team_c.*, GRANT
 		// INSERT ON app.ev*.
@@ -443,7 +443,7 @@ func TestAnalyze(t *testing.T) {
 		"WithoutIsWildcardLooksLiteral258": {version: v258, target: db("team_"), privileges: []string{"INSERT"},
 			rows:   []GrantRow{gr("SELECT", "team_.*", ""), gr("SELECT", "team_b.*", "p"), gr("SELECT", "team_c.*", "p"), gr("INSERT", "app.ev", "")},
 			exists: true,
-			apply:  []string{"GRANT INSERT ON `team_`.* TO `g`", "REVOKE SELECT ON `team_`.* FROM `g`"}, privs: []string{"SELECT"}},
+			apply:  []string{"REVOKE SELECT ON `team_`.* FROM `g`", "GRANT INSERT ON `team_`.* TO `g`"}, privs: []string{"SELECT"}},
 		// GRANT ACCESS MANAGEMENT ON *.* [N3r 25.3]: the global and table
 		// level flags are foreign at *.*; USER_NAME ones are ignored.
 		"AccessManagementGlobal": {version: v253, target: global, privileges: []string{"SELECT"},
@@ -477,15 +477,15 @@ func TestAnalyze(t *testing.T) {
 			if a.Exists() != tc.exists || a.Effective() != tc.effective {
 				t.Errorf("Exists() = %t, Effective() = %t; want %t, %t (missing %v)", a.Exists(), a.Effective(), tc.exists, tc.effective, a.Missing())
 			}
-			apply, err := a.Apply(tc.wgo).Statements(tc.target, "g")
+			apply, err := a.Apply(tc.wgo, nil).Statements(tc.target, "g")
 			if err != nil {
 				t.Fatal(err)
 			}
-			revoke, err := a.Revoke().Statements(tc.target, "g")
+			revoke, err := a.Revoke(nil).Statements(tc.target, "g")
 			if err != nil {
 				t.Fatal(err)
 			}
-			if a.Apply(tc.wgo).Empty() != (len(apply) == 0) || a.Revoke().Empty() != (len(revoke) == 0) {
+			if a.Apply(tc.wgo, nil).Empty() != (len(apply) == 0) || a.Revoke(nil).Empty() != (len(revoke) == 0) {
 				t.Error("Plan.Empty() disagrees with the statements")
 			}
 			if tc.check != nil {
@@ -505,7 +505,7 @@ func TestAnalyze(t *testing.T) {
 			}
 			// The analysis never plans a partial revoke: everything it
 			// revokes is granted by a row at exactly the target.
-			for _, p := range []Plan{a.Apply(tc.wgo), a.Revoke()} {
+			for _, p := range []Plan{a.Apply(tc.wgo, nil), a.Revoke(nil)} {
 				for _, r := range slices.Concat(p.Revoke, p.RevokeGrantOption) {
 					if !exactlyGranted(a, r) {
 						t.Errorf("%s is revoked but not granted at exactly the target", r.Privilege)
@@ -545,6 +545,201 @@ func alterSubset(t *testing.T, c *Catalogue, apply, revoke []string) {
 	}
 	if diff := cmp.Diff([]string{"REVOKE ALTER UPDATE ON `app`.* FROM `g`"}, revoke); diff != "" {
 		t.Errorf("Revoke() -want +got:\n%s", diff)
+	}
+}
+
+// TestGrantOptionHidden checks goMayBeHidden on the rows the servers show
+// for grants whose grant option they hide or show [verified on 25.3.3 and
+// 26.8, each confirmed by delegating the privilege as the grantee]. The
+// rows are what system.grants lists; the comments name the statements.
+func TestGrantOptionHidden(t *testing.T) {
+	appEvents := scope{level: TargetTable, db: "app", table: "events"}
+	teamA := scope{level: TargetDatabase, db: "team_a"}
+	cases := map[string]struct {
+		version string
+		rows    []GrantRow
+		point   scope
+		hidden  bool
+	}{
+		// GRANT SELECT ON app.*, GRANT SELECT ON app.events WITH GRANT
+		// OPTION, GRANT INSERT ON app.events_raw: the option is listed
+		// nowhere, but in effect.
+		"SiblingExtendsTheName": {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.events_raw", "")}, point: appEvents, hidden: true},
+		// ... GRANT INSERT ON app.evil instead: hidden too.
+		"SiblingSharesAPrefix": {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.evil", "")}, point: appEvents, hidden: true},
+		// ... GRANT INSERT ON app.events_raw and app.events_x: hidden.
+		"SiblingsShareALongerPrefix": {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.events_raw", ""), gr("INSERT", "app.events_x", "")}, point: appEvents, hidden: true},
+		// ... GRANT INSERT ON app.evil and app.evx: the server splits the
+		// names at "ev" and lists the option, which the check cannot tell
+		// (it over-approximates the server).
+		"SiblingsSplitBelow": {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.evil", ""), gr("INSERT", "app.evx", "")}, point: appEvents, hidden: true},
+		// ... GRANT INSERT ON app.x: listed.
+		"SiblingStartsOtherwise": {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("SELECT", "app.events", "g"), gr("INSERT", "app.x", "")}, point: appEvents},
+		// A row at the point proves its grant option information is listed.
+		"RowAtThePoint":  {rows: []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.ev", ""), gr("SELECT", "app.events", "g")}, point: appEvents},
+		"NoBroaderGrant": {rows: []GrantRow{gr("SELECT", "app.events", "g"), gr("INSERT", "app.events_raw", "")}, point: appEvents},
+		// GRANT SELECT ON *.*, GRANT SELECT ON team_a.* WITH GRANT OPTION,
+		// GRANT INSERT ON team_b.*: hidden at the database level, and so is
+		// GRANT SELECT ON team_a.t WITH GRANT OPTION.
+		"DatabaseLevel":          {rows: []GrantRow{gr("SELECT", "*.*", ""), gr("INSERT", "team_b.*", "")}, point: teamA, hidden: true},
+		"TableUnderHiddenDBNode": {rows: []GrantRow{gr("SELECT", "*.*", ""), gr("INSERT", "team_b.*", "")}, point: scope{level: TargetTable, db: "team_a", table: "t"}, hidden: true},
+		// GRANT SELECT ON *.* WITH GRANT OPTION, REVOKE GRANT OPTION FOR
+		// SELECT ON team_a.*, GRANT INSERT ON team_b.*: the partial revoke
+		// of the option is hidden the same way.
+		"HiddenOptionRevoke": {rows: []GrantRow{gr("SELECT", "*.*", "g"), gr("INSERT", "team_b.*", "")}, point: teamA, hidden: true},
+		// GRANT SELECT ON app.t, GRANT SELECT(a) ON app.t WITH GRANT OPTION,
+		// GRANT INSERT(ab) ON app.t: hidden at the column level.
+		"ColumnLevel": {rows: []GrantRow{gr("SELECT", "app.t", ""), gr("INSERT", "app.t(ab)", "")}, point: scope{level: TargetColumn, db: "app", table: "t", column: "a"}, hidden: true},
+		"Global":      {rows: []GrantRow{gr("SELECT", "app.*", "")}, point: scope{level: TargetGlobal}},
+		"NoRows":      {point: teamA},
+		// A grant on a user name prefix: on 25.3 it shows as a global row,
+		// but the server keeps it among the database names (a name that may
+		// begin with anything); from 25.8 on access_object names it.
+		"UnknownParameter253": {version: v253, rows: []GrantRow{gr("CREATE USER", "*.*", "")}, point: teamA, hidden: true},
+		"ParameterName268":    {version: v268, rows: []GrantRow{withObject(gr("CREATE USER", "*.*", "w"), "team_")}, point: teamA, hidden: true},
+		"OtherParameter268":   {version: v268, rows: []GrantRow{withObject(gr("CREATE USER", "*.*", "w"), "svc_"), gr("SELECT", "*.*", "")}, point: teamA},
+		// A wildcard on exactly the name is on the point's path.
+		"WildcardOnTheName268": {version: v268, rows: []GrantRow{gr("SELECT", "team_a.*", "w")}, point: teamA},
+		"WildcardPrefix268":    {version: v268, rows: []GrantRow{gr("SELECT", "team.*", "w")}, point: teamA, hidden: true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			v := tc.version
+			if v == "" {
+				v = v253
+			}
+			if got := goMayBeHidden(catalogue(t, v), tc.rows, tc.point); got != tc.hidden {
+				t.Errorf("goMayBeHidden() = %t, want %t", got, tc.hidden)
+			}
+		})
+	}
+}
+
+// TestGrantOptionRecord: where the server may not show the grant option,
+// the Grant's record of the grant option it gave stands in for the rows, so
+// that withGrantOption converges and a grant option that is no longer wanted
+// is revoked although no row shows it (D-35).
+func TestGrantOptionRecord(t *testing.T) {
+	c := catalogue(t, v253)
+	events := GrantTarget{Database: "app", Table: "events"}
+	desired := func(t *testing.T, privs ...string) PrivilegeSet {
+		t.Helper()
+		d, err := c.Expand(privs, events.Level())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	// GRANT SELECT ON app.*, GRANT INSERT ON app.events_raw, and the
+	// provider's GRANT SELECT ON app.events WITH GRANT OPTION, which the
+	// server does not list.
+	hidden := []GrantRow{gr("SELECT", "app.*", ""), gr("INSERT", "app.events_raw", "")}
+	// The same without the sibling: the option is listed.
+	shown := []GrantRow{gr("SELECT", "app.*", ""), gr("SELECT", "app.events", "g")}
+	shownGone := []GrantRow{gr("SELECT", "app.*", "")}
+	sel := NewPrivilegeSet("SELECT")
+	cases := map[string]struct {
+		rows   []GrantRow
+		privs  []string
+		wgo    bool
+		record PrivilegeSet
+		apply  []string
+		after  PrivilegeSet
+		revoke []string
+	}{
+		"GrantedOnce": {rows: hidden, privs: []string{"SELECT"}, wgo: true,
+			apply: []string{"GRANT SELECT ON `app`.`events` TO `g` WITH GRANT OPTION"}, after: sel},
+		"ConvergesWithTheRecord": {rows: hidden, privs: []string{"SELECT"}, wgo: true, record: sel, after: sel,
+			revoke: []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}},
+		"TurnedOff": {rows: hidden, privs: []string{"SELECT"}, record: sel,
+			apply:  []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"},
+			revoke: []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}},
+		"PrivilegeDropped": {rows: append([]GrantRow{gr("INSERT", "app.*", "")}, hidden...), privs: []string{"INSERT"}, wgo: true,
+			record: NewPrivilegeSet("SELECT", "INSERT"),
+			apply:  []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}, after: NewPrivilegeSet("INSERT"),
+			revoke: []string{"REVOKE GRANT OPTION FOR INSERT, SELECT ON `app`.`events` FROM `g`"}},
+		"NothingRecorded": {rows: hidden, privs: []string{"SELECT"}},
+		// A broader row with grant option: revoking at the target would cut
+		// a partial revoke into it.
+		"BroaderOptionShown": {rows: []GrantRow{gr("SELECT", "app.*", "g"), gr("INSERT", "app.events_raw", "")}, privs: []string{"SELECT"}, record: sel},
+		// Where the server shows the option, the rows decide: a recorded
+		// option that is gone is granted again, or forgotten.
+		"ShownKeepsTheRecord": {rows: shown, privs: []string{"SELECT"}, wgo: true, record: sel, after: sel,
+			revoke: []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}},
+		"ShownAndGone": {rows: shownGone, privs: []string{"SELECT"}, wgo: true, record: sel,
+			apply: []string{"GRANT SELECT ON `app`.`events` TO `g` WITH GRANT OPTION"}, after: sel},
+		"ShownGoneForgotten": {rows: shownGone, privs: []string{"SELECT"}, record: sel},
+		// An option granted before the record existed is recorded.
+		"ShownRecorded": {rows: shown, privs: []string{"SELECT"}, wgo: true, after: sel,
+			revoke: []string{"REVOKE GRANT OPTION FOR SELECT ON `app`.`events` FROM `g`"}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			a := Analyze(c, events, desired(t, tc.privs...), tc.rows)
+			p := a.Apply(tc.wgo, tc.record)
+			apply, err := p.Statements(events, "g")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.apply, apply, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("Apply() -want +got:\n%s", diff)
+			}
+			if !p.Record.Equal(tc.after) {
+				t.Errorf("Apply().Record = %v, want %v", p.Record.Sorted(), tc.after.Sorted())
+			}
+			revoke, err := a.Revoke(tc.record).Statements(events, "g")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if diff := cmp.Diff(tc.revoke, revoke, cmpopts.EquateEmpty()); diff != "" {
+				t.Errorf("Revoke() -want +got:\n%s", diff)
+			}
+			if r := a.Revoke(tc.record).Record; len(r) != 0 {
+				t.Errorf("a deleted Grant records nothing: %v", r.Sorted())
+			}
+		})
+	}
+}
+
+// TestPlanOrder: a REVOKE also removes the flags of the privilege's
+// children, so the plan revokes first and then grants every desired flag a
+// REVOKE removed. CREATE ARBITRARY TEMPORARY TABLE carries a flag of its own
+// besides that of its only child CREATE TEMPORARY TABLE [all versions].
+func TestPlanOrder(t *testing.T) {
+	global := GrantTarget{Database: "*"}
+	for _, v := range versions {
+		t.Run(v, func(t *testing.T) {
+			c := catalogue(t, v)
+			ctt, err := c.Expand([]string{"CREATE TEMPORARY TABLE"}, TargetGlobal)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, tc := range []struct {
+				name string
+				rows []GrantRow
+				wgo  bool
+				want []string
+			}{
+				{"ForeignParent", []GrantRow{gr("CREATE ARBITRARY TEMPORARY TABLE", "*.*", "")}, false,
+					[]string{"REVOKE CREATE ARBITRARY TEMPORARY TABLE ON *.* FROM `g`", "GRANT CREATE TEMPORARY TABLE ON *.* TO `g`"}},
+				{"ForeignParentWithOption", []GrantRow{gr("CREATE ARBITRARY TEMPORARY TABLE", "*.*", "g")}, true,
+					[]string{"REVOKE CREATE ARBITRARY TEMPORARY TABLE ON *.* FROM `g`", "GRANT CREATE TEMPORARY TABLE ON *.* TO `g` WITH GRANT OPTION"}},
+				// GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.* WITH GRANT OPTION,
+				// GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.*: the option of the
+				// child goes with the parent's and is granted again.
+				{"ForeignParentOption", []GrantRow{gr("CREATE ARBITRARY TEMPORARY TABLE", "*.*", "g")}, false,
+					[]string{"REVOKE CREATE ARBITRARY TEMPORARY TABLE ON *.* FROM `g`", "GRANT CREATE TEMPORARY TABLE ON *.* TO `g`"}},
+			} {
+				a := Analyze(c, global, ctt, tc.rows)
+				got, err := a.Apply(tc.wgo, nil).Statements(global, "g")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if diff := cmp.Diff(tc.want, got); diff != "" {
+					t.Errorf("%s: Apply() -want +got:\n%s", tc.name, diff)
+				}
+			}
+		})
 	}
 }
 

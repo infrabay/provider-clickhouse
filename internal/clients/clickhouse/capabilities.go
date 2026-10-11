@@ -5,6 +5,7 @@ package clickhouse
 
 import (
 	"context"
+	"encoding/json"
 	"slices"
 	"sync"
 	"time"
@@ -37,7 +38,7 @@ func ProbeInfo(ctx context.Context, db DB) (ServerInfo, error) {
 // Probe queries. They are exported so that tests can match them.
 const (
 	QueryJWTProbe        = "EXPLAIN AST CREATE USER capability_probe IDENTIFIED WITH jwt"
-	QueryUserDirectories = "SELECT name, type, precedence FROM system.user_directories ORDER BY precedence"
+	QueryUserDirectories = "SELECT name, type, params, precedence FROM system.user_directories ORDER BY precedence"
 	QueryClusterHosts    = "SELECT count() FROM system.clusters WHERE cluster = {cluster:String}"
 	QueryPrivilegeExists = "SELECT count() FROM system.privileges WHERE privilege = {privilege:String}"
 
@@ -76,7 +77,11 @@ func QuerySystemColumnProbe(table, column string) string {
 	return "SELECT " + QuoteIdent(column) + " FROM system." + QuoteIdent(table) + " LIMIT 0"
 }
 
-// Writable user directory types.
+// User directory types (system.user_directories.type). Entities can be
+// written only in the first three; users_xml is the read-only directory of
+// users.xml and users.d. An entity's storage (system.users.storage,
+// system.roles.storage) is the name of its directory, which is its type
+// unless the server configuration renames the directory.
 const (
 	StorageLocalDirectory = "local_directory"
 	StorageReplicated     = "replicated"
@@ -114,6 +119,13 @@ func (c *Capabilities) get(key string) (any, bool) {
 		return nil, false
 	}
 	return r.value, true
+}
+
+// forget drops a cached probe result, so that the next call probes again.
+func (c *Capabilities) forget(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.results, key)
 }
 
 func (c *Capabilities) put(key string, v any) {
@@ -155,39 +167,97 @@ func (c *Capabilities) JWTUsers(ctx context.Context, db DB) (bool, error) {
 
 // UserDirectory is a row of system.user_directories.
 type UserDirectory struct {
-	Name       string
-	Type       string
+	Name string
+	Type string
+	// Params is the directory's configuration as JSON, for example
+	// {"path":"/var/lib/clickhouse/access/","readonly":true}.
+	Params     string
 	Precedence uint64
 }
 
-// AccessStorage returns the type of the first writable user directory, where
-// new access entities are stored: local_directory, replicated or memory.
-func (c *Capabilities) AccessStorage(ctx context.Context, db DB) (string, error) {
-	return probe(ctx, c, "storage", func(ctx context.Context) (string, error) {
+// Writable reports whether access entities in the directory can be written:
+// its type is local_directory, replicated or memory, and its configuration
+// does not make it read-only (a local_directory with <readonly>true</readonly>
+// shows "readonly":true in params). users_xml and every other type are
+// read-only.
+func (d UserDirectory) Writable() bool {
+	if !slices.Contains([]string{StorageLocalDirectory, StorageReplicated, StorageMemory}, d.Type) {
+		return false
+	}
+	var p struct {
+		ReadOnly bool `json:"readonly"`
+	}
+	if err := json.Unmarshal([]byte(d.Params), &p); err == nil && p.ReadOnly {
+		return false
+	}
+	return true
+}
+
+// UserDirectories returns the server's user directories in precedence order.
+// The configuration of user directories is read only at server start.
+func (c *Capabilities) UserDirectories(ctx context.Context, db DB) ([]UserDirectory, error) {
+	return probe(ctx, c, "directories", func(ctx context.Context) ([]UserDirectory, error) {
 		var dirs []UserDirectory
 		err := db.Query(ctx, QueryUserDirectories, nil, func(r Row) error {
 			var d UserDirectory
-			if err := r.Scan(&d.Name, &d.Type, &d.Precedence); err != nil {
+			if err := r.Scan(&d.Name, &d.Type, &d.Params, &d.Precedence); err != nil {
 				return err
 			}
 			dirs = append(dirs, d)
 			return nil
 		})
 		if err != nil {
-			return "", WithDefaultReason(err)
+			return nil, WithDefaultReason(err)
 		}
-		return FirstWritableDirectory(dirs)
+		return dirs, nil
 	})
+}
+
+// AccessStorage returns the type of the first writable user directory, where
+// new access entities are stored: local_directory, replicated or memory.
+func (c *Capabilities) AccessStorage(ctx context.Context, db DB) (string, error) {
+	dirs, err := c.UserDirectories(ctx, db)
+	if err != nil {
+		return "", err
+	}
+	return FirstWritableDirectory(dirs)
 }
 
 // FirstWritableDirectory returns the type of the first writable directory.
 func FirstWritableDirectory(dirs []UserDirectory) (string, error) {
 	for _, d := range dirs {
-		if slices.Contains([]string{StorageLocalDirectory, StorageReplicated, StorageMemory}, d.Type) {
+		if d.Writable() {
 			return d.Type, nil
 		}
 	}
 	return "", reason.Errorf(reason.InvalidConfig, "the server has no writable user directory")
+}
+
+// StorageReadOnly reports whether the user directory that holds an access
+// entity refuses writes, given the entity's storage (system.users.storage or
+// system.roles.storage). That is the name of the directory, not its type: a
+// configuration may rename users_xml (<users_xml><name>...</name>), so the
+// name is looked up in system.user_directories. A name that is not among
+// the cached directories is looked up once more without the cache (the
+// server reads its user directories only at start, so a restart may have
+// changed them); a name that is still unknown counts as read-only, so the
+// provider never writes to an entity whose directory it cannot tell.
+func (c *Capabilities) StorageReadOnly(ctx context.Context, db DB, storage string) (bool, error) {
+	for refreshed := false; ; refreshed = true {
+		dirs, err := c.UserDirectories(ctx, db)
+		if err != nil {
+			return false, err
+		}
+		for _, d := range dirs {
+			if d.Name == storage {
+				return !d.Writable(), nil
+			}
+		}
+		if refreshed {
+			return true, nil
+		}
+		c.forget("directories")
+	}
 }
 
 // ClusterHosts returns the number of hosts of a cluster in system.clusters.

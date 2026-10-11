@@ -59,8 +59,9 @@ type Env struct {
 	// Resolved is the resolved ProviderConfig: its policy (nil for a
 	// namespaced ProviderConfig), adoption, cluster and endpoint.
 	Resolved *providerconfig.Resolved
-	// Kube persists ownership annotations written in Observe (adoption and
-	// recovery).
+	// Kube persists annotations: ownership claims written in Observe
+	// (adoption and recovery) and a Grant's record of the grant option it
+	// gave.
 	Kube client.Client
 	// Reader lists User and Role MRs to find the owner of a grantee. The
 	// manager's cached client is fine.

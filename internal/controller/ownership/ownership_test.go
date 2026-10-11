@@ -103,15 +103,15 @@ func TestDecide(t *testing.T) {
 		event       string
 	}{
 		"Row1ReadOnly": {
-			mr: newMR(), in: Input{Storage: ch.StorageUsersXML},
+			mr: newMR(), in: Input{Storage: ch.StorageUsersXML, ReadOnly: true},
 			decision: ReadOnly, exists: true, reason: reason.ReadOnlyStorage,
 		},
 		"Row1ReadOnlyDeleting": {
-			mr: newMR(deleting()), in: Input{Storage: ch.StorageUsersXML},
+			mr: newMR(deleting()), in: Input{Storage: ch.StorageUsersXML, ReadOnly: true},
 			decision: ReadOnly, exists: false,
 		},
 		"Row1ReadOnlyObserveOnly": {
-			mr: newMR(policies(xpv2.ManagementActionObserve)), in: Input{Storage: ch.StorageUsersXML},
+			mr: newMR(policies(xpv2.ManagementActionObserve)), in: Input{Storage: ch.StorageUsersXML, ReadOnly: true},
 			decision: ReadOnly, exists: true, ready: true,
 		},
 		"Row2Owned": {

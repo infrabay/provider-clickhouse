@@ -26,7 +26,6 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 
 	"github.com/infrabay/provider-clickhouse/apis/v1alpha1"
-	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
 	"github.com/infrabay/provider-clickhouse/internal/reason"
 )
 
@@ -158,8 +157,12 @@ type Input struct {
 	Name string
 	// ObservedID is the object's UUID.
 	ObservedID string
-	// Storage is the object's access storage (User and Role), or "".
+	// Storage is the name of the object's user directory (User and Role),
+	// or "", for messages.
 	Storage string
+	// ReadOnly is set when that directory refuses writes: users.xml/users.d
+	// (whatever the directory is called) or a read-only local directory.
+	ReadOnly bool
 	// Recoverable enables row 5 (User and Role).
 	Recoverable bool
 	// CreateEvidence is what the create journal knows about a CREATE this
@@ -215,7 +218,8 @@ func (r Result) Ready() bool {
 // Decide applies the ownership decision table to an object that exists. The
 // first matching row wins:
 //
-//  1. storage users_xml: read-only;
+//  1. a read-only user directory (users.xml/users.d, whatever it is called,
+//     or a local directory configured read-only): read-only;
 //  2. valid claim, owned-id equals the observed UUID: owned;
 //  3. adopt equals the observed UUID and adoption is allowed: adopted;
 //  4. adopt is set otherwise: adoption rejected;
@@ -242,11 +246,11 @@ func Decide(mg resource.Managed, in Input) Result {
 	uid := string(mg.GetUID())
 
 	// Row 1.
-	if in.Storage == ch.StorageUsersXML {
+	if in.ReadOnly {
 		r := Result{Decision: ReadOnly, Exists: !deleting, ObserveOnly: !writes}
 		if !deleting && writes {
 			r.Err = reason.Errorf(reason.ReadOnlyStorage,
-				"%s %q is defined in users.xml/users.d and cannot be managed", in.Kind, in.Name)
+				"%s %q is in the read-only user directory %q (such as users.xml/users.d) and cannot be managed", in.Kind, in.Name, in.Storage)
 		}
 		return r
 	}
@@ -376,7 +380,8 @@ func Apply(mg resource.Managed, set map[string]string, remove []string) {
 // Patch persists annotation changes with a JSON merge patch on
 // metadata.annotations, and applies them to mg (the patch response updates
 // it). Observe uses it for adoption and recovery: annotation changes made in
-// Observe are otherwise not persisted.
+// Observe are otherwise not persisted. Grant uses it for its record of the
+// grant option, which Update and Delete change.
 func Patch(ctx context.Context, kube client.Client, mg resource.Managed, set map[string]string, remove []string) error {
 	if len(set) == 0 && len(remove) == 0 {
 		return nil
@@ -395,7 +400,7 @@ func Patch(ctx context.Context, kube client.Client, mg resource.Managed, set map
 		return err
 	}
 	if err := kube.Patch(ctx, mg, client.RawPatch(types.MergePatchType, body)); err != nil {
-		return fmt.Errorf("cannot patch ownership annotations: %w", err)
+		return fmt.Errorf("cannot patch annotations: %w", err)
 	}
 	Apply(mg, set, remove)
 	return nil

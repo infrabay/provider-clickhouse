@@ -1037,9 +1037,14 @@ func TestReferences(t *testing.T) {
 	if ReferencesOf(&v1alpha1.Role{}) != nil || len(ReferencesOf(g)) != 3 {
 		t.Error("ReferencesOf must only return the references of a RoleGrant")
 	}
-	// A cross-namespace reference is rejected before anything is read.
+	// A cross-namespace reference is rejected before anything is read; the
+	// MR's own namespace, which a resolved selector names, is accepted.
+	g.Spec.ForProvider.MemberOfRef.Namespace = g.GetNamespace()
+	if err := providerconfig.CheckReferenceNamespaces(References(g), g.GetNamespace()); err != nil {
+		t.Errorf("memberOfRef in the MR's own namespace: %v", err)
+	}
 	g.Spec.ForProvider.MemberOfRef.Namespace = "team-b"
-	if err := providerconfig.CheckReferenceNamespaces(References(g)); !reason.Is(err, reason.InvalidSpec) {
+	if err := providerconfig.CheckReferenceNamespaces(References(g), g.GetNamespace()); !reason.Is(err, reason.InvalidSpec) {
 		t.Errorf("cross-namespace memberOfRef: %v", err)
 	}
 }

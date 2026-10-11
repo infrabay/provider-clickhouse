@@ -165,12 +165,21 @@ func testAccessEntities(t *testing.T, f *accessFixture) {
 	ctx := context.Background()
 	cl := f.client(t)
 
-	if e, ok, err := access.ReadEntity(ctx, cl, access.User, f.identity); err != nil || !ok || !e.ReadOnly() {
+	plain := &access.Env{Client: cl}
+	e, ok, err := access.ReadEntity(ctx, cl, access.User, f.identity)
+	if err != nil || !ok || e.Storage != ch.StorageUsersXML {
 		t.Errorf("the users.d identity: %+v, %t, %v", e, ok, err)
 	}
+	if readOnly, err := plain.ReadOnly(ctx, e); err != nil || !readOnly {
+		t.Errorf("the users.d identity must be read-only: %t, %v", readOnly, err)
+	}
 	uid := f.adminUser(t, "app_ent_user")
-	if e, ok, err := access.ReadEntity(ctx, cl, access.User, "app_ent_user"); err != nil || !ok || e.ID != uid || e.Storage != ch.StorageLocalDirectory {
+	e, ok, err = access.ReadEntity(ctx, cl, access.User, "app_ent_user")
+	if err != nil || !ok || e.ID != uid || e.Storage != ch.StorageLocalDirectory {
 		t.Errorf("SQL user: %+v, %t, %v (admin sees %s)", e, ok, err, uid)
+	}
+	if readOnly, err := plain.ReadOnly(ctx, e); err != nil || readOnly {
+		t.Errorf("an SQL user must be writable: %t, %v", readOnly, err)
 	}
 	rid := f.adminRole(t, "app_ent_role")
 	if e, ok, err := access.ReadEntity(ctx, cl, access.Role, "app_ent_role"); err != nil || !ok || e.ID != rid {

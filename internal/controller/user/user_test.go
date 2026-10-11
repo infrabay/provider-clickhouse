@@ -236,6 +236,13 @@ func TestCreate(t *testing.T) {
 			mr:     newUser(),
 			reason: reason.Internal,
 		},
+		// crossplane-runtime never calls Create without the Create
+		// management policy; if it did, nothing is created, even with a
+		// claim on the MR's own UID (D-26).
+		"WithoutCreatePolicy": {
+			mr:     newUser(claimed(), policies(xpv2.ManagementActionObserve, xpv2.ManagementActionUpdate, xpv2.ManagementActionDelete)),
+			reason: reason.Internal,
+		},
 		// 36 is a configuration error the server found, e.g. claims it
 		// refuses.
 		"BadArguments": {
@@ -551,6 +558,23 @@ func TestUpdate(t *testing.T) {
 		e := newEnv(t, newServer(fake.Upstream268, passwordRow(), ""), nil)
 		if _, err := e.Update(context.Background(), newUser(owned(userID))); !reason.Is(err, reason.Internal) || len(e.db.Execs) > 0 {
 			t.Fatalf("Update() = %v, %v", err, e.db.Execs)
+		}
+	})
+	t.Run("WithoutUpdatePolicy", func(t *testing.T) {
+		// A drifted jwt user whose policies allow Create but not Update:
+		// Observe plans the ALTER, and Update must refuse it even with a
+		// claim on the MR's own UID, whatever crossplane-runtime calls
+		// (D-26).
+		s := newServer(fake.Antalya266, jwtRow(), "CREATE USER `team-a_etl` IDENTIFIED WITH jwt PROCESSOR 'other'")
+		mr := newUser(owned(userID), jwtUser("kubernetes", ""), managedFields("", ""),
+			policies(xpv2.ManagementActionObserve, xpv2.ManagementActionCreate, xpv2.ManagementActionDelete))
+		e := newEnv(t, s, nil, mr.DeepCopy())
+		o, err := e.Observe(context.Background(), mr)
+		if err != nil || o.ResourceUpToDate {
+			t.Fatalf("Observe() = %+v, %v; want a drifted user", o, err)
+		}
+		if _, err := e.Update(context.Background(), mr); !reason.Is(err, reason.Internal) || len(e.db.Execs) > 0 {
+			t.Fatalf("Update() = %v, %v; want Internal and no statement", err, e.db.Execs)
 		}
 	})
 	t.Run("PasswordWithoutSecret", func(t *testing.T) {

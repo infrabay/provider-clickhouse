@@ -121,6 +121,9 @@ func TestGrant(t *testing.T) {
 		t.Run("Grantees", func(t *testing.T) { testGrantGrantees(t, g) })
 		t.Run("Names", func(t *testing.T) { testGrantNames(t, g) })
 		t.Run("ExpansionModel", func(t *testing.T) { testGrantExpansionModel(t, g) })
+		t.Run("HiddenGrantOption", func(t *testing.T) { testGrantHiddenOption(t, g) })
+		t.Run("HiddenGrantOptionModel", func(t *testing.T) { testGrantHiddenOptionModel(t, g) })
+		t.Run("PlanOrder", func(t *testing.T) { testGrantPlanOrder(t, g) })
 		bystander.unchanged(t)
 	})
 }
@@ -149,7 +152,7 @@ func newGrantFixture(t *testing.T, f *accessFixture) *grantFixture {
 		if !ok {
 			return nil
 		}
-		if err := providerconfig.CheckReferenceNamespaces(grant.References(g)); err != nil {
+		if err := providerconfig.CheckReferenceNamespaces(grant.References(g), g.GetNamespace()); err != nil {
 			return err
 		}
 		if err := g.ResolveReferences(ctx, f.kube); err != nil {
@@ -910,5 +913,235 @@ func testGrantExpansionModel(t *testing.T, g *grantFixture) {
 	// (it lacks NAMED COLLECTION ADMIN).
 	if _, err := cat.Expand([]string{"ALL"}, sqlx.TargetGlobal); err == nil {
 		t.Error("ALL on *.* must be rejected")
+	}
+}
+
+// delegates reports whether a user holding only the role can grant priv ON
+// on to another user, that is whether the role holds priv WITH GRANT OPTION
+// there. The grant it makes is revoked again.
+func (g *grantFixture) delegates(t *testing.T, role, priv, on string) bool {
+	t.Helper()
+	member, other := role+"_member", role+"_other"
+	if _, _, ok := g.srv.entity(t, access.User, member); !ok {
+		g.srv.exec(t, "CREATE USER "+member+" IDENTIFIED WITH sha256_hash BY "+ch.QuoteString(testHash)+" SALT "+ch.QuoteString(testSalt)+" DEFAULT ROLE ALL")
+		g.srv.exec(t, "GRANT "+role+" TO "+member)
+		g.srv.exec(t, "CREATE USER "+other+" IDENTIFIED WITH sha256_hash BY "+ch.QuoteString(testHash)+" SALT "+ch.QuoteString(testSalt))
+	}
+	conn, err := ch.OpenDriver(ch.Config{Host: g.srv.host, Port: g.srv.nativePort, Protocol: ch.ProtocolNative, Username: member, Password: testPassword, MaxOpenConns: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close() //nolint:errcheck // Test cleanup.
+	err = conn.Exec(context.Background(), "GRANT "+priv+" ON "+on+" TO "+other)
+	if err == nil {
+		g.srv.exec(t, "REVOKE "+priv+" ON "+on+" FROM "+other)
+		return true
+	}
+	if !ch.IsCode(err, ch.CodeAccessDenied) {
+		t.Fatalf("delegation as %s: %v", member, err)
+	}
+	return false
+}
+
+// testGrantHiddenOption: the server lists a grant option on app_db12.events
+// nowhere while the role also holds SELECT ON app_db12.* and a grant on
+// app_db12.events_raw [verified on every supported version]. The Grant with
+// withGrantOption grants it once and records it, instead of granting again
+// on every reconcile; turning the option off and deleting the Grant revoke
+// it, although no row shows it (D-35). Delegation as a member of the role
+// proves what the rows do not show.
+func testGrantHiddenOption(t *testing.T, g *grantFixture) {
+	g.ownedRole(t, "reader12", "app_g12")
+	db := roleGrantee("app_db12", "SELECT")
+	db.Role = new("app_g12")
+	g.newGrant("g12-db", db)
+	g.mustReconcile(t, "g12-db")
+	raw := roleGrantee("app_db12", "INSERT")
+	raw.Table, raw.Role = new("events_raw"), new("app_g12")
+	g.newGrant("g12-raw", raw)
+	g.mustReconcile(t, "g12-raw")
+
+	p := roleGrantee("app_db12", "SELECT")
+	p.Table, p.Role, p.WithGrantOption = new("events"), new("app_g12"), new(true)
+	g.newGrant("g12", p)
+	if o := g.mustReconcile(t, "g12"); !o.updated {
+		t.Fatalf("grant the option: %s", o)
+	}
+	g.expectRoleGrants(t, "app_g12", "SELECT app_db12.*", "INSERT app_db12.events_raw")
+	if !g.delegates(t, "app_g12", "SELECT", "app_db12.events") {
+		t.Fatal("the role must hold the grant option that the server does not list")
+	}
+	if ann := g.h.get("g12").GetAnnotations()[v1alpha1.AnnotationGrantOption]; !strings.Contains(ann, `"privileges":["SELECT"]`) {
+		t.Fatalf("record = %q", ann)
+	}
+	g.upToDate(t, "g12")
+	g.upToDate(t, "g12")
+
+	// Turned off: revoked although no row shows it.
+	g.h.mutate("g12", func(mr *v1alpha1.Grant) { mr.Spec.ForProvider.WithGrantOption = new(false) })
+	if o := g.mustReconcile(t, "g12"); !o.updated {
+		t.Fatalf("turn the option off: %s", o)
+	}
+	if g.delegates(t, "app_g12", "SELECT", "app_db12.events") {
+		t.Error("the grant option must be revoked")
+	}
+	g.upToDate(t, "g12")
+	g.expectRoleGrants(t, "app_g12", "SELECT app_db12.*", "INSERT app_db12.events_raw")
+
+	// Deleted: revoked, then released.
+	g.h.mutate("g12", func(mr *v1alpha1.Grant) { mr.Spec.ForProvider.WithGrantOption = new(true) })
+	if o := g.mustReconcile(t, "g12"); !o.updated {
+		t.Fatalf("turn the option on again: %s", o)
+	}
+	if !g.delegates(t, "app_g12", "SELECT", "app_db12.events") {
+		t.Fatal("the role must hold the grant option again")
+	}
+	if !g.deleteGrant(t, "g12") {
+		t.Error("Delete must revoke the grant option of record")
+	}
+	if g.delegates(t, "app_g12", "SELECT", "app_db12.events") {
+		t.Error("the grant option must be revoked when the Grant is deleted")
+	}
+	g.expectRoleGrants(t, "app_g12", "SELECT app_db12.*", "INSERT app_db12.events_raw")
+	g.deleteGrant(t, "g12-raw")
+	g.deleteGrant(t, "g12-db")
+	g.expectRoleGrants(t, "app_g12")
+}
+
+// testGrantHiddenOptionModel checks the analysis against the server: for
+// grant options the server does not list, it must report that the server
+// may hide them (sqlx.Analysis.Hidden). The statements are run by the
+// administrator; the shapes are those of design 5.6.
+func testGrantHiddenOptionModel(t *testing.T, g *grantFixture) {
+	ctx := context.Background()
+	cl := g.client(t)
+	privs, err := cl.Capabilities().Privileges(ctx, cl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, err := sqlx.NewCatalogue(privs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := sqlx.GrantColumns{}
+	if cols.AccessObject, err = cl.Capabilities().GrantsAccessObject(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	if cols.IsWildcard, err = cl.Capabilities().GrantsIsWildcard(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	events := sqlx.GrantTarget{Database: "app_m", Table: "events"}
+	teamA := sqlx.GrantTarget{Database: "app_ma"}
+	for i, tc := range []struct {
+		stmts  []string
+		target sqlx.GrantTarget
+		hidden bool // the server lists no grant option row at the target
+	}{
+		{[]string{"GRANT SELECT ON app_m.* TO %s", "GRANT SELECT ON app_m.events TO %s WITH GRANT OPTION", "GRANT INSERT ON app_m.events_raw TO %s"}, events, true},
+		{[]string{"GRANT SELECT ON app_m.* TO %s", "GRANT SELECT ON app_m.events TO %s WITH GRANT OPTION", "GRANT INSERT ON app_m.evil TO %s"}, events, true},
+		{[]string{"GRANT SELECT ON app_m.* TO %s", "GRANT SELECT ON app_m.events TO %s WITH GRANT OPTION", "GRANT INSERT ON app_m.evil TO %s", "GRANT INSERT ON app_m.evx TO %s"}, events, false},
+		{[]string{"GRANT SELECT ON app_m.* TO %s", "GRANT SELECT ON app_m.events TO %s WITH GRANT OPTION", "GRANT INSERT ON app_m.x TO %s"}, events, false},
+		{[]string{"GRANT SELECT ON *.* TO %s", "GRANT SELECT ON app_ma.* TO %s WITH GRANT OPTION", "GRANT INSERT ON app_mb.* TO %s"}, teamA, true},
+		{[]string{"GRANT SELECT ON *.* TO %s", "GRANT SELECT ON app_ma.* TO %s WITH GRANT OPTION"}, teamA, false},
+	} {
+		role := "app_hm" + strings.Repeat("x", i)
+		g.adminRole(t, role)
+		for _, stmt := range tc.stmts {
+			g.srv.exec(t, strings.ReplaceAll(stmt, "%s", role))
+		}
+		rows := g.rows(t, role, cols)
+		desired, err := cat.Expand([]string{"SELECT"}, tc.target.Level())
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := sqlx.Analyze(cat, tc.target, desired, rows)
+		listed := false
+		for _, r := range rows {
+			if r.GrantOption && !r.PartialRevoke && r.Database == tc.target.Database && r.Table == tc.target.Table {
+				listed = true
+			}
+		}
+		if listed == tc.hidden {
+			t.Errorf("%v on %s: the server lists the option: %t (SHOW GRANTS %v)", tc.stmts, g.image, listed, g.showGrants(t, role))
+		}
+		if !listed && !a.Hidden() {
+			t.Errorf("%v on %s: the server does not list the option, but the analysis says it would (rows %+v)", tc.stmts, g.image, rows)
+		}
+	}
+}
+
+// rows reads a role's rows of system.grants as the provider does.
+func (g *grantFixture) rows(t *testing.T, role string, cols sqlx.GrantColumns) []sqlx.GrantRow {
+	t.Helper()
+	var out []sqlx.GrantRow
+	cl := g.client(t)
+	err := cl.Query(context.Background(), sqlx.QueryGrants(true, cols), ch.Params{"grantee": role}, func(r ch.Row) error {
+		row, err := sqlx.ScanGrantRow(r, cols)
+		if err != nil {
+			return err
+		}
+		out = append(out, row)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// testGrantPlanOrder runs the provider's plans as the administrator (the
+// minimal identity cannot grant global privileges): a REVOKE of a
+// privilege also removes the flags of its children, so the plan revokes
+// first and then grants every desired flag the REVOKE removed, and the
+// target converges in one step. CREATE ARBITRARY TEMPORARY TABLE carries a
+// flag of its own besides that of its only child CREATE TEMPORARY TABLE.
+func testGrantPlanOrder(t *testing.T, g *grantFixture) {
+	ctx := context.Background()
+	cl := g.client(t)
+	privs, err := cl.Capabilities().Privileges(ctx, cl)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, err := sqlx.NewCatalogue(privs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cols := sqlx.GrantColumns{}
+	if cols.AccessObject, err = cl.Capabilities().GrantsAccessObject(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	if cols.IsWildcard, err = cl.Capabilities().GrantsIsWildcard(ctx, cl); err != nil {
+		t.Fatal(err)
+	}
+	global := sqlx.GrantTarget{Database: "*"}
+	for i, tc := range []struct {
+		foreign string
+		desired string
+		wgo     bool
+	}{
+		{"GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.* TO %s", "CREATE TEMPORARY TABLE", false},
+		{"GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.* TO %s WITH GRANT OPTION", "CREATE TEMPORARY TABLE", true},
+		{"GRANT CREATE ARBITRARY TEMPORARY TABLE ON *.* TO %s WITH GRANT OPTION", "CREATE TEMPORARY TABLE", false},
+		{"GRANT CREATE ON *.* TO %s", "CREATE TEMPORARY TABLE", false},
+	} {
+		role := "app_po" + strings.Repeat("x", i)
+		g.adminRole(t, role)
+		g.srv.exec(t, strings.ReplaceAll(tc.foreign, "%s", role))
+		desired, err := cat.Expand([]string{tc.desired}, sqlx.TargetGlobal)
+		if err != nil {
+			t.Fatal(err)
+		}
+		a := sqlx.Analyze(cat, global, desired, g.rows(t, role, cols))
+		stmts, err := a.Apply(tc.wgo, nil).Statements(global, role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, stmt := range stmts {
+			g.srv.exec(t, stmt)
+		}
+		after := sqlx.Analyze(cat, global, desired, g.rows(t, role, cols))
+		if next, _ := after.Apply(tc.wgo, nil).Statements(global, role); len(next) > 0 || !after.Effective() {
+			t.Errorf("%s, then %v: missing %v, next plan %v (SHOW GRANTS %v)", tc.foreign, stmts, after.Missing(), next, g.showGrants(t, role))
+		}
 	}
 }

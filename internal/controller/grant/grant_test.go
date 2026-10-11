@@ -699,7 +699,7 @@ func TestApply(t *testing.T) {
 		},
 		"GrantsAndRevokesForeign": {
 			mr: newGrant(privs("SELECT", "SHOW TABLES")), server: up(gr("SELECT", dbName+".*", ""), gr("INSERT", dbName+".*", "")), objs: []client.Object{ownedRole()},
-			wantStmts: []string{"GRANT SHOW TABLES ON `team-a_db`.* TO `team-a_reader`", "REVOKE INSERT ON `team-a_db`.* FROM `team-a_reader`"},
+			wantStmts: []string{"REVOKE INSERT ON `team-a_db`.* FROM `team-a_reader`", "GRANT SHOW TABLES ON `team-a_db`.* TO `team-a_reader`"},
 		},
 		"Columns": {
 			mr: newGrant(privs("SELECT", "INSERT"), table("t", "b", "a")), server: up(gr("SELECT", dbName+".t(a)", "")), objs: []client.Object{ownedRole()},
@@ -994,6 +994,105 @@ func TestDelete(t *testing.T) {
 }
 
 // --- wiring ---
+
+// TestGrantOptionRecord drives a Grant WITH GRANT OPTION on a server that
+// does not list the option: the role holds SELECT ON team-a_db.* and INSERT
+// ON team-a_db.events_raw, so a grant option on team-a_db.events is listed
+// nowhere [verified on every supported version]. The Grant records what it
+// granted in an annotation bound to the grantee's UUID: it converges instead
+// of granting again on every reconcile, and it revokes the option when it is
+// turned off or the Grant is deleted (D-35).
+func TestGrantOptionRecord(t *testing.T) {
+	ctx := context.Background()
+	s := newServer(t, fake.Upstream253).role(roleName, roleID).
+		grants(true, roleName, gr("SELECT", dbName+".*", ""), gr("INSERT", dbName+".events_raw", ""))
+	policy := v1alpha1.ClusterPolicy{AllowedNamespaces: []string{"team-.*"}, RoleNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, DatabaseNamePatterns: []string{"{namespace}_[a-z0-9_]+"}, AllowGrantOption: true}
+	mr := newGrant(table("events"), withGrantOption())
+	mr.SetFinalizers([]string{"finalizer.managedresource.crossplane.io"})
+	e := newTestExternal(t, s, resolved(t, policy), mr.DeepCopy(), ownedRole())
+	stored := func() *v1alpha1.Grant {
+		t.Helper()
+		g := &v1alpha1.Grant{}
+		if err := e.Kube.Get(ctx, client.ObjectKeyFromObject(mr), g); err != nil {
+			t.Fatal(err)
+		}
+		return g
+	}
+	reconcile := func(g *v1alpha1.Grant) (managed.ExternalObservation, []string) {
+		t.Helper()
+		s.db.Execs = nil
+		o, err := e.Observe(ctx, g)
+		if err != nil {
+			t.Fatalf("Observe() = %v", err)
+		}
+		switch {
+		case meta.WasDeleted(g) && o.ResourceExists:
+			_, err = e.Delete(ctx, g)
+		case o.ResourceExists && !o.ResourceUpToDate:
+			_, err = e.Update(ctx, g)
+		}
+		if err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return o, s.db.Execs
+	}
+	grantGO := "GRANT SELECT ON `team-a_db`.`events` TO `team-a_reader` WITH GRANT OPTION"
+	revokeGO := "REVOKE GRANT OPTION FOR SELECT ON `team-a_db`.`events` FROM `team-a_reader`"
+
+	if _, stmts := reconcile(stored()); !slices.Equal(stmts, []string{grantGO}) {
+		t.Fatalf("first reconcile: %v", stmts)
+	}
+	want := `{"granteeID":"` + roleID + `","privileges":["SELECT"]}`
+	if got := stored().GetAnnotations()[v1alpha1.AnnotationGrantOption]; got != want {
+		t.Fatalf("record = %q, want %q", got, want)
+	}
+	// The server still lists no option: the record stands in for it.
+	if o, stmts := reconcile(stored()); !o.ResourceUpToDate || len(stmts) > 0 {
+		t.Fatalf("second reconcile: %+v, %v", o, stmts)
+	}
+	// A record of another grantee (the role was dropped and created again)
+	// does not count.
+	other := stored()
+	meta.AddAnnotations(other, map[string]string{v1alpha1.AnnotationGrantOption: `{"granteeID":"` + otherID + `","privileges":["SELECT"]}`})
+	if o, err := e.Observe(ctx, other); err != nil || o.ResourceUpToDate {
+		t.Fatalf("record of another grantee: %+v, %v", o, err)
+	}
+
+	// Turned off: the option is revoked although no row shows it.
+	off := stored()
+	off.Spec.ForProvider.WithGrantOption = new(false)
+	if err := e.Kube.Update(ctx, off); err != nil {
+		t.Fatal(err)
+	}
+	if _, stmts := reconcile(stored()); !slices.Equal(stmts, []string{revokeGO}) {
+		t.Fatalf("turned off: %v", stmts)
+	}
+	if _, held := stored().GetAnnotations()[v1alpha1.AnnotationGrantOption]; held {
+		t.Error("the record must be gone once the option is revoked")
+	}
+	if o, stmts := reconcile(stored()); !o.ResourceUpToDate || len(stmts) > 0 {
+		t.Fatalf("after turning off: %+v, %v", o, stmts)
+	}
+
+	// Deleted: the option is revoked, and then the MR is released.
+	on := stored()
+	on.Spec.ForProvider.WithGrantOption = new(true)
+	if err := e.Kube.Update(ctx, on); err != nil {
+		t.Fatal(err)
+	}
+	if _, stmts := reconcile(stored()); !slices.Equal(stmts, []string{grantGO}) {
+		t.Fatalf("turned on again: %v", stmts)
+	}
+	if err := e.Kube.Delete(ctx, stored()); err != nil {
+		t.Fatal(err)
+	}
+	if o, stmts := reconcile(stored()); !o.ResourceExists || !slices.Equal(stmts, []string{revokeGO}) {
+		t.Fatalf("delete: %+v, %v", o, stmts)
+	}
+	if o, stmts := reconcile(stored()); o.ResourceExists || len(stmts) > 0 {
+		t.Fatalf("after delete: %+v, %v", o, stmts)
+	}
+}
 
 func TestReferences(t *testing.T) {
 	g := newGrant(func(g *v1alpha1.Grant) {

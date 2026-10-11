@@ -57,17 +57,20 @@ spec:
     roleRef:
       name: writer
 ---
-# With the admin option the grantee may grant and revoke the role itself,
-# outside the provider. On a ClusterProviderConfig it needs
-# policy.allowAdminOption; this one uses the namespaced ProviderConfig of
-# providerconfig-password.yaml, which has no policy. Delete is left out of the
-# management policies, so deleting the MR never revokes the membership: use
-# this to import an existing membership (with Delete, the membership is
-# revoked even if it existed before the MR).
+# The role of the Role MR team-a/etl-writer (role.yaml) for the user of the
+# User MR team-a/etl (user.yaml, ClickHouse name team-a_etl), both on the
+# namespaced ProviderConfig of providerconfig-password.yaml, which has no
+# policy. With the admin option the grantee may grant and revoke the role
+# itself, outside the provider; on a ClusterProviderConfig it needs
+# policy.allowAdminOption. Delete is left out of the management policies, so
+# deleting the MR never revokes the membership: use this to import an
+# existing membership (with Delete, the membership is revoked even if it
+# existed before the MR). The grantee must be owned by a User MR, so adopt an
+# existing user with one first.
 apiVersion: clickhouse.m.infrabay.io/v1alpha1
 kind: RoleGrant
 metadata:
-  name: etl-loader
+  name: etl-etl-writer
   namespace: team-a
 spec:
   providerConfigRef:
@@ -75,6 +78,8 @@ spec:
     name: tenant
   managementPolicies: ["Observe", "Create", "Update"]
   forProvider:
-    memberOf: loader
-    user: etl
+    memberOfRef:
+      name: etl-writer
+    userRef:
+      name: etl
     adminOption: true

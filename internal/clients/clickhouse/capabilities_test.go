@@ -86,8 +86,8 @@ func TestClusterHosts(t *testing.T) {
 func TestAccessStorage(t *testing.T) {
 	ctx := context.Background()
 	db := fake.NewDB().On(ch.QueryUserDirectories, fake.Rows(
-		[]any{"users_xml", "users_xml", uint64(0)},
-		[]any{"replicated", "replicated", uint64(1)},
+		[]any{"users_xml", "users_xml", `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+		[]any{"replicated", "replicated", `{"zookeeper_path":"\/clickhouse\/access"}`, uint64(2)},
 	))
 	got, err := ch.NewCapabilities().AccessStorage(ctx, db)
 	if err != nil || got != ch.StorageReplicated {
@@ -95,6 +95,65 @@ func TestAccessStorage(t *testing.T) {
 	}
 	if _, err := ch.FirstWritableDirectory([]ch.UserDirectory{{Type: "users_xml"}}); !reason.Is(err, reason.InvalidConfig) {
 		t.Fatalf("no writable directory: %v", err)
+	}
+	// A read-only local directory never receives new entities.
+	got, err = ch.FirstWritableDirectory([]ch.UserDirectory{
+		{Name: "ro", Type: ch.StorageLocalDirectory, Params: `{"path":"\/ro\/","readonly":true}`},
+		{Name: "rw", Type: ch.StorageMemory, Params: `{}`},
+	})
+	if err != nil || got != ch.StorageMemory {
+		t.Fatalf("FirstWritableDirectory() = %q, %v", got, err)
+	}
+}
+
+// TestStorageReadOnly: an entity's storage is the name of its directory,
+// which a configuration may change, for example <users_xml><name>cfg_users
+// </name> [verified on 25.3.3]; read-only-ness follows the directory's type
+// and its readonly setting.
+func TestStorageReadOnly(t *testing.T) {
+	ctx := context.Background()
+	reads := 0
+	dirs := [][]any{
+		{"cfg_users", "users_xml", `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+		{"sql_users", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access\/"}`, uint64(2)},
+		{"ro_users", "local_directory", `{"path":"\/var\/lib\/clickhouse\/access_ro\/","readonly":true}`, uint64(3)},
+		{"users_xml", "replicated", `{"zookeeper_path":"\/clickhouse\/access"}`, uint64(4)},
+		{"ldap", "ldap", `{"server":"ldap"}`, uint64(5)},
+		{"odd", "memory", `not json`, uint64(6)},
+	}
+	db := fake.NewDB().OnFunc(ch.QueryUserDirectories, func(ch.Params) fake.Result {
+		reads++
+		return fake.Rows(dirs...)
+	})
+	c := ch.NewCapabilities()
+	for storage, want := range map[string]bool{
+		"cfg_users": true,  // users.xml under another name
+		"sql_users": false, // the SQL directory under another name
+		"ro_users":  true,  // <readonly>true</readonly>
+		"users_xml": false, // a directory called users_xml is not necessarily one
+		"ldap":      true,  // only local_directory, replicated and memory are writable
+		"odd":       false, // params that do not parse are not a readonly setting
+	} {
+		got, err := c.StorageReadOnly(ctx, db, storage)
+		if err != nil || got != want {
+			t.Errorf("StorageReadOnly(%q) = %t, %v; want %t", storage, got, err, want)
+		}
+	}
+	if reads != 1 {
+		t.Errorf("system.user_directories was read %d times; the directories are cached", reads)
+	}
+	// A name that is not among the cached directories is looked up once
+	// more, and an unknown name is read-only.
+	if got, err := c.StorageReadOnly(ctx, db, "gone"); err != nil || !got || reads != 2 {
+		t.Errorf("StorageReadOnly(unknown) = %t, %v after %d reads; want read-only after one more read", got, err, reads)
+	}
+	dirs = append(dirs, []any{"new_dir", "local_directory", `{}`, uint64(7)})
+	if got, err := c.StorageReadOnly(ctx, db, "new_dir"); err != nil || got {
+		t.Errorf("StorageReadOnly(new directory) = %t, %v; want writable after a refresh", got, err)
+	}
+	denied := fake.NewDB().On(ch.QueryUserDirectories, fake.Error(fake.Exception(ch.CodeAccessDenied, "necessary to have the grant SELECT ON system.user_directories")))
+	if _, err := ch.NewCapabilities().StorageReadOnly(ctx, denied, "sql_users"); !reason.Is(err, reason.PermissionDenied) {
+		t.Errorf("StorageReadOnly() without the grant = %v, want PermissionDenied", err)
 	}
 }
 

@@ -82,7 +82,10 @@ spec:
                     pattern: ^[^\x00-\x1F\x7F]+$
                     type: string
                   memberOfRef:
-                    description: MemberOfRef references a Role MR in the same namespace.
+                    description: |-
+                      MemberOfRef references a Role MR in the same namespace. A namespace, if
+                      set, must be this resource's own: a resolved selector writes it, and any
+                      other namespace is refused before anything is read.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -169,7 +172,10 @@ spec:
                     pattern: ^[^\x00-\x1F\x7F]+$
                     type: string
                   roleRef:
-                    description: RoleRef references a Role MR in the same namespace.
+                    description: |-
+                      RoleRef references a Role MR in the same namespace. A namespace, if
+                      set, must be this resource's own: a resolved selector writes it, and any
+                      other namespace is refused before anything is read.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -255,7 +261,10 @@ spec:
                     pattern: ^[^\x00-\x1F\x7F]+$
                     type: string
                   userRef:
-                    description: UserRef references a User MR in the same namespace.
+                    description: |-
+                      UserRef references a User MR in the same namespace. A namespace, if
+                      set, must be this resource's own: a resolved selector writes it, and any
+                      other namespace is refused before anything is read.
                     properties:
                       name:
                         description: Name of the referenced object.
@@ -349,21 +358,12 @@ spec:
                   rule: '!has(oldSelf.user) || (has(self.user) && self.user == oldSelf.user)'
                 - message: role is immutable
                   rule: '!has(oldSelf.role) || (has(self.role) && self.role == oldSelf.role)'
-                - message: cross-namespace references are not allowed
-                  rule: '!has(self.memberOfRef) || !has(self.memberOfRef.__namespace__)
-                    || self.memberOfRef.__namespace__.size() == 0'
                 - message: cross-namespace selectors are not allowed
                   rule: '!has(self.memberOfSelector) || !has(self.memberOfSelector.__namespace__)
                     || self.memberOfSelector.__namespace__.size() == 0'
-                - message: cross-namespace references are not allowed
-                  rule: '!has(self.userRef) || !has(self.userRef.__namespace__) ||
-                    self.userRef.__namespace__.size() == 0'
                 - message: cross-namespace selectors are not allowed
                   rule: '!has(self.userSelector) || !has(self.userSelector.__namespace__)
                     || self.userSelector.__namespace__.size() == 0'
-                - message: cross-namespace references are not allowed
-                  rule: '!has(self.roleRef) || !has(self.roleRef.__namespace__) ||
-                    self.roleRef.__namespace__.size() == 0'
                 - message: cross-namespace selectors are not allowed
                   rule: '!has(self.roleSelector) || !has(self.roleSelector.__namespace__)
                     || self.roleSelector.__namespace__.size() == 0'

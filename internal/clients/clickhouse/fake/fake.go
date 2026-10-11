@@ -215,16 +215,25 @@ func (d *DB) WithProfile(p Profile) *DB {
 		}
 		return Error(Exception(ch.CodeUnknownIdentifier, "Unknown expression identifier"))
 	}
-	storage := p.Storage
+	// The user directories: users_xml, the profile's first writable
+	// directory, and the other SQL directory type with a lower precedence,
+	// so that entities scripted in either are writable.
+	storage, other := p.Storage, ch.StorageReplicated
 	if storage == "" {
 		storage = ch.StorageLocalDirectory
+	}
+	if storage == ch.StorageReplicated {
+		other = ch.StorageLocalDirectory
 	}
 	comment := uint64(0)
 	if p.DBComment {
 		comment = 1
 	}
 	return d.On(ch.QueryJWTProbe, jwt).
-		On(ch.QueryUserDirectories, Rows([]any{"users_xml", ch.StorageUsersXML, uint64(0)}, []any{storage, storage, uint64(1)})).
+		On(ch.QueryUserDirectories, Rows(
+			[]any{ch.StorageUsersXML, ch.StorageUsersXML, `{"path":"\/etc\/clickhouse-server\/users.xml"}`, uint64(1)},
+			[]any{storage, storage, `{}`, uint64(2)},
+			[]any{other, other, `{}`, uint64(3)})).
 		On(ch.QuerySystemColumnProbe(ch.TableUsers, ch.ColumnValidUntil), column(p.ValidUntil)).
 		On(ch.QuerySystemColumnProbe(ch.TableGrants, ch.ColumnAccessObject), column(p.AccessObject)).
 		On(ch.QuerySystemColumnProbe(ch.TableGrants, ch.ColumnIsWildcard), column(p.IsWildcard)).

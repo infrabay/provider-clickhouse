@@ -437,6 +437,126 @@ func testRoleUsersXML(t *testing.T, f *accessFixture) {
 	sameRoleSnapshot(t, f.srv, before, "Role MRs for a users.d role")
 }
 
+// renamedUserDirectories renames both user directories: system.users.storage
+// and system.roles.storage hold a directory's name, so users.d entities then
+// report the storage cfg_users and SQL entities sql_users [verified on
+// 25.3.3].
+const renamedUserDirectories = `<clickhouse>
+  <user_directories replace="replace">
+    <users_xml><name>cfg_users</name><path>users.xml</path></users_xml>
+    <local_directory><name>sql_users</name><path>/var/lib/clickhouse/access/</path></local_directory>
+  </user_directories>
+</clickhouse>
+`
+
+// TestRenamedUserDirectories checks, on every image, that entities of
+// users.xml/users.d are never written when the configuration renames the
+// users_xml directory: a Role MR cannot adopt a users.d role and is released
+// on deletion without a DROP, a User MR claiming a users.d user changes
+// nothing, and a Grant to that user grants nothing. Roles the provider
+// creates are stored in the renamed SQL directory and managed as usual.
+func TestRenamedUserDirectories(t *testing.T) {
+	policy := accessPolicy()
+	policy.AllowAdoption = true
+	ran := false
+	for _, fam := range []struct{ name, env, def string }{
+		{familyUpstream, envUpstreamImages, defaultUpstreamImages},
+		{familyAntalya, envAntalyaImages, defaultAntalyaImages},
+	} {
+		for _, image := range imageList(fam.env, fam.def) {
+			ran = true
+			t.Run(image, func(t *testing.T) {
+				testRenamedUserDirectories(t, newAccessFixture(t, fam.name, image, policy, map[string]string{
+					"/etc/clickhouse-server/users.d/role-fixtures.yaml":    roleUsersD(),
+					"/etc/clickhouse-server/config.d/user-directories.xml": renamedUserDirectories,
+				}))
+			})
+		}
+	}
+	if !ran {
+		t.Skip("no images selected")
+	}
+}
+
+func testRenamedUserDirectories(t *testing.T, f *accessFixture) {
+	roleID, storage, ok := f.srv.entity(t, access.Role, roleFixtureYAMLRole)
+	if !ok || storage != "cfg_users" {
+		t.Fatalf("users.d role: %q %q %t", roleID, storage, ok)
+	}
+	userID, storage, ok := f.srv.entity(t, access.User, roleFixtureYAMLUser)
+	if !ok || storage != "cfg_users" {
+		t.Fatalf("users.d user: %q %q %t", userID, storage, ok)
+	}
+	before := f.srv.roleSnapshot(t)
+	userBefore := f.showCreateUser(t, roleFixtureYAMLUser)
+	grantsBefore := f.srv.rawStrings(t, "SHOW GRANTS FOR "+ch.QuoteIdent(roleFixtureYAMLUser))
+
+	// Adoption cannot make a users.d role writable, whatever its directory
+	// is called; deleting the MR, even with a claim on the role, releases it
+	// without a DROP.
+	h := roleHarness(t, f)
+	r := newRoleMR(f, "cfg", roleFixtureYAMLRole)
+	meta.AddAnnotations(r, map[string]string{v1alpha1.AnnotationAdopt: roleID})
+	h.create(r)
+	if o := h.reconcile("cfg"); !reason.Is(o.err, reason.ReadOnlyStorage) || o.created {
+		t.Fatalf("adopting a users.d role: %s", o)
+	}
+	if c := ownership.ClaimOf(h.get("cfg")); c.OwnedID != "" {
+		t.Fatalf("a users.d role was claimed: %+v", c)
+	}
+	h.mutate("cfg", func(r *v1alpha1.Role) {
+		meta.RemoveAnnotations(r, v1alpha1.AnnotationAdopt)
+		meta.AddAnnotations(r, map[string]string{v1alpha1.AnnotationOwnerUID: string(r.GetUID()), v1alpha1.AnnotationOwnedID: roleID})
+	})
+	h.delete("cfg")
+	if o := h.reconcile("cfg"); o.err != nil || !o.gone || o.deleted {
+		t.Fatalf("delete: %s", o)
+	}
+
+	// A User MR claiming the users.d user changes nothing.
+	uh := newUserHarness(t, f)
+	uh.createUser("cfg-user", roleFixtureYAMLUser, func(u *v1alpha1.User) {
+		u.Spec.ForProvider.HostIP = []string{"10.0.0.0/8"}
+	})
+	uh.mutate("cfg-user", func(u *v1alpha1.User) {
+		meta.AddAnnotations(u, map[string]string{v1alpha1.AnnotationOwnerUID: string(u.GetUID()), v1alpha1.AnnotationOwnedID: userID})
+	})
+	uh.mustReconcile("cfg-user", "users.d user", failedWith(reason.ReadOnlyStorage))
+
+	// Nor does a Grant to it.
+	g := newGrantFixture(t, f)
+	p := roleGrantee("app_cfg", "SELECT")
+	p.User = new(roleFixtureYAMLUser)
+	g.newGrant("cfg-grant", p)
+	if o := g.h.reconcile("cfg-grant"); !reason.Is(o.err, reason.ReadOnlyStorage) || o.created || o.updated {
+		t.Fatalf("grant to a users.d user: %s", o)
+	}
+
+	// The SQL directory under another name is managed as usual.
+	h.create(newRoleMR(f, "sql", "app_sql_role"))
+	if o := h.reconcile("sql"); o.err != nil || !o.created {
+		t.Fatalf("create: %s", o)
+	}
+	if _, storage, ok := f.srv.entity(t, access.Role, "app_sql_role"); !ok || storage != "sql_users" {
+		t.Fatalf("created role: %q %t", storage, ok)
+	}
+	if o := h.reconcile("sql"); o.err != nil || !o.obs.ResourceExists || !o.obs.ResourceUpToDate || o.created {
+		t.Fatalf("steady state: %s", o)
+	}
+	h.delete("sql")
+	if o := h.reconcile("sql"); o.err != nil || !o.deleted {
+		t.Fatalf("delete: %s", o)
+	}
+
+	sameRoleSnapshot(t, f.srv, before, "MRs for users.d entities in a renamed directory")
+	if got := f.showCreateUser(t, roleFixtureYAMLUser); got != userBefore {
+		t.Errorf("the users.d user changed: %s, was %s", got, userBefore)
+	}
+	if diff := cmp.Diff(grantsBefore, f.srv.rawStrings(t, "SHOW GRANTS FOR "+ch.QuoteIdent(roleFixtureYAMLUser))); diff != "" {
+		t.Errorf("grants of the users.d user changed (-before +after):\n%s", diff)
+	}
+}
+
 func testRoleAdversarialName(t *testing.T, f *accessFixture) {
 	h := roleHarness(t, f)
 	name := "app_r`'\\.ü@*\tx"

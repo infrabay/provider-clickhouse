@@ -364,29 +364,35 @@ func testEndToEndAccess(t *testing.T, family, image string) {
 	}
 
 	db := &v1alpha1.Database{ObjectMeta: e.meta("shop")}
+	db.Labels = map[string]string{"e2e": "shop"}
 	db.Spec.ProviderConfigReference = e.pc
 	db.Spec.ForProvider.Name = new(e2eDatabase)
 
 	reader := &v1alpha1.Role{ObjectMeta: e.meta("reader")}
+	reader.Labels = map[string]string{"e2e": "reader"}
 	reader.Spec.ProviderConfigReference = e.pc
 	reader.Spec.ForProvider.Name = new(e2eRole)
 
 	app := e.userMR("app", e.user)
+	app.Labels = map[string]string{"e2e": "app"}
 	app.Spec.ForProvider.DefaultDatabase = new(e2eDatabase)
 
+	// The Grant selects its database and role, the RoleGrant references its
+	// role and selects its user. crossplane-runtime writes the reference a
+	// selector resolves to with the MR's own namespace.
 	grant := &v1alpha1.Grant{ObjectMeta: e.meta("reader-shop")}
 	grant.Spec.ProviderConfigReference = e.pc
 	grant.Spec.ForProvider = v1alpha1.GrantParameters{
-		Privileges:  []string{"SELECT", "INSERT"},
-		DatabaseRef: &xpv2.NamespacedReference{Name: "shop"},
-		RoleRef:     &xpv2.NamespacedReference{Name: "reader"},
+		Privileges:       []string{"SELECT", "INSERT"},
+		DatabaseSelector: &xpv2.NamespacedSelector{MatchLabels: map[string]string{"e2e": "shop"}},
+		RoleSelector:     &xpv2.NamespacedSelector{MatchLabels: map[string]string{"e2e": "reader"}},
 	}
 
 	membership := &v1alpha1.RoleGrant{ObjectMeta: e.meta("app-reader")}
 	membership.Spec.ProviderConfigReference = e.pc
 	membership.Spec.ForProvider = v1alpha1.RoleGrantParameters{
-		MemberOfRef: &xpv2.NamespacedReference{Name: "reader"},
-		UserRef:     &xpv2.NamespacedReference{Name: "app"},
+		MemberOfRef:  &xpv2.NamespacedReference{Name: "reader"},
+		UserSelector: &xpv2.NamespacedSelector{MatchLabels: map[string]string{"e2e": "app"}},
 	}
 
 	// MRs that point at the foreign user: a User that would take it over,
@@ -415,6 +421,19 @@ func testEndToEndAccess(t *testing.T, family, image string) {
 		e.waitFor(mg, "NotOwned", func(ready, synced xpv2.Condition) bool {
 			return synced.Status == corev1.ConditionFalse && strings.Contains(synced.Message, string(reason.NotOwned)) && ready.Status != corev1.ConditionTrue
 		})
+	}
+	// The selectors resolved to references in the MRs' own namespace.
+	for _, c := range []struct {
+		field, name, value, want string
+		ref                      *xpv2.NamespacedReference
+	}{
+		{"databaseRef", "shop", deref(grant.Spec.ForProvider.Database), e2eDatabase, grant.Spec.ForProvider.DatabaseRef},
+		{"roleRef", "reader", deref(grant.Spec.ForProvider.Role), e2eRole, grant.Spec.ForProvider.RoleRef},
+		{"userRef", "app", deref(membership.Spec.ForProvider.User), e.user, membership.Spec.ForProvider.UserRef},
+	} {
+		if c.ref == nil || c.ref.Name != c.name || (c.ref.Namespace != "" && c.ref.Namespace != namespace) || c.value != c.want {
+			t.Errorf("%s resolved to %+v (%q), want %s in namespace %s (%q)", c.field, c.ref, c.value, c.name, namespace, c.want)
+		}
 	}
 
 	// The server holds exactly what the MRs describe, under the UUIDs the
@@ -714,4 +733,12 @@ func boolString(b bool) string {
 		return "true"
 	}
 	return "false"
+}
+
+// deref returns *s, or "" for nil.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }

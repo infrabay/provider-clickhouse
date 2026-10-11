@@ -384,6 +384,85 @@ func TestHostsCompare(t *testing.T) {
 	}
 }
 
+// TestHostsServerForms compares desired hosts with the host_ip and
+// host_names that the server stores for them, as recorded on 25.3.3, 26.8
+// and Antalya 26.6 (identical on all three): every loopback address or
+// prefix, and every host name equal to localhost in any case, is stored as
+// HOST LOCAL (host_names = ['localhost']), and IPv4-mapped prefixes whose
+// IPv4 part is zero are printed without it ('::ffff:/96').
+func TestHostsServerForms(t *testing.T) {
+	type stored struct{ ips, names []string }
+	local := stored{names: []string{"localhost"}}
+	cases := map[string]struct {
+		ips, names []string
+		server     stored
+	}{
+		"IPv4Loopback":             {ips: []string{"127.0.0.1"}, server: local},
+		"IPv4LoopbackOther":        {ips: []string{"127.0.0.2"}, server: local},
+		"IPv4LoopbackLast":         {ips: []string{"127.255.255.255"}, server: local},
+		"IPv4LoopbackNet":          {ips: []string{"127.0.0.0/8"}, server: local},
+		"IPv4LoopbackSubnet":       {ips: []string{"127.0.0.0/16"}, server: local},
+		"IPv4LoopbackOtherSubnet":  {ips: []string{"127.1.0.0/16"}, server: local},
+		"IPv4LoopbackMask":         {ips: []string{"127.0.0.1/255.255.255.254"}, server: local},
+		"IPv4LoopbackHost":         {ips: []string{"127.0.0.1/32"}, server: local},
+		"IPv4WiderThanLoopback":    {ips: []string{"127.0.0.0/7"}, server: stored{ips: []string{"126.0.0.0/7"}}},
+		"IPv6Loopback":             {ips: []string{"::1"}, server: local},
+		"IPv6LoopbackHost":         {ips: []string{"::1/128"}, server: local},
+		"IPv6LoopbackCompatible":   {ips: []string{"::0.0.0.1"}, server: local},
+		"IPv6WiderThanLoopback":    {ips: []string{"::1/127"}, server: stored{ips: []string{"::/127"}}},
+		"MappedLoopback":           {ips: []string{"::ffff:127.0.0.1"}, server: local},
+		"MappedLoopbackHex":        {ips: []string{"::ffff:7f00:1"}, server: local},
+		"MappedLoopbackNet":        {ips: []string{"::ffff:127.0.0.0/104"}, server: local},
+		"MappedLoopbackSubnet":     {ips: []string{"::ffff:127.0.0.0/120"}, server: local},
+		"LoopbackAndAddress":       {ips: []string{"127.0.0.1", "10.0.0.1"}, server: stored{ips: []string{"10.0.0.1"}, names: []string{"localhost"}}},
+		"LoopbackAndName":          {ips: []string{"::1"}, names: []string{"localhost"}, server: local},
+		"NameUpperCase":            {names: []string{"LOCALHOST"}, server: local},
+		"NameMixedCase":            {names: []string{"Localhost"}, server: local},
+		"NameTwice":                {names: []string{"localhost", "LOCALHOST"}, server: local},
+		"NameAndLoopbackAndOthers": {ips: []string{"127.0.0.1", "10.0.0.0/8"}, names: []string{"Localhost", "Host.Example.COM"}, server: stored{ips: []string{"10.0.0.0/8"}, names: []string{"Host.Example.COM", "localhost"}}},
+		"FullRangeAndLoopback":     {ips: []string{"0.0.0.0/0", "127.0.0.1"}, server: stored{ips: []string{"::/0"}}},
+		"MappedZero":               {ips: []string{"::ffff:0:0/96"}, server: stored{ips: []string{"::ffff:/96"}}},
+		"MappedZeroAddress":        {ips: []string{"::ffff:0.0.0.0"}, server: stored{ips: []string{"::ffff:"}}},
+		"MappedZeroNarrower":       {ips: []string{"::ffff:0.0.0.0/104"}, server: stored{ips: []string{"::ffff:/104"}}},
+		"MappedZeroWider":          {ips: []string{"::ffff:0.0.0.0/97"}, server: stored{ips: []string{"::ffff:/97"}}},
+		"MappedZeroMasked":         {ips: []string{"::ffff:0.0.0.0/95"}, server: stored{ips: []string{"::fffe:0:0/95"}}},
+		"Mapped":                   {ips: []string{"::ffff:1.2.3.4"}, server: stored{ips: []string{"::ffff:1.2.3.4"}}},
+		"MappedSubnet":             {ips: []string{"::ffff:10.0.0.0/104"}, server: stored{ips: []string{"::ffff:10.0.0.0/104"}}},
+		"Compatible":               {ips: []string{"::1.2.3.4"}, server: stored{ips: []string{"::1.2.3.4"}}},
+		"CompatibleZero":           {ips: []string{"::/96"}, server: stored{ips: []string{"::/96"}}},
+		"Unspecified":              {ips: []string{"::"}, server: stored{ips: []string{"::"}}},
+		"UnspecifiedIPv4":          {ips: []string{"0.0.0.0"}, server: stored{ips: []string{"0.0.0.0"}}},
+		"ThisNetwork":              {ips: []string{"0.0.0.0/8"}, server: stored{ips: []string{"0.0.0.0/8"}}},
+		"FirstZeroRun":             {ips: []string{"2001:0:0:1:0:0:0:1"}, server: stored{ips: []string{"2001::1:0:0:0:1"}}},
+		"UpperCaseHex":             {ips: []string{"FD00::ABCD"}, server: stored{ips: []string{"fd00::abcd"}}},
+		"NotCompatible":            {ips: []string{"::1:0:0/96"}, server: stored{ips: []string{"::1:0:0/96"}}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			desired, err := NormalizeHosts(tc.ips, tc.names)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := ObservedHosts(tc.server.ips, tc.server.names); !desired.Equal(got) {
+				t.Errorf("desired %+v never equals what the server stores (%+v): perpetual drift", desired, got)
+			}
+		})
+	}
+	// Addresses the server prints without their last 24 bits: an IPv4-mapped
+	// or IPv4-compatible address whose first IPv4 byte is 0 is printed as
+	// '::ffff:' or '::' [verified on 25.3.3 and 26.8], so they could never be
+	// compared.
+	for _, in := range []string{"::ffff:0.1.2.3", "::0.1.2.3", "::ff:1", "::ffff:0.1.0.0/112", "::1:0/112"} {
+		if got, err := NormalizeHosts([]string{in}, nil); err == nil {
+			t.Errorf("NormalizeHosts(%q) = %+v, want an error", in, got)
+		}
+	}
+	// A localhost entry still restricts the hosts.
+	if got, _ := NormalizeHosts([]string{"127.0.0.1"}, nil); got.Any() {
+		t.Errorf("a loopback address must not mean ANY: %+v", got)
+	}
+}
+
 func TestCanonicalClaims(t *testing.T) {
 	cases := map[string]string{
 		`{"b": 1, "a": "x y"}`: `{"a":"x y","b":1}`,

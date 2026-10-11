@@ -237,8 +237,10 @@ spec:
     userRef: {name: api}
 ```
 
-References (`databaseRef`, `roleRef`, `userRef`, `memberOfRef`) resolve to
-the ClickHouse names of MRs in the same namespace that use the same
+References (`databaseRef`, `roleRef`, `userRef`, `memberOfRef`) and
+selectors (`databaseSelector`, `roleSelector`, `userSelector`,
+`memberOfSelector`, for example with `matchControllerRef` in a composition)
+resolve to the ClickHouse names of MRs in the same namespace that use the same
 ProviderConfig. Change `generate.rotationToken` to rotate the password. On
 Antalya a user can log in with JWTs instead
 (`authentication: {jwt: {processor: <token processor>, claims: {...}}}`); its
@@ -280,6 +282,15 @@ metadata:
 ```
 
 On a `ClusterProviderConfig` this also needs `policy.allowAdoption: true`.
+
+The server never shows a password, and the provider's record of the password
+it applied is the connection Secret, which an adopted user does not have yet.
+So adopting a password user with `generate` applies a new password at once
+(Warning event `PasswordRegenerated`), and clients that use the old one can no
+longer log in. To keep the current password, adopt the user with
+`passwordSecretRef` pointing at a Secret that holds it. Once the connection
+Secret records it, switching to `generate` keeps it until
+`generate.rotationToken` is set or changed.
 
 Grants and role grants have no UUID of their own, so they are bound to their
 grantee: a `Grant` or `RoleGrant` grants to and revokes from a user or role

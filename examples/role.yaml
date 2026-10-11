@@ -30,6 +30,23 @@ spec:
   forProvider:
     name: team-a_writer
 ---
+# A role on the namespaced ProviderConfig of providerconfig-password.yaml. The
+# Grant etl-writer (grant.yaml) grants to it and the RoleGrant etl-etl-writer
+# (rolegrant.yaml) grants it: the provider grants to and revokes from only
+# roles and users that a Role or User MR of the same namespace and
+# ProviderConfig created or adopted.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Role
+metadata:
+  name: etl-writer
+  namespace: team-a
+spec:
+  providerConfigRef:
+    kind: ProviderConfig
+    name: tenant
+  forProvider:
+    name: team-a_etl_writer
+---
 # An existing role, observed only: status.atProvider shows its id and storage,
 # and nothing is claimed, changed or dropped. To take it over, set the
 # annotation clickhouse.m.infrabay.io/adopt to status.atProvider.id (on a

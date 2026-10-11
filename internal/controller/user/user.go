@@ -153,7 +153,9 @@ func execError(err error) error {
 }
 
 // Observe reads the user and decides ownership, drift and the connection
-// details (design 5.4).
+// details (design 5.4). When the user does not exist and the management
+// policies allow Create, a connection Secret that the MR does not control is
+// SecretConflict.
 //
 // While the MR is being deleted, Observe reports the user as existing only
 // when it is the MR's own (owned, adopted or recovered), its name is allowed
@@ -176,6 +178,19 @@ func (e *External) Observe(ctx context.Context, cr *v1alpha1.User) (managed.Exte
 		return managed.ExternalObservation{}, err
 	}
 	if !obs.Exists {
+		if !meta.WasDeleted(cr) && pol.Create() {
+			// crossplane-runtime publishes the connection details before it
+			// calls Create, and its publisher takes over an existing Secret of
+			// the connection type that nothing controls. A Secret this MR does
+			// not control is refused here, before that, so that it never
+			// becomes the record of the user's password (design 5.4, 9.5).
+			if _, err := e.connectionSecret(ctx, cr); err != nil {
+				if reason.Is(err, reason.SecretConflict) {
+					return managed.ExternalObservation{}, access.Unavailable(cr, err)
+				}
+				return managed.ExternalObservation{}, err
+			}
+		}
 		return managed.ExternalObservation{ResourceExists: false}, nil
 	}
 	if meta.WasDeleted(cr) {
@@ -219,12 +234,18 @@ func (e *External) Observe(ctx context.Context, cr *v1alpha1.User) (managed.Exte
 	}, nil
 }
 
-// Create runs CREATE USER (design 5.4). The write checks, the policy, the
-// provider's own identity, the topology guard and the name collision check
-// run first; ownership is recorded by reading the UUID back
-// (access.Env.CreateEntity). It returns the connection details, including
-// the password of a password user.
+// Create runs CREATE USER (design 5.4). It refuses without the Create
+// management policy (D-26). The write checks, the policy, the provider's own
+// identity, the topology guard and the name collision check run first;
+// ownership is recorded by reading the UUID back (access.Env.CreateEntity).
+// It returns the connection details, including the password of a password
+// user.
 func (e *External) Create(ctx context.Context, cr *v1alpha1.User) (managed.ExternalCreation, error) {
+	if !ownership.PoliciesOf(cr).Create() {
+		// crossplane-runtime does not call Create without the Create
+		// management policy; this second guard does not depend on it (D-26).
+		return managed.ExternalCreation{}, reason.Errorf(reason.Internal, "the management policies do not include Create; no user was created")
+	}
 	name, err := ownership.EffectiveName(cr, cr.Spec.ForProvider.Name)
 	if err != nil {
 		return managed.ExternalCreation{}, err
@@ -288,7 +309,8 @@ func (e *External) Create(ctx context.Context, cr *v1alpha1.User) (managed.Exter
 //	ALTER USER `name` [IDENTIFIED WITH ...] [HOST ...] [DEFAULT DATABASE ...] [SETTINGS ...]
 //	ALTER USER `name` DEFAULT ROLE ...
 //
-// Ownership is re-checked immediately before each (access.Env.VerifyOwned:
+// It refuses without the Update management policy (D-26). Ownership is
+// re-checked immediately before each statement (access.Env.VerifyOwned:
 // claim, name policy, own identity, users.xml, topology and UUID). DEFAULT
 // ROLE has its own statement so that an error in it does not block the
 // other changes. When the first statement changed the password, the second
@@ -296,6 +318,11 @@ func (e *External) Create(ctx context.Context, cr *v1alpha1.User) (managed.Exter
 // connection details only after Update succeeds, so the new password must
 // never wait for a statement that may fail.
 func (e *External) Update(ctx context.Context, cr *v1alpha1.User) (managed.ExternalUpdate, error) {
+	if !ownership.PoliciesOf(cr).Update() {
+		// crossplane-runtime does not call Update without the Update
+		// management policy; this second guard does not depend on it (D-26).
+		return managed.ExternalUpdate{}, reason.Errorf(reason.Internal, "the management policies do not include Update; the user was not changed")
+	}
 	p := e.plan
 	if p == nil {
 		return managed.ExternalUpdate{}, reason.Errorf(reason.Internal, "Update ran without Observe")

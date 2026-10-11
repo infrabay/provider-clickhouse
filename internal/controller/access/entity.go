@@ -66,14 +66,19 @@ type Entity struct {
 	// ID is the UUID (system.users.id or system.roles.id), the anchor of
 	// ownership.
 	ID string
-	// Storage is users_xml (read-only), local_directory, replicated or
-	// memory.
+	// Storage is the name of the user directory that holds the entity:
+	// users_xml (read-only), local_directory, replicated or memory, unless
+	// the server configuration renames the directory (see Env.ReadOnly).
 	Storage string
 }
 
-// ReadOnly reports whether the entity is defined in users.xml/users.d. The
-// server refuses every write to it with 495, and the provider never tries.
-func (e Entity) ReadOnly() bool { return e.Storage == ch.StorageUsersXML }
+// ReadOnly reports whether the user directory that holds ent refuses writes:
+// users.xml/users.d whatever the directory is called, or a local directory
+// configured read-only (ch.Capabilities.StorageReadOnly). The server refuses
+// every write to such an entity with 495, and the provider never tries.
+func (e *Env) ReadOnly(ctx context.Context, ent Entity) (bool, error) {
+	return e.Client.Capabilities().StorageReadOnly(ctx, e.Client, ent.Storage)
+}
 
 // ReadEntity reads the UUID and storage of the user or role named name.
 // exists is false only when the query succeeded and returned no row:
@@ -207,6 +212,10 @@ func (e *Env) ObserveEntity(ctx context.Context, mg resource.Managed, kind Entit
 		return obs, nil
 	}
 	obs.Found, obs.Entity = true, ent
+	readOnly, err := e.ReadOnly(ctx, ent)
+	if err != nil {
+		return obs, err
+	}
 
 	key := e.createKey(kind, mg, name)
 	d := ownership.Decide(mg, ownership.Input{
@@ -214,6 +223,7 @@ func (e *Env) ObserveEntity(ctx context.Context, mg resource.Managed, kind Entit
 		Name:            name,
 		ObservedID:      ent.ID,
 		Storage:         ent.Storage,
+		ReadOnly:        readOnly,
 		Recoverable:     true,
 		CreateEvidence:  e.journal().Evidence(key),
 		AdoptionAllowed: e.Resolved != nil && e.Resolved.AdoptionAllowed,
@@ -348,8 +358,12 @@ func (e *Env) VerifyOwned(ctx context.Context, mg resource.Managed, kind EntityK
 	if err != nil || !exists {
 		return false, err
 	}
-	if ent.ReadOnly() {
-		return false, reason.Errorf(reason.ReadOnlyStorage, "%s %q is defined in users.xml/users.d and cannot be managed", kind, name)
+	readOnly, err := e.ReadOnly(ctx, ent)
+	if err != nil {
+		return false, err
+	}
+	if readOnly {
+		return false, reason.Errorf(reason.ReadOnlyStorage, "%s %q is in the read-only user directory %q (such as users.xml/users.d) and cannot be managed", kind, name, ent.Storage)
 	}
 	if ent.ID != claim.OwnedID {
 		return false, reason.Errorf(reason.Replaced, "%s %q was replaced since it was observed (id %s, now %s); nothing was changed", kind, name, claim.OwnedID, ent.ID)

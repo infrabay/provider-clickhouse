@@ -48,6 +48,19 @@ var unsupportedLevels = map[string]bool{
 	LevelSource:          true,
 }
 
+// parameterLevels are the levels whose privileges are granted on a parameter
+// (ON name or ON prefix*: a named collection, a user or role name prefix, a
+// table engine, a definer, a source) instead of on a database. The server
+// keeps such a grant among the database names, named by the parameter
+// (system.grants.access_object from 25.8 on).
+var parameterLevels = map[string]bool{
+	LevelNamedCollection: true,
+	LevelUserName:        true,
+	LevelTableEngine:     true,
+	LevelDefiner:         true,
+	LevelSource:          true,
+}
+
 // globalLeavesUnderAll are the GLOBAL leaves directly under ALL that are not
 // source privileges, verified on every supported server version. From 25.8
 // on, source privileges (S3, URL, REMOTE, ...) are GLOBAL leaves directly
@@ -129,6 +142,20 @@ func NewPrivilegeSet(names ...string) PrivilegeSet {
 func (s PrivilegeSet) Has(n string) bool {
 	_, ok := s[n]
 	return ok
+}
+
+// Equal reports whether s and o hold the same names; nil and empty sets are
+// equal.
+func (s PrivilegeSet) Equal(o PrivilegeSet) bool {
+	if len(s) != len(o) {
+		return false
+	}
+	for n := range s {
+		if !o.Has(n) {
+			return false
+		}
+	}
+	return true
 }
 
 // Sorted returns the names in s, sorted.
@@ -383,6 +410,22 @@ func (c *Catalogue) Expand(privileges []string, t TargetLevel) (PrivilegeSet, er
 		}
 	}
 	return out, nil
+}
+
+// Parameterized reports whether a row of system.grants with the given
+// access_type may be a grant on a parameter (parameterLevels): its access
+// type is unknown, or one of its flags has a parameter level.
+func (c *Catalogue) Parameterized(accessType string) bool {
+	p, ok := c.privs[accessType]
+	if !ok {
+		return true
+	}
+	for _, f := range p.flags {
+		if parameterLevels[c.privs[f].Level] {
+			return true
+		}
+	}
+	return false
 }
 
 // RowFlags returns the flags that a row of system.grants with the given

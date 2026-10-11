@@ -72,6 +72,7 @@ func TestUser(t *testing.T) {
 		t.Run("PasswordScheme", func(t *testing.T) { testUserPasswordScheme(t, f) })
 		t.Run("PasswordLifecycle", func(t *testing.T) { testUserPasswordLifecycle(t, f) })
 		t.Run("PasswordSecretRef", func(t *testing.T) { testUserPasswordSecretRef(t, f) })
+		t.Run("UncontrolledSecret", func(t *testing.T) { testUserUncontrolledSecret(t, f) })
 		t.Run("Hosts", func(t *testing.T) { testUserHosts(t, f) })
 		t.Run("DefaultRoles", func(t *testing.T) { testUserDefaultRoles(t, f) })
 		t.Run("Ownership", func(t *testing.T) { testUserOwnership(t, f) })
@@ -717,6 +718,58 @@ func testUserPasswordSecretRef(t *testing.T, f *accessFixture) {
 	}
 }
 
+// testUserUncontrolledSecret: a Secret of the connection type that exists
+// before the User and that nothing controls is refused (SecretConflict)
+// before crossplane-runtime's publisher, which publishes the connection
+// details before Create, could take it over. Its password never becomes the
+// user's: the user is created only once the Secret is gone, with a password
+// of its own.
+func testUserUncontrolledSecret(t *testing.T, f *accessFixture) {
+	ctx := context.Background()
+	h := newUserHarness(t, f)
+	const planted = "Planted-Passw0rd-0123456789abcdef"
+	sec := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "planted-conn"},
+		Type:       resource.SecretTypeConnection,
+		Data:       map[string][]byte{v1alpha1.ConnectionKeyPassword: []byte(planted)},
+	}
+	if err := f.kube.Create(ctx, sec); err != nil {
+		t.Fatal(err)
+	}
+	h.createUser("planted", "app_planted", func(u *v1alpha1.User) { u.Spec.WriteConnectionSecretToReference.Name = "planted-conn" })
+	h.mustReconcile("planted", "uncontrolled Secret", failedWith(reason.SecretConflict))
+	if _, _, ok := f.srv.entity(t, access.User, "app_planted"); ok {
+		t.Fatal("the user was created")
+	}
+	got := &corev1.Secret{}
+	if err := f.kube.Get(ctx, client.ObjectKeyFromObject(sec), got); err != nil {
+		t.Fatal(err)
+	}
+	if c := metav1.GetControllerOf(got); c != nil || string(got.Data[v1alpha1.ConnectionKeyPassword]) != planted {
+		t.Fatalf("the Secret was taken over: controller %v", c)
+	}
+	if u := h.observed("planted"); readyStatus(u) != "False" {
+		t.Errorf("Ready = %s, want False", readyStatus(u))
+	}
+
+	if err := f.kube.Delete(ctx, got); err != nil {
+		t.Fatal(err)
+	}
+	h.mustReconcile("planted", "create", created)
+	pw := string(h.secret("planted")[v1alpha1.ConnectionKeyPassword])
+	if pw == "" || pw == planted {
+		t.Fatal("the user must get a password of its own")
+	}
+	if err := f.loginPassword(t, "app_planted", pw); err != nil {
+		t.Errorf("login with the published password: %v", err)
+	}
+	if err := f.loginPassword(t, "app_planted", planted); !authFailed(err) {
+		t.Errorf("login with the planted password: %v, want 516", err)
+	}
+	h.delete("planted")
+	h.mustReconcile("planted", "delete", func(o outcome) bool { return o.err == nil && o.deleted })
+}
+
 func testUserHosts(t *testing.T, f *accessFixture) {
 	h := newUserHarness(t, f)
 	h.createUser("hosts", "app_hosts", func(u *v1alpha1.User) {
@@ -758,6 +811,34 @@ func testUserHosts(t *testing.T, f *accessFixture) {
 		t.Errorf("HOST ANY: %+v", r)
 	}
 	h.mustReconcile("hosts", "steady with ANY", steady)
+
+	// The server stores loopback addresses and localhost in any case as HOST
+	// LOCAL (host_names = ['localhost']), and prints the IPv4-mapped zero
+	// prefix as '::ffff:/96'. Both compare equal, so the user converges.
+	h.createUser("local", "app_local", func(u *v1alpha1.User) {
+		u.Spec.ForProvider.HostIP = []string{"127.0.0.1", "::1", "127.1.0.0/16", "::ffff:0:0/96"}
+		u.Spec.ForProvider.HostNames = []string{"LOCALHOST"}
+		u.Spec.ForProvider.DefaultDatabase = new("")
+	})
+	h.mustReconcile("local", "create", created)
+	local := func(what string) {
+		t.Helper()
+		if r := f.userRow(t, "app_local"); !slices.Equal(r.hostIP, []string{"::ffff:/96"}) || !slices.Equal(r.hostNames, []string{"localhost"}) {
+			t.Fatalf("%s: hosts as stored: %+v", what, r)
+		}
+	}
+	local("create")
+	h.mustReconcile("local", "observe", func(o outcome) bool { return o.err == nil && o.obs.ResourceUpToDate && !o.updated })
+	h.mustReconcile("local", "steady", steady)
+	f.srv.exec(t, "ALTER USER app_local HOST NAME 'localhost.example.com'")
+	h.mustReconcile("local", "repair", updated)
+	local("repair")
+	h.mustReconcile("local", "steady after repair", steady)
+	// An address the server prints without its last 24 bits could never be
+	// compared.
+	h.mutate("local", func(u *v1alpha1.User) { u.Spec.ForProvider.HostIP = []string{"::ffff:0.1.2.3"} })
+	h.mustReconcile("local", "lossy address", failedWith(reason.InvalidSpec))
+	local("refused")
 }
 
 func testUserDefaultRoles(t *testing.T, f *accessFixture) {

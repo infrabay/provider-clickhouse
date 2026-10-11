@@ -65,6 +65,14 @@ func TestCheckReferenceNamespaces(t *testing.T) {
 		"NoReferences":   {mutate: func(p *v1alpha1.GrantParameters) { p.User = new("team-a_api") }},
 		"SameNamespace":  {mutate: func(p *v1alpha1.GrantParameters) { p.UserRef = &xpv2.NamespacedReference{Name: "api"} }},
 		"EmptyNamespace": {mutate: func(p *v1alpha1.GrantParameters) { p.RoleRef = &xpv2.NamespacedReference{Name: "r", Namespace: ""} }},
+		// crossplane-runtime writes the MR's own namespace into the
+		// reference that a selector resolves to.
+		"OwnNamespaceRef": {mutate: func(p *v1alpha1.GrantParameters) {
+			p.RoleRef = &xpv2.NamespacedReference{Name: "r", Namespace: "team-a"}
+		}},
+		"OwnNamespaceSelector": {mutate: func(p *v1alpha1.GrantParameters) {
+			p.RoleSelector = &xpv2.NamespacedSelector{MatchLabels: map[string]string{"a": "b"}, Namespace: "team-a"}
+		}},
 		"CrossNamespaceRef": {
 			mutate: func(p *v1alpha1.GrantParameters) {
 				p.UserRef = &xpv2.NamespacedReference{Name: "api", Namespace: "team-b"}
@@ -80,7 +88,8 @@ func TestCheckReferenceNamespaces(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := CheckReferenceNamespaces(grantRefs(testGrant(tc.mutate)))
+			g := testGrant(tc.mutate)
+			err := CheckReferenceNamespaces(grantRefs(g), g.GetNamespace())
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -109,6 +118,32 @@ func TestReferenceResolver(t *testing.T) {
 		}
 		if g.Spec.ForProvider.User == nil || *g.Spec.ForProvider.User != "team-a_api" {
 			t.Errorf("user = %v, want the referenced MR's external name", g.Spec.ForProvider.User)
+		}
+	})
+
+	// A selector resolves to a reference that names the MR's own namespace:
+	// crossplane-runtime writes the resolved reference back like that. The
+	// next reconcile and Connect accept it.
+	t.Run("ResolvesSelector", func(t *testing.T) {
+		g := testGrant(func(p *v1alpha1.GrantParameters) {
+			p.UserSelector = &xpv2.NamespacedSelector{MatchLabels: map[string]string{"app": "api"}}
+		})
+		g.SetGroupVersionKind(v1alpha1.GrantGroupVersionKind)
+		u := testUser("team-a", "api", "team-a_api", shared)
+		u.SetLabels(map[string]string{"app": "api"})
+		kube := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(g, u).Build()
+		r := NewReferenceResolver(kube, grantRefs)
+		if err := r.ResolveReferences(ctx, g); err != nil {
+			t.Fatal(err)
+		}
+		if ref := g.Spec.ForProvider.UserRef; ref == nil || ref.Name != "api" || g.Spec.ForProvider.User == nil || *g.Spec.ForProvider.User != "team-a_api" {
+			t.Fatalf("userRef = %+v, user = %v", ref, g.Spec.ForProvider.User)
+		}
+		if err := r.ResolveReferences(ctx, g); err != nil {
+			t.Errorf("the next reconcile: %v", err)
+		}
+		if err := CheckReferencedConfigs(ctx, kube, g, grantRefs(g)); err != nil {
+			t.Errorf("Connect: %v", err)
 		}
 	})
 

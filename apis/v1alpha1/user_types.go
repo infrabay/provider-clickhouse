@@ -45,7 +45,13 @@ type UserParameters struct {
 	// 10.0.0.0/255.0.0.0 is accepted). With hostNames, this forms the HOST
 	// clause. If both are empty the user may connect from ANY host. Hosts are
 	// always enforced, never late-initialized. 0.0.0.0/0 or ::/0 together with
-	// hostNames is invalid: the server would drop the names.
+	// hostNames is invalid: the server would drop the names. The server
+	// stores loopback addresses and prefixes (inside 127.0.0.0/8, ::1, and
+	// their IPv4-mapped forms) as HOST LOCAL, which allows every address of
+	// the server host; they compare equal to hostNames: [localhost].
+	// An IPv4-mapped or IPv4-compatible entry whose first IPv4 byte is 0 but
+	// whose IPv4 part is not all zero is invalid: the server prints it
+	// without its last 24 bits.
 	// +optional
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=256
@@ -53,7 +59,8 @@ type UserParameters struct {
 	HostIP []string `json:"hostIP,omitempty"`
 
 	// HostNames lists exact client host names (HOST NAME). Compared
-	// case-sensitively, as the server stores them.
+	// case-sensitively, as the server stores them, except localhost: the
+	// server stores it in any case as HOST LOCAL.
 	// +optional
 	// +listType=set
 	// +kubebuilder:validation:MaxItems=256

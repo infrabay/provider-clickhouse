@@ -36,17 +36,19 @@ type Reference struct {
 type ReferencesFunc func(mg resource.Managed) []Reference
 
 // CheckReferenceNamespaces returns InvalidSpec if any reference or selector
-// names a namespace. References never leave the MR's namespace: the
-// generated resolver would read the referenced MR from that namespace with
-// the provider's cluster-wide RBAC, before Connect and before any policy
-// check (design 3.1). CEL rejects such references too; this is defence in
-// depth.
-func CheckReferenceNamespaces(refs []Reference) error {
+// of an MR in namespace names another namespace. References never leave the
+// MR's namespace: the generated resolver would read the referenced MR from
+// that namespace with the provider's cluster-wide RBAC, before Connect and
+// before any policy check (design 3.1). The MR's own namespace is accepted:
+// crossplane-runtime writes it into the reference that a selector resolves
+// to. CEL rejects every non-empty selector namespace too, but cannot reject
+// a reference's namespace, because it cannot see metadata.namespace.
+func CheckReferenceNamespaces(refs []Reference, namespace string) error {
 	for _, r := range refs {
-		if r.Ref != nil && r.Ref.Namespace != "" {
+		if r.Ref != nil && r.Ref.Namespace != "" && r.Ref.Namespace != namespace {
 			return reason.Errorf(reason.InvalidSpec, "%s: cross-namespace references are not allowed (namespace %q)", r.Field, r.Ref.Namespace)
 		}
-		if r.Selector != nil && r.Selector.Namespace != "" {
+		if r.Selector != nil && r.Selector.Namespace != "" && r.Selector.Namespace != namespace {
 			return reason.Errorf(reason.InvalidSpec, "%s: cross-namespace selectors are not allowed (namespace %q)", selectorField(r.Field), r.Selector.Namespace)
 		}
 	}
@@ -67,7 +69,7 @@ func selectorField(refField string) string {
 func NewReferenceResolver(kube client.Client, refs ReferencesFunc) managed.ReferenceResolver {
 	inner := managed.NewAPISimpleReferenceResolver(kube)
 	return managed.ReferenceResolverFn(func(ctx context.Context, mg resource.Managed) error {
-		if err := CheckReferenceNamespaces(refs(mg)); err != nil {
+		if err := CheckReferenceNamespaces(refs(mg), mg.GetNamespace()); err != nil {
 			return err
 		}
 		return inner.ResolveReferences(ctx, mg)
@@ -81,7 +83,7 @@ func NewReferenceResolver(kube client.Client, refs ReferencesFunc) managed.Refer
 // resolved while an MR is being deleted, and its resolved names are then
 // plain names.
 func CheckReferencedConfigs(ctx context.Context, kube client.Reader, mg resource.ModernManaged, refs []Reference) error {
-	if err := CheckReferenceNamespaces(refs); err != nil {
+	if err := CheckReferenceNamespaces(refs, mg.GetNamespace()); err != nil {
 		return err
 	}
 	for _, r := range refs {

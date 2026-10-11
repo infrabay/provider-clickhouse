@@ -81,7 +81,8 @@ type orphanCause struct {
 //
 // and, when the management policies allow writes:
 //
-//   - not defined in users.xml/users.d (ReadOnlyStorage);
+//   - not in a read-only user directory such as users.xml/users.d
+//     (ReadOnlyStorage);
 //   - not the provider's own identity (SelfModification);
 //   - owned: a User or Role MR in the MR's namespace that uses the same
 //     ProviderConfig holds a valid claim on the grantee's current UUID
@@ -199,8 +200,12 @@ func (e *Env) bind(ctx context.Context, mg resource.ModernManaged, g Grantee) (b
 	if !pol.Writes() {
 		return b, nil, nil, nil
 	}
-	if ent.ReadOnly() {
-		return leave(ReasonOrphaned, reason.Errorf(reason.ReadOnlyStorage, "grantee %s is defined in users.xml/users.d and is never written", g))
+	readOnly, err := e.ReadOnly(ctx, ent)
+	if err != nil {
+		return b, nil, nil, err
+	}
+	if readOnly {
+		return leave(ReasonOrphaned, reason.Errorf(reason.ReadOnlyStorage, "grantee %s is in the read-only user directory %q (such as users.xml/users.d) and is never written", g, ent.Storage))
 	}
 	if g.Kind == User && g.Name == e.CurrentUser() {
 		return leave(ReasonOrphaned, reason.Errorf(reason.SelfModification, "grantee %s is the provider's own identity and is never modified", g))

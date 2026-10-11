@@ -141,6 +141,10 @@ func specOf(cr *v1alpha1.Grant) (spec, error) {
 //     are read. Without system.grants.is_wildcard a grantee with wildcard
 //     grants is Unsupported (D-10).
 //
+// Where the server may not list the grant option (sqlx.Analyze), the
+// Grant's record of the grant option it gave (record.go) stands in for the
+// rows. The Grant is up to date when the plan of Update has no statement.
+//
 // While the MR is being deleted, every failed check orphans it: a Warning
 // event is emitted, the grant is reported as absent and nothing is revoked.
 // The grant then exists only while Delete has something to revoke, so a
@@ -191,8 +195,9 @@ func (e *External) Observe(ctx context.Context, cr *v1alpha1.Grant) (managed.Ext
 		return managed.ExternalObservation{}, err
 	}
 	cr.Status.AtProvider.Privileges = a.Privileges()
+	record := recordOf(cr, b.Entity.ID)
 	if deleting {
-		return managed.ExternalObservation{ResourceExists: !a.Revoke().Empty()}, nil
+		return managed.ExternalObservation{ResourceExists: !a.Revoke(record).Empty()}, nil
 	}
 	if !a.Exists() {
 		return managed.ExternalObservation{ResourceExists: false}, nil
@@ -202,7 +207,7 @@ func (e *External) Observe(ctx context.Context, cr *v1alpha1.Grant) (managed.Ext
 	} else {
 		cr.SetConditions(xpv2.Available())
 	}
-	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: a.Apply(s.withGrantOption).Empty()}, nil
+	return managed.ExternalObservation{ResourceExists: true, ResourceUpToDate: a.Apply(s.withGrantOption, record).Empty()}, nil
 }
 
 // list names privileges in a message, at most maxListed of them.
@@ -317,8 +322,8 @@ func (e *External) Create(ctx context.Context, cr *v1alpha1.Grant) (managed.Exte
 	return managed.ExternalCreation{}, e.apply(ctx, cr)
 }
 
-// Update grants the missing privileges and revokes the foreign ones at the
-// target.
+// Update revokes the foreign privileges at the target and grants the
+// missing ones, and keeps the record of the grant option.
 func (e *External) Update(ctx context.Context, cr *v1alpha1.Grant) (managed.ExternalUpdate, error) {
 	if !ownership.PoliciesOf(cr).Update() {
 		return managed.ExternalUpdate{}, notAllowed("Update")
@@ -334,12 +339,14 @@ func notAllowed(op string) error {
 	return reason.Errorf(reason.Internal, "the management policies do not include %s; nothing was granted or revoked", op)
 }
 
-// apply runs the plan of Create and Update (sqlx.Analysis.Apply). It
-// repeats the policy checks, re-reads the rows (a third party could have
-// changed them since Observe) and, immediately before the statements,
-// re-checks the grantee binding: the grantee must still exist, be owned and
-// unambiguous, have the UUID bound in Observe, and the access storage must
-// be writable from this endpoint.
+// apply runs the plan of Create and Update (sqlx.Analysis.Apply): REVOKE,
+// REVOKE GRANT OPTION FOR, then GRANT. It repeats the policy checks,
+// re-reads the rows (a third party could have changed them since Observe)
+// and, immediately before the statements, re-checks the grantee binding:
+// the grantee must still exist, be owned and unambiguous, have the UUID
+// bound in Observe, and the access storage must be writable from this
+// endpoint. Once the statements ran it saves the record of the grant option
+// the plan leaves.
 func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 	ctx = access.SQLContext(ctx, kind, cr)
 	s, err := specOf(cr)
@@ -359,11 +366,16 @@ func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 	if err != nil {
 		return err
 	}
-	stmts, err := a.Apply(s.withGrantOption).Statements(s.target, s.grantee.Name)
+	granteeID := e.binding.Entity.ID
+	record := recordOf(cr, granteeID)
+	p := a.Apply(s.withGrantOption, record)
+	stmts, err := p.Statements(s.target, s.grantee.Name)
 	if err != nil {
 		return reason.Wrap(reason.Internal, err)
 	}
 	if len(stmts) == 0 {
+		// A record that changed without statements (a grant option no row
+		// shows any more) is saved with the next statements.
 		return nil
 	}
 	ok, err := e.RebindGrantee(ctx, cr, e.binding)
@@ -381,15 +393,16 @@ func (e *External) apply(ctx context.Context, cr *v1alpha1.Grant) error {
 			return ch.WithDefaultReason(err)
 		}
 	}
-	return nil
+	return e.saveRecord(ctx, cr, granteeID, p.Record)
 }
 
 // Delete revokes the desired privileges that are granted at exactly the
-// target (sqlx.Analysis.Revoke). Privileges covered by a broader grant and
-// privileges that someone else granted at the target are left alone. It is
-// only reached for a bound grantee: Observe orphans every other case. The
-// name policy and the binding are checked again first; a grantee that no
-// longer exists leaves nothing to revoke.
+// target, and the grant option of record where the server may not list it
+// (sqlx.Analysis.Revoke); then it removes the record. Privileges covered by
+// a broader grant and privileges that someone else granted at the target are
+// left alone. It is only reached for a bound grantee: Observe orphans every
+// other case. The name policy and the binding are checked again first; a
+// grantee that no longer exists leaves nothing to revoke.
 func (e *External) Delete(ctx context.Context, cr *v1alpha1.Grant) (managed.ExternalDelete, error) {
 	cr.SetConditions(xpv2.Deleting())
 	ctx = access.SQLContext(ctx, kind, cr)
@@ -407,27 +420,29 @@ func (e *External) Delete(ctx context.Context, cr *v1alpha1.Grant) (managed.Exte
 	if err != nil {
 		return managed.ExternalDelete{}, err
 	}
-	stmts, err := a.Revoke().Statements(s.target, s.grantee.Name)
+	granteeID := e.binding.Entity.ID
+	stmts, err := a.Revoke(recordOf(cr, granteeID)).Statements(s.target, s.grantee.Name)
 	if err != nil {
 		return managed.ExternalDelete{}, reason.Wrap(reason.Internal, err)
 	}
-	if len(stmts) == 0 {
-		return managed.ExternalDelete{}, nil
-	}
-	ok, err := e.RebindGrantee(ctx, cr, e.binding)
-	if err != nil || !ok {
-		return managed.ExternalDelete{}, err
-	}
-	for _, stmt := range stmts {
-		if err := e.Client.Exec(ctx, stmt); err != nil {
-			if access.IgnoreGone(err) == nil {
-				// 192 or 511: the grantee is gone, and its grants with it.
-				return managed.ExternalDelete{}, nil
+	if len(stmts) > 0 {
+		ok, err := e.RebindGrantee(ctx, cr, e.binding)
+		if err != nil || !ok {
+			return managed.ExternalDelete{}, err
+		}
+		for _, stmt := range stmts {
+			if err := e.Client.Exec(ctx, stmt); err != nil {
+				if access.IgnoreGone(err) == nil {
+					// 192 or 511: the grantee is gone, and its grants with it.
+					return managed.ExternalDelete{}, nil
+				}
+				return managed.ExternalDelete{}, ch.WithDefaultReason(err)
 			}
-			return managed.ExternalDelete{}, ch.WithDefaultReason(err)
 		}
 	}
-	return managed.ExternalDelete{}, nil
+	// The grant option of record is revoked: the next Observe no longer
+	// counts it, and the MR is released.
+	return managed.ExternalDelete{}, e.saveRecord(ctx, cr, granteeID, nil)
 }
 
 // Interface checks.
