@@ -20,3 +20,6 @@ tmp/
 # Local private material (any top-level "_<name>-private/" directory) that
 # must never be committed
 /_*-private/
+
+# Claude Code local state (agent worktrees)
+/.claude/
