@@ -12,16 +12,25 @@ import (
 	"github.com/infrabay/provider-clickhouse/apis/v1alpha1"
 	"github.com/infrabay/provider-clickhouse/internal/controller/config"
 	"github.com/infrabay/provider-clickhouse/internal/controller/database"
+	"github.com/infrabay/provider-clickhouse/internal/controller/grant"
+	"github.com/infrabay/provider-clickhouse/internal/controller/role"
+	"github.com/infrabay/provider-clickhouse/internal/controller/rolegrant"
+	"github.com/infrabay/provider-clickhouse/internal/controller/user"
 )
 
 // Dependencies are shared by the managed resource controllers.
 type Dependencies = database.Dependencies
 
 // ManagedKinds are the managed resource kinds that have a controller. Only
-// their CRDs are packaged (package/crds); the CRDs of the other kinds are
-// generated into apis/unreleased-crds (see apis/generate.go). A test keeps
-// the two in sync.
-var ManagedKinds = []string{v1alpha1.DatabaseKind}
+// their CRDs are packaged (package/crds). A test keeps the two in sync, so a
+// kind can only be packaged together with its controller.
+var ManagedKinds = []string{
+	v1alpha1.DatabaseKind,
+	v1alpha1.UserKind,
+	v1alpha1.RoleKind,
+	v1alpha1.GrantKind,
+	v1alpha1.RoleGrantKind,
+}
 
 // SetupGated adds every controller to the manager. Managed resource
 // controllers are registered with safe-start: each is set up once its CRD is
@@ -30,16 +39,10 @@ func SetupGated(mgr ctrl.Manager, o controller.Options, d Dependencies) error {
 	for _, setup := range []func(ctrl.Manager, controller.Options) error{
 		config.Setup,
 		func(mgr ctrl.Manager, o controller.Options) error { return database.SetupGated(mgr, o, d) },
-
-		// TODO(v1alpha1): register the remaining kinds once their controllers
-		// are implemented (design sections 5.4 to 5.7), add them to
-		// ManagedKinds and stop moving their CRDs to apis/unreleased-crds in
-		// apis/generate.go. Until then their CRDs are not packaged, so MRs of
-		// these kinds cannot be created.
-		//   user.SetupGated      (design 5.4: jwt/password users, SHOW CREATE USER parser, connection Secrets)
-		//   role.SetupGated      (design 5.5: ownership as for User, name collision checks)
-		//   grant.SetupGated     (design 5.6: privilege catalogue, revoke-aware coverage)
-		//   rolegrant.SetupGated (design 5.7: membership and admin option)
+		func(mgr ctrl.Manager, o controller.Options) error { return user.SetupGated(mgr, o, d) },
+		func(mgr ctrl.Manager, o controller.Options) error { return role.SetupGated(mgr, o, d) },
+		func(mgr ctrl.Manager, o controller.Options) error { return grant.SetupGated(mgr, o, d) },
+		func(mgr ctrl.Manager, o controller.Options) error { return rolegrant.SetupGated(mgr, o, d) },
 	} {
 		if err := setup(mgr, o); err != nil {
 			return err

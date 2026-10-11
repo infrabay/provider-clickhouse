@@ -46,11 +46,6 @@ func TestOnlyReconciledKindsArePackaged(t *testing.T) {
 	want := slices.Clone(ManagedKinds)
 	slices.Sort(want)
 	if !slices.Equal(packaged, want) {
-		t.Errorf("package/crds has managed kinds %v, controllers exist for %v; update ManagedKinds and apis/generate.go together", packaged, want)
-	}
-	for _, k := range managedCRDKinds(t, filepath.Join(root, "apis", "unreleased-crds")) {
-		if slices.Contains(ManagedKinds, k) {
-			t.Errorf("%s has a controller but its CRD is in apis/unreleased-crds", k)
-		}
+		t.Errorf("package/crds has managed kinds %v, controllers exist for %v; update ManagedKinds and SetupGated together", packaged, want)
 	}
 }

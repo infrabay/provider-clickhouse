@@ -26,32 +26,50 @@ services are a different thing.
 > change between minor releases. The full design is in
 > [`docs/design.md`](docs/design.md).
 
-## Implementation status
+## Kinds
 
-| Kind | Installed by the package | Controller |
+| Kind | Short name | ClickHouse object |
 |---|---|---|
-| `ClusterProviderConfig`, `ProviderConfig`, `ProviderConfigUsage` | yes | yes (usage tracking) |
-| `Database` | yes | **yes** |
-| `User` | no | planned |
-| `Role` | no | planned |
-| `Grant` | no | planned |
-| `RoleGrant` | no | planned |
+| `ClusterProviderConfig`, `ProviderConfig` | `chcpc`, `chpc` | connection and identity; the cluster kind also holds the tenant policy |
+| `Database` | `chdb` | `CREATE DATABASE`, with an explicit UUID |
+| `User` | `chuser` | `CREATE USER`: a password user (stored as a salted SHA-256 hash, password published in the connection Secret) or a JWT user pinned to a token processor (Antalya) |
+| `Role` | `chrole` | `CREATE ROLE` |
+| `Grant` | `chgrant` | privileges of one user or role on one exact target (`*.*`, `db.*`, `db.table`, `db.table(columns)`) |
+| `RoleGrant` | `chrolegrant` | membership of one user or role in one role, with or without the admin option |
 
-Only kinds with a controller are packaged. The API types of the other kinds
-are in [`apis/v1alpha1`](apis/v1alpha1) for review, and their CRDs are
-generated into [`apis/unreleased-crds`](apis/unreleased-crds), but they are
-not installed, so no resource of those kinds can be created and then ignored.
+Every kind is packaged together with its controller (a unit test keeps the
+two in sync), and every kind is namespaced.
 
 ## Compatibility
 
 | | Supported |
 |---|---|
 | Crossplane | v2.0 and later |
-| Upstream ClickHouse | 25.3 and later (password identities) |
-| Altinity Antalya | 26.3 and later (password and JWT identities) |
+| Upstream ClickHouse | 25.3 and later (password identities and password users) |
+| Altinity Antalya | 26.3 and later (password and JWT identities and users) |
 
-Server differences are detected at run time. On 25.3 a database comment cannot
-be changed after creation (the change is reported as `Unsupported`).
+Server differences are detected at run time, and a missing capability fails
+only the resource that needs it. CI tests these images:
+
+| | 25.3 (25.3.3.42) | 25.8 | 26.8 | Antalya 26.3 | Antalya 26.6 |
+|---|---|---|---|---|---|
+| JWT users | no | no | no | yes | yes |
+| Database comment change | no | yes | yes | yes | yes |
+| Grants of a grantee with wildcard grants (`ON team_*.*`) | no | no | yes | no | no |
+| Expiry (`VALID UNTIL`) drift read from | `SHOW CREATE USER` | `SHOW CREATE USER` | `system.users` | `system.users` | `system.users` |
+
+- A JWT `User` on upstream ClickHouse is reported as `Unsupported` and nothing
+  is written (the provider's capability probe gets code 62 on 25.3 and 36 on
+  25.8 and 26.8).
+- A database comment cannot be changed on 25.3; the change is reported as
+  `Unsupported`.
+- Without `system.grants.is_wildcard` (before 26.8) a wildcard grant cannot be
+  told apart from a grant on a database named like its prefix, so a `Grant`
+  whose grantee holds wildcard grants is `Unsupported`, and deleting it
+  leaves its privileges in place (Warning event `Orphaned`).
+- Password users need `writeConnectionSecretToRef`: the connection Secret is
+  the provider's record of the password that was last applied (the server
+  never shows the hash).
 
 ## Quick start
 
@@ -61,8 +79,9 @@ password identity. Every name below is an example.
 ### 1. Create the provider identity on the server
 
 Define the identity in the server's `users.d` so that the provider can never
-modify it, and give it only the grants it needs. This one manages databases
-whose names start with `app_`:
+modify it, and give it only the grants it needs. This one manages databases,
+users and roles whose names start with `app_`, and may hand out `SELECT`,
+`INSERT` and `SHOW TABLES` on those databases:
 
 ```yaml
 # /etc/clickhouse-server/users.d/provider-clickhouse.yaml
@@ -73,12 +92,26 @@ users:
     profile: default
     grants:
       query:
+        # Database
         - "GRANT CREATE DATABASE, DROP DATABASE, SHOW TABLES ON app_*.*"
         - "GRANT ALTER MODIFY DATABASE COMMENT ON app_*.*"   # omit on 25.3
+        # User, Role, Grant, RoleGrant
+        - "GRANT CREATE USER, ALTER USER, DROP USER ON `app_`*"
+        - "GRANT CREATE ROLE, DROP ROLE ON `app_`*"
+        - "GRANT SHOW USERS, SHOW ROLES ON *.*"
+        - "GRANT ROLE ADMIN ON *.*"   # RoleGrant of roles the provider creates
+        - "GRANT SELECT ON system.user_directories"
+        - "GRANT SELECT ON system.role_grants"
+        - "GRANT SELECT ON system.grants"
+        - "GRANT SELECT ON system.settings_profile_elements"   # only for User.settingsProfile
+        # The ceiling of what Grant may hand out (and revoke).
+        - "GRANT SELECT, INSERT, SHOW TABLES ON app_*.* WITH GRANT OPTION"
 ```
 
 Do not grant `DROP TABLE`: without it a single server refuses to drop a
-database that still has tables, whatever the provider decides.
+database that still has tables, whatever the provider decides. The prefix
+grants (`` ON `app_`* ``) limit user and role DDL to names that start with
+`app_` on the server side, whatever the provider is asked to do.
 
 ### 2. Install the provider
 
@@ -155,6 +188,62 @@ NAME        READY   SYNCED   EXTERNAL-NAME   ENGINE   AGE
 analytics   True    True     app_analytics   Atomic   12s
 ```
 
+### 5. Create a role, a user and their grants
+
+```yaml
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Role
+metadata: {name: reader, namespace: team-a}
+spec:
+  providerConfigRef: {kind: ClusterProviderConfig, name: clickhouse-main}
+  forProvider:
+    name: app_reader
+---
+# SELECT and INSERT on every table of the database, for the role.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: Grant
+metadata: {name: reader-analytics, namespace: team-a}
+spec:
+  providerConfigRef: {kind: ClusterProviderConfig, name: clickhouse-main}
+  forProvider:
+    privileges: ["SELECT", "INSERT"]
+    databaseRef: {name: analytics}
+    roleRef: {name: reader}
+---
+# A user with a generated password, published with the endpoint in the
+# connection Secret "api-clickhouse".
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: User
+metadata: {name: api, namespace: team-a}
+spec:
+  providerConfigRef: {kind: ClusterProviderConfig, name: clickhouse-main}
+  forProvider:
+    name: app_api
+    authentication:
+      password:
+        generate: {}
+    defaultDatabase: app_analytics
+  writeConnectionSecretToRef: {name: api-clickhouse}
+---
+# The user becomes a member of the role. New users start with DEFAULT ROLE
+# ALL, so the role is active at login.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: RoleGrant
+metadata: {name: api-reader, namespace: team-a}
+spec:
+  providerConfigRef: {kind: ClusterProviderConfig, name: clickhouse-main}
+  forProvider:
+    memberOfRef: {name: reader}
+    userRef: {name: api}
+```
+
+References (`databaseRef`, `roleRef`, `userRef`, `memberOfRef`) resolve to
+the ClickHouse names of MRs in the same namespace that use the same
+ProviderConfig. Change `generate.rotationToken` to rotate the password. On
+Antalya a user can log in with JWTs instead
+(`authentication: {jwt: {processor: <token processor>, claims: {...}}}`); its
+connection Secret then holds no secret.
+
 More examples, including `GoogleIDToken` and `TokenFile` identities and the
 `DeploymentRuntimeConfig`s they need, are in [`examples/`](examples).
 
@@ -191,6 +280,27 @@ metadata:
 ```
 
 On a `ClusterProviderConfig` this also needs `policy.allowAdoption: true`.
+
+Grants and role grants have no UUID of their own, so they are bound to their
+grantee: a `Grant` or `RoleGrant` grants to and revokes from a user or role
+only when a `User` or `Role` in the same namespace, using the same
+ProviderConfig, created or adopted it. The grantee's UUID is read again right
+before every `GRANT` and `REVOKE`. To manage the grants of an existing user,
+adopt it with a `User` first. A role and a user that share a name are
+refused, because ClickHouse resolves grantees user-first.
+
+Deleting a `Grant` or `RoleGrant` revokes its privileges or membership, even
+if they existed before the resource. To import existing grants, leave
+`Delete` out of the management policies:
+
+```yaml
+spec:
+  managementPolicies: ["Observe", "Create", "Update"]
+```
+
+Default roles that a `User` late-initializes from an adopted user are not
+filtered by the policy: if they lie outside `grantableRoles`, set
+`defaultRoles` explicitly.
 
 Management policies are always honoured: a resource with
 `managementPolicies: ["Observe"]` never alters or drops anything.

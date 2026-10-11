@@ -17,15 +17,18 @@ This page is for contributors. To use the provider, install the package as the
 
 ```
 apis/v1alpha1/                 API types; zz_generated.* files are generated
-apis/unreleased-crds/          generated CRDs of kinds without a controller (not packaged)
 cmd/provider/                  the provider binary
 internal/clients/clickhouse/   connection options, client cache, errors, quoting, capabilities
   auth/                        token sources and the checks before a token is sent
-  sqlx/                        SQL builders
+  sqlx/                        SQL builders, the SQL lexer, the SHOW CREATE USER parser,
+                               the privilege catalogue and grant model; testdata/ holds
+                               recorded server output per version
   fake/                        fakes for unit tests
-internal/controller/           controllers: config, database; providerconfig (resolution
-                               and policy) and ownership (claims and the decision table)
-package/                       crossplane.yaml and the generated CRDs of kinds with a controller
+internal/controller/           controllers: config, database, user, role, grant, rolegrant;
+                               access (shared by the access entity kinds), providerconfig
+                               (resolution and policy), ownership (claims, decision table,
+                               create journal)
+package/                       crossplane.yaml and the generated CRDs
 examples/                      example manifests, validated in CI
 test/envtest/                  CRD validation against a real kube-apiserver
 test/integration/              tests against ClickHouse containers
@@ -51,12 +54,11 @@ The code generators are `tool` directives in `go.mod`, so their versions move
 with the module. `make generate` must be run after any change in `apis/`, and
 its output is committed; CI fails when it is out of date.
 
-Only kinds with a controller are packaged. `make generate` moves the CRDs of
-the other kinds from `package/crds` to `apis/unreleased-crds` (the list is in
-`apis/generate.go`); envtest still installs them to check their CEL rules.
-When a controller is added, register it in `internal/controller/register.go`,
-add its kind to `ManagedKinds` there and remove its CRD from the list in
-`apis/generate.go`; a unit test fails if the two disagree.
+Only kinds with a controller may be packaged. `make generate` writes every CRD
+into `package/crds`, and a unit test fails when `package/crds` and
+`ManagedKinds` in `internal/controller/register.go` disagree. When a kind is
+added, register its controller in `SetupGated` and add it to `ManagedKinds`
+in the same change.
 
 ## Integration tests
 
@@ -64,7 +66,11 @@ add its kind to `ManagedKinds` there and remove its CRD from the list in
 with testcontainers. The tests start:
 
 - upstream ClickHouse with a password provider identity defined in `users.d`,
-  holding only the prefix-scoped grants that `Database` needs;
+  holding only the prefix-scoped grants that `Database` needs, and for the
+  access entity kinds (`TestUser`, `TestRole`, `TestRoleGrant`, `TestGrant`,
+  `TestAccess*`) an identity with the prefix-scoped grants of every kind
+  (design 9.4). Antalya runs the same tests with a JWT identity and two token
+  processors; JWT users are tested there and reported `Unsupported` upstream;
 - Altinity Antalya with a `jwt_static_key` HS256 token processor and a JWT
   provider identity. Keys are random per run and written to a temporary
   directory; tokens are minted in the test with `golang-jwt` and written to a
@@ -77,15 +83,50 @@ with testcontainers. The tests start:
   databases, the per-host ownership check and the Keeper path policy. It uses
   the first image of `XPCH_UPSTREAM_IMAGES`;
 - the provider's real controllers against envtest and an upstream container
-  (`TestProviderEndToEnd`), including an observe-only resource.
+  (`TestProviderEndToEnd`), including an observe-only resource, and against
+  every selected image (`TestProviderEndToEndAccess`): a Database, Role,
+  User (password upstream, JWT on Antalya), Grant and RoleGrant; the user
+  logs in and can do exactly what was granted, foreign users and roles stay
+  byte-identical, and deleting the resources revokes and drops only what the
+  provider created. The end-to-end tests need `KUBEBUILDER_ASSETS`, which
+  `make test-integration` sets.
 
 Choose the images with comma-separated lists, or `none` to skip a family:
 
 ```sh
-XPCH_UPSTREAM_IMAGES=clickhouse/clickhouse-server:25.3,clickhouse/clickhouse-server:26.8.23.6 \
+XPCH_UPSTREAM_IMAGES=clickhouse/clickhouse-server:25.3.3.42-alpine,clickhouse/clickhouse-server:26.8.23.6 \
 XPCH_ANTALYA_IMAGES=none \
   make test-integration
 ```
+
+One image takes several minutes; CI runs one job per image. For a run over
+all five images raise the timeout, for example
+`go test -tags integration -count=1 -timeout 90m ./test/integration/...` with
+`KUBEBUILDER_ASSETS` and `TESTCONTAINERS_RYUK_DISABLED=true` set as the
+Makefile does.
+
+### Recorded server output
+
+Some unit tests use output recorded from every image of the CI matrix. The
+integration tests compare it with the servers under test and fail on any
+difference (or skip for a version without a recording); re-record it when an
+image of the matrix changes:
+
+- `SHOW CREATE USER` fixtures of the parser,
+  `internal/clients/clickhouse/sqlx/testdata/user/<server version>.txt`:
+
+  ```sh
+  XPCH_UPDATE_FIXTURES=1 go test -tags integration -run 'TestUser$/.*/.*/ShowCreateUserFixtures' ./test/integration/
+  ```
+
+- the privilege catalogues of the grant model,
+  `internal/clients/clickhouse/sqlx/testdata/privileges/<server version>.tsv`:
+
+  ```sh
+  XPCH_RECORD_PRIVILEGES=1 go test -tags integration -run TestGrantPrivilegeCatalogue ./test/integration/
+  ```
+
+Both read the images from `XPCH_UPSTREAM_IMAGES` and `XPCH_ANTALYA_IMAGES`.
 
 ### Container naming rule
 
@@ -130,7 +171,8 @@ emulation.
 gofmt, vet, build, the generated-files check, unit tests and a guard against
 workstation paths; envtest and `crossplane resource validate`; golangci-lint;
 govulncheck; the integration matrix (upstream 25.3, 25.8 and 26.8, Antalya
-26.3 and 26.6); and gitleaks.
+26.3 and 26.6; each job runs every integration and end-to-end test against
+its image); and gitleaks.
 
 ## Releasing
 

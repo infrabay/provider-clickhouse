@@ -295,6 +295,16 @@ func TestRebindGrantee(t *testing.T) {
 			mr: newGrant(), db: fake.NewDB().WithRole(roleName, roleID, ch.StorageLocalDirectory), objs: []client.Object{ownedRole},
 			multi: true, reason: reason.AccessStorageNotReplicated,
 		},
+		// An observe-only MR binds no owner, so it never passes the re-check,
+		// even for an owned grantee and even if a write were called.
+		"ObserveOnly": {
+			mr: newGrant(grantPolicies(xpv2.ManagementActionObserve)), db: fake.NewDB().WithRole(roleName, roleID, ch.StorageLocalDirectory),
+			objs: []client.Object{ownedRole}, reason: reason.NotOwned,
+		},
+		"ObserveOnlyForeignGrantee": {
+			mr: newGrant(grantPolicies(xpv2.ManagementActionObserve, xpv2.ManagementActionLateInitialize)),
+			db: fake.NewDB().WithRole(roleName, roleID, ch.StorageLocalDirectory), reason: reason.NotOwned,
+		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {

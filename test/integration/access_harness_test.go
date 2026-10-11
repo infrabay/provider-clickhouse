@@ -8,6 +8,7 @@ package integration
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -101,8 +102,10 @@ func accessGrants(image string) []string {
 }
 
 // accessUpstreamServer starts upstream ClickHouse with a password provider
-// identity in users.d that holds accessGrants.
-func accessUpstreamServer(t *testing.T, image, password string) *server {
+// identity in users.d that holds accessGrants. extra are further files
+// (container path to content), for example more users.d entities; nil adds
+// none.
+func accessUpstreamServer(t *testing.T, image, password string, extra map[string]string) *server {
 	t.Helper()
 	usersD := fmt.Sprintf(`users:
   %s:
@@ -113,14 +116,16 @@ func accessUpstreamServer(t *testing.T, image, password string) *server {
     grants:
       query:
 %s`, providerUser, sha256Hex(password), grantsYAML(accessGrants(image)))
-	return startServer(t, image, map[string]string{"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD})
+	files := map[string]string{"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD}
+	maps.Copy(files, extra)
+	return startServer(t, image, files)
 }
 
 // accessAntalyaServer starts Antalya with two jwt_static_key HS256 token
 // processors (random keys, never committed) and a JWT provider identity in
-// users.d that pins processorTest and holds accessGrants. It returns the
-// processors' keys.
-func accessAntalyaServer(t *testing.T, image string) (*server, map[string][]byte) {
+// users.d that pins processorTest and holds accessGrants. extra are further
+// files, as for accessUpstreamServer. It returns the processors' keys.
+func accessAntalyaServer(t *testing.T, image string, extra map[string]string) (*server, map[string][]byte) {
 	t.Helper()
 	keys := map[string][]byte{processorTest: []byte(randHex(24)), processorTest2: []byte(randHex(24))}
 	processors := fmt.Sprintf(`token_processors:
@@ -148,11 +153,12 @@ func accessAntalyaServer(t *testing.T, image string) (*server, map[string][]byte
     grants:
       query:
 %s`, jwtProviderUser, processorTest, grantsYAML(accessGrants(image)))
-	srv := startServer(t, image, map[string]string{
+	files := map[string]string{
 		"/etc/clickhouse-server/config.d/token_processors.yaml":   processors,
 		"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD,
-	})
-	return srv, keys
+	}
+	maps.Copy(files, extra)
+	return startServer(t, image, files), keys
 }
 
 // mintTokenClaims signs an HS256 token with the given claims. iss, aud, iat
@@ -192,16 +198,17 @@ type accessFixture struct {
 	jwtKeys map[string][]byte
 }
 
-// newAccessFixture starts a server of family for image and stores a
+// newAccessFixture starts a server of family for image, with the extra files
+// of accessUpstreamServer or accessAntalyaServer (nil for none), and stores a
 // ClusterProviderConfig "access" with policy.
-func newAccessFixture(t *testing.T, family, image string, policy v1alpha1.ClusterPolicy) *accessFixture {
+func newAccessFixture(t *testing.T, family, image string, policy v1alpha1.ClusterPolicy, extra map[string]string) *accessFixture {
 	t.Helper()
 	f := &accessFixture{t: t, family: family, image: image, journal: ownership.NewJournal(),
 		pc: &xpv2.ProviderConfigReference{Kind: v1alpha1.ClusterProviderConfigKind, Name: "access"}}
 	switch family {
 	case familyUpstream:
 		password := randHex(16)
-		f.srv = accessUpstreamServer(t, image, password)
+		f.srv = accessUpstreamServer(t, image, password, extra)
 		cpc := passwordCPC(f.srv, "access", policy)
 		f.kube = newKube(t, cpc, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "crossplane-system", Name: "provider-clickhouse"},
@@ -209,7 +216,7 @@ func newAccessFixture(t *testing.T, family, image string, policy v1alpha1.Cluste
 		})
 		f.identity = providerUser
 	case familyAntalya:
-		f.srv, f.jwtKeys = accessAntalyaServer(t, image)
+		f.srv, f.jwtKeys = accessAntalyaServer(t, image, extra)
 		tokenPath := filepath.Join(t.TempDir(), "token")
 		writeToken(t, tokenPath, mintToken(t, f.jwtKeys[processorTest], jwtProviderUser, tokenAudience, 2*time.Hour))
 		cpc := tokenFileCPC(f.srv, tokenPath)
@@ -237,7 +244,7 @@ func forEachAccessImage(t *testing.T, policy v1alpha1.ClusterPolicy, fn func(t *
 	} {
 		for _, image := range imageList(fam.env, fam.def) {
 			ran = true
-			t.Run(image, func(t *testing.T) { fn(t, newAccessFixture(t, fam.name, image, policy)) })
+			t.Run(image, func(t *testing.T) { fn(t, newAccessFixture(t, fam.name, image, policy, nil)) })
 		}
 	}
 	if !ran {

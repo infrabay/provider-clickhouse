@@ -8,7 +8,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -16,9 +15,7 @@ import (
 
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/google/go-cmp/cmp"
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
@@ -64,77 +61,9 @@ users:
 `, roleFixtureYAMLRole, roleFixtureYAMLSuperRole, roleFixtureYAMLUser, sha256Hex(randHex(16)))
 }
 
-// newRoleFixture is newAccessFixture with roleUsersD added to the server's
-// users.d: the same provider identity (accessGrants), the same
-// ClusterProviderConfig "access" with policy.
-func newRoleFixture(t *testing.T, family, image string, policy v1alpha1.ClusterPolicy) *accessFixture {
-	t.Helper()
-	const extraPath = "/etc/clickhouse-server/users.d/role-fixtures.yaml"
-	f := &accessFixture{t: t, family: family, image: image, journal: ownership.NewJournal(),
-		pc: &xpv2.ProviderConfigReference{Kind: v1alpha1.ClusterProviderConfigKind, Name: "access"}}
-	switch family {
-	case familyUpstream:
-		password := randHex(16)
-		usersD := fmt.Sprintf(`users:
-  %s:
-    password_sha256_hex: %q
-    networks: {ip: ["::/0"]}
-    profile: default
-    quota: default
-    grants:
-      query:
-%s`, providerUser, sha256Hex(password), grantsYAML(accessGrants(image)))
-		f.srv = startServer(t, image, map[string]string{
-			"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD,
-			extraPath: roleUsersD(),
-		})
-		f.kube = newKube(t, passwordCPC(f.srv, "access", policy), &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "crossplane-system", Name: "provider-clickhouse"},
-			Data:       map[string][]byte{"password": []byte(password)},
-		})
-		f.identity = providerUser
-	case familyAntalya:
-		f.jwtKeys = map[string][]byte{processorTest: []byte(randHex(24)), processorTest2: []byte(randHex(24))}
-		processors := fmt.Sprintf(`token_processors:
-  %s:
-    type: jwt_static_key
-    algo: HS256
-    static_key: %q
-    expected_issuer: %s
-    expected_audience: %s
-    username_claim: email
-`, processorTest, f.jwtKeys[processorTest], tokenIssuer, tokenAudience)
-		usersD := fmt.Sprintf(`users:
-  %q:
-    jwt: {processor: %s}
-    networks: {ip: ["::/0"]}
-    profile: default
-    quota: default
-    grants:
-      query:
-%s`, jwtProviderUser, processorTest, grantsYAML(accessGrants(image)))
-		f.srv = startServer(t, image, map[string]string{
-			"/etc/clickhouse-server/config.d/token_processors.yaml":   processors,
-			"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD,
-			extraPath: roleUsersD(),
-		})
-		tokenPath := filepath.Join(t.TempDir(), "token")
-		writeToken(t, tokenPath, mintToken(t, f.jwtKeys[processorTest], jwtProviderUser, tokenAudience, 2*time.Hour))
-		cpc := tokenFileCPC(f.srv, tokenPath)
-		cpc.Name, cpc.UID = "access", types.UID("cpc-access")
-		cpc.Spec.Policy = policy
-		f.kube = newKube(t, cpc)
-		f.identity = jwtProviderUser
-	default:
-		t.Fatalf("unknown image family %q", family)
-	}
-	f.cache = ch.NewCache(ch.OpenDriver)
-	t.Cleanup(f.cache.Close)
-	return f
-}
-
 // forEachRoleImage runs fn for every selected image (XPCH_UPSTREAM_IMAGES,
-// XPCH_ANTALYA_IMAGES), each with its own newRoleFixture.
+// XPCH_ANTALYA_IMAGES), each with its own access fixture whose server also
+// has roleUsersD in users.d.
 func forEachRoleImage(t *testing.T, policy v1alpha1.ClusterPolicy, fn func(t *testing.T, f *accessFixture)) {
 	t.Helper()
 	ran := false
@@ -144,7 +73,9 @@ func forEachRoleImage(t *testing.T, policy v1alpha1.ClusterPolicy, fn func(t *te
 	} {
 		for _, image := range imageList(fam.env, fam.def) {
 			ran = true
-			t.Run(image, func(t *testing.T) { fn(t, newRoleFixture(t, fam.name, image, policy)) })
+			t.Run(image, func(t *testing.T) {
+				fn(t, newAccessFixture(t, fam.name, image, policy, map[string]string{"/etc/clickhouse-server/users.d/role-fixtures.yaml": roleUsersD()}))
+			})
 		}
 	}
 	if !ran {

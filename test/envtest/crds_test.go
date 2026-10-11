@@ -5,9 +5,8 @@
 
 // Package envtest installs every CRD into a real kube-apiserver (envtest) and
 // checks the CEL validation rules with positive and negative cases. CEL rules
-// fail their compile or cost checks only there. That includes the CRDs of
-// kinds that are not packaged yet (apis/unreleased-crds). It also applies
-// every file in examples/ with a server-side dry run.
+// fail their compile or cost checks only there. It also applies every file in
+// examples/ with a server-side dry run.
 //
 // Run with "make envtest" (KUBEBUILDER_ASSETS must point at the envtest
 // binaries; the Makefile downloads them with setup-envtest).
@@ -39,7 +38,7 @@ var kube client.Client
 
 func TestMain(m *testing.M) {
 	env := &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "package", "crds"), filepath.Join("..", "..", "apis", "unreleased-crds")},
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "package", "crds")},
 		ErrorIfCRDPathMissing: true,
 	}
 	cfg, err := env.Start()

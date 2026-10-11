@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Revision 4, after re-verifying the access entity facts on upstream 25.3.3.42 and building the foundations that User, Role, Grant and RoleGrant share. Revision 3 followed the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller); revision 2 the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
+| Status | Revision 4, after re-verifying the access entity facts on upstream 25.3.3.42, building the foundations that User, Role, Grant and RoleGrant share, and implementing and registering those four controllers. Revision 3 followed the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller); revision 2 the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
 | Module and repository | `github.com/infrabay/provider-clickhouse` |
 | Package | `ghcr.io/infrabay/provider-clickhouse` |
 | API group and version | `clickhouse.m.infrabay.io/v1alpha1` |
@@ -25,6 +25,11 @@ Decisions taken during the review are collected in [section 12](#12-decisions) (
 - **Grants and role grants are bound to an owned grantee** (D-30): the provider grants to and revokes from only users and roles that a User or Role MR in the namespace owns ([4.3](#43-grants-and-role-grants-grantee-binding)).
 - **Provider flags while deleting** (D-31): a namespaced ProviderConfig that the flags forbid orphans a deleting MR instead of blocking it ([5.9](#59-shared-controller-wiring)).
 - **JWT processor names** are validated provider-side on every config kind (D-32, [5.8](#58-policy-evaluation)).
+- **User, Role, Grant and RoleGrant are implemented and packaged** with their controllers; `apis/unreleased-crds` is gone ([11.1](#111-layout)). What the design left open is now specified: the User's connection Secret, password and default role handling ([5.4](#54-user)), the second guards of every kind (D-26, [5.5](#55-role) to [5.7](#57-rolegrant)), and the facts found on all five images (A44 to A56).
+- **Grant compares access flags, not leaves** (D-33, [5.6](#56-grant)): `CREATE ARBITRARY TEMPORARY TABLE` carries a flag besides that of its only child, and `SHOW FILESYSTEM CACHES` grants nothing. The model was checked against the server on all five images, which closes **OQ-14**. A grantee with wildcard grants on a server without `is_wildcard` orphans a deleting Grant (D-34).
+- **The re-check before a GRANT or REVOKE** refuses a binding without an owner, so an MR whose management policies allow no write never writes, whatever crossplane-runtime calls ([4.3](#43-grants-and-role-grants-grantee-binding)).
+- **Corrections**: after `REVOKE`, only 25.3 keeps the role in `default_roles_list`; 25.8 and A26.3 remove it like 26.6 and 26.8 (A15). `GRANT r TO r` is stored on every version except 26.8 (A53). An out-of-band replacement of an adopted entity is reported as `NotOwned`, not `Replaced` ([4.2](#42-ownership)).
+- **End-to-end**: the provider's real controllers run every kind on envtest against every image, including a login with the published credentials and foreign entities that must stay byte-identical ([10.2](#102-integration-tests-build-tag-integration)).
 
 ### What changed in revision 3
 
@@ -831,7 +836,7 @@ type UserObservation struct {
   - the server never shows the hash (`SHOW CREATE USER` prints `IDENTIFIED WITH sha256_password` only [V]);
   - status can be lost.
 
-  The Secret is read with the uncached API reader, and it is trusted only when its controller reference is this MR. Its name is immutable for password users. See [5.4](#54-user).
+  The Secret is read with the uncached API reader, and it is trusted only when its controller reference is this MR. Its name is immutable for password users. CEL requires the reference, and so does the controller (`InvalidSpec`): without a record every reconcile would apply a new password. See [5.4](#54-user).
 - **Rotation is explicit.** For `passwordSecretRef`, change the Secret's value. For `generate`, change `generate.rotationToken`. A missing connection Secret still triggers a new password, but only as recovery, with a Warning event (D-12).
 - **No `noPassword` method in v1.**
   - `CREATE USER` without an `IDENTIFIED` clause creates a `no_password` user [V].
@@ -844,6 +849,7 @@ type UserObservation struct {
   - New users start with `DEFAULT ROLE ALL`, so every role granted later is active. That covers the common case [V].
   - `Listed` requires the roles to be granted first: `ALTER USER ... DEFAULT ROLE` with a role that is not granted returns 512 `SET_NON_GRANTED_ROLE` [V 25.3.3, 26.6, 26.8]. (`CREATE USER ... DEFAULT ROLE r` accepts an existing role that is not granted yet and stores it, so it becomes active once granted [V 25.3.3, 26.6, 26.8]; the provider does not rely on that.) The provider creates such users with `DEFAULT ROLE NONE` and applies only the listed roles that are currently granted ([5.4](#54-user)).
   - `AllExcept` does not require the roles to be granted. It needs only that they exist (511 otherwise) [V 25.3.3, 26.6, 26.8], so it is set at creation.
+  - Late-initialized default roles are not filtered by policy. An adopted user whose default roles lie outside `grantableRoles` fails the write check on the next reconcile (`PolicyViolation`, `Ready=False`, nothing written) until `spec.defaultRoles` is set explicitly. This fails closed.
 - **Hosts.**
   - Hosts are always enforced. Empty means `HOST ANY`.
   - They are deliberately not late-initialized. Telling "unset" apart from `ANY` would need tri-state lists, which do not survive JSON `omitempty`.
@@ -1151,7 +1157,7 @@ The provider identity can alter or drop SQL users and roles it did not create ([
 - on a `ClusterProviderConfig`: `policy.allowAdoption: true`;
 - on a namespaced `ProviderConfig`: always allowed. The tenant owns that identity, and the server's grants bound it.
 
-After adoption the annotation is spent. A later out-of-band replacement yields `Replaced`, not a silent re-adoption.
+After adoption the annotation is spent. A later out-of-band replacement is never adopted silently: row 6 needs the `external-create-succeeded` annotation of a CREATE the MR made, so for an adopted MR the result is `NotOwned`, naming the new UUID with the adoption hint, and nothing is written. For an object the MR created it is `Replaced`.
 
 **Decision table in Observe**, when an object with the effective external name exists. The first matching row wins.
 
@@ -1195,12 +1201,12 @@ The table has these consequences:
   - the grantee is not in `users.xml`/`users.d` (`ReadOnlyStorage`) and is not `currentUser()` (`SelfModification`);
   - the grantee is **owned**: a `User` or `Role` MR in the MR's namespace that uses the same ProviderConfig holds a valid claim (`owner-uid` equals its UID) whose `owned-id` is the grantee's current UUID. Otherwise the result is `NotOwned`. The provider never grants to or revokes from an access entity that it did not create or adopt by UUID. To manage the grants of an existing user or role, adopt it with a `User` or `Role` first.
 - **A missing grantee** gives `DependencyMissing` when writes are allowed. Observe-only MRs report the grant as absent.
-- **Re-check before every write.** Immediately before a GRANT or REVOKE the binding is checked again, together with the topology guard of [section 8](#8-topology-replicas-and-clusters): the grantee must still exist, still be owned, still be unambiguous, and still have the UUID observed in the same reconcile (`Replaced` otherwise).
+- **Re-check before every write.** Immediately before a GRANT or REVOKE the binding is checked again, together with the topology guard of [section 8](#8-topology-replicas-and-clusters): the grantee must still exist, still be owned, still be unambiguous, and still have the UUID observed in the same reconcile (`Replaced` otherwise). A binding without an owner is refused (`NotOwned`): the checks stop before the owner lookup when the management policies allow no write, so such an MR never writes, even if crossplane-runtime called Create, Update or Delete (D-26).
 - **While deleting**, every failed check orphans the MR (Warning event `Orphaned` or `OrphanedByPolicy`, `ResourceExists=false`, no SQL), and so do management policies without `Delete` (D-26). A grantee that no longer exists leaves nothing to revoke.
 
 Ownership claims are annotations, so a tenant who forges a claim on a `User` or `Role` can make a foreign entity look owned. As for users and roles, the name policy is the boundary between tenants; the binding prevents accidents (a grantee created by an administrator, a copied manifest, a replaced entity).
 
-- **Deleting a `Grant` or a `RoleGrant` revokes the privileges or the membership, even if someone else had granted them before.** To avoid that, for example when importing existing grants, use management policies without `Delete`.
+- **Deleting a `Grant` or a `RoleGrant` revokes the privileges or the membership, even if someone else had granted them before** (**OQ-29**). To avoid that, for example when importing existing grants, use management policies without `Delete`.
 - **Implementation.** `access.Env.BindGrantee` (Observe) and `access.Env.RebindGrantee` (before each write). The checks of the other names (the target database, `memberOf`) are `providerconfig.Policy.CheckGrantTarget` and `CheckRoleGrantNames`.
 
 ---
@@ -1370,16 +1376,16 @@ The re-check above runs first. 81 means the database is gone. The Update returns
 
 **Observe**
 
-1. Read the user's row:
+1. Read the user's entity, `SELECT toString(id), storage FROM system.users WHERE name = {name:String}` (the shared flow of [4.2](#42-ownership)). No row means `ResourceExists=false`. `system.users` is not filtered: without `SHOW USERS` it fails with 497. Then apply the ownership and storage rules. When the management policies allow Create or Update, the write checks ([5.8](#58-policy-evaluation)) and, for a jwt user, the jwt capability run next, before any detail is read: a jwt user on upstream is `Unsupported` and no further SQL is sent. Then read the details:
 
    ```sql
-   SELECT toString(id), storage, auth_type, host_ip, host_names, host_names_regexp, host_names_like,
+   SELECT toString(id), arrayMap(x -> toString(x), auth_type), host_ip, host_names, host_names_regexp, host_names_like,
           default_roles_all, default_roles_list, default_roles_except, default_database
-          [, valid_until]                                -- when the column exists (section 7)
+          [, arrayMap(x -> toInt64(x), valid_until)]     -- when the column exists (section 7)
    FROM system.users WHERE name = {name:String}
    ```
 
-   No row means `ResourceExists=false`. `system.users` is not filtered: without `SHOW USERS` it fails with 497. Then apply the ownership and storage rules ([4.2](#42-ownership)).
+   `toInt64` gives seconds for both `Array(DateTime)` (A26.3, A26.6) and `Array(DateTime64(0))` (26.8); 0 means no expiry [V A26.6, 26.8]. If the `id` differs from the one just read, or the row is gone, the user was replaced in between: the result is `Replaced`, never "not found".
 2. **Name collision.** `SELECT count() FROM system.roles WHERE name = {name:String}`. A role with the same name gives error `NameCollision`: the server resolves grantee names user-first, so this user would capture every grant meant for that role [V 25.3, 25.3.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
 3. Run ``SHOW CREATE USER `name` `` and parse the `IDENTIFIED WITH` clause (see the parser below) when any of these holds:
    - the desired method is jwt;
@@ -1390,15 +1396,18 @@ The re-check above runs first. 81 means the database is gone. The Update returns
 4. If `settingsProfile` is managed or late-initialized, run:
 
    ```sql
-   SELECT inherit_profile, setting_name
-   FROM system.settings_profile_elements WHERE user_name = {name:String}
+   SELECT ifNull(inherit_profile, ''), ifNull(setting_name, '')
+   FROM system.settings_profile_elements WHERE user_name = {name:String} ORDER BY index
    ```
 
+   When `settingsProfile` is managed, a 497 is `PermissionDenied`. When it is only late-initialized, a 497 skips the late initialization, so users that do not set `settingsProfile` need no `SELECT ON system.settings_profile_elements` ([9.4](#94-minimal-grants-for-the-provider-identity)).
 5. If `defaultRoles.policy` is `Listed`, read the granted roles: `SELECT granted_role_name FROM system.role_grants WHERE user_name = {name:String}`.
-6. If the desired method is password, read the connection Secret (`spec.writeConnectionSecretToRef.name` in the MR namespace) with the **uncached API reader** (`mgr.GetAPIReader()`).
+6. When the management policies allow Create or Update, read the connection Secret (`spec.writeConnectionSecretToRef.name` in the MR namespace) with the **uncached API reader** (`mgr.GetAPIReader()`). Observe-only MRs never read it and never compare passwords.
    - The cached client is not used: right after Create publishes the Secret, the reconciler requeues immediately. A stale cache would then report "Secret missing" and trigger a needless new password, breaking clients that already read the first one.
-   - The Secret is trusted only when its controller reference UID equals the MR's UID. Otherwise the result is error `SecretConflict`: the password is never regenerated, and the Secret is never treated as the record of the last applied password.
+   - The Secret is trusted only when its controller reference UID equals the MR's UID. A Secret that exists but is not controlled by the MR is error `SecretConflict` (`Ready=False`) for every User, jwt users included: the password is never regenerated, and the Secret is never treated as the record of the last applied password.
    - Its `password` key holds the password that was last applied. Its `rotationToken` key holds the rotation token that was last applied.
+   - The `passwordSecretRef` Secret is read with the uncached API reader too. A missing Secret or key is `DependencyMissing`; an empty value is `InvalidSpec`.
+   - A password user without `writeConnectionSecretToRef` is `InvalidSpec` in Go as well as in CEL: without a record every reconcile would apply a new password.
 7. Fill `status.atProvider`, late-initialize `settingsProfile`, `defaultRoles` and `defaultDatabase`, and compute whether the user is up to date:
 
 | Aspect | Desired | Observed | Rule |
@@ -1420,8 +1429,8 @@ The re-check above runs first. 81 means the database is gone. The Update returns
 - Desired roles that are not granted are left out, and the provider emits Warning event `DefaultRoleNotGranted` naming them. It does not loop on 512.
 - Once a `RoleGrant` grants such a role, the next Observe sees the larger set and re-applies `DEFAULT ROLE`. A role granted to a `Listed` user does not become default by itself [V 25.3, 25.3.3, 26.6, 26.8].
 - Server versions differ when a role is revoked:
-  - On 26.6 and 26.8, `REVOKE` removes the role from `default_roles_list`, and a later `GRANT` does not restore it.
-  - On 25.3 the stale entry stays in the list [V].
+  - On 25.8, A26.3, A26.6 and 26.8, `REVOKE` removes the role from `default_roles_list`, and a later `GRANT` does not restore it.
+  - On 25.3 (25.3.3) the stale entry stays in the list, and a later `GRANT` makes the role default again [V all].
 
   Because the provider compares against desired ∩ granted and re-applies on drift, both behaviours converge.
 
@@ -1495,6 +1504,7 @@ CREATE USER `name` IDENTIFIED WITH sha256_hash BY '<hash>' SALT '<salt>'
 - After success:
   - read back `id` and set the `owned-id` annotation ([4.2](#42-ownership));
   - return `ConnectionDetails` ([9.5](#95-connection-secrets)).
+- **Re-creating a user with a generated password.** When the user was dropped out of band and no rotation is pending (no `generate.rotationToken`, or the one the trusted connection Secret records), the recorded password is applied again, so clients keep working. With a pending rotation, or without a record, a new password is generated. `passwordSecretRef` always applies the desired value.
 
 **Update.** Only the aspects that drifted are sent, in at most two statements:
 
@@ -1505,11 +1515,11 @@ ALTER USER `name` DEFAULT ROLE {ALL | NONE | `r1`, `r2` | ALL EXCEPT `r1`}
 
 - `ALTER USER ... IDENTIFIED WITH` replaces **all** authentication methods. That also removes extra methods added with `ADD IDENTIFIED` and clears `VALID UNTIL` [V].
 - `HOST` and `SETTINGS` replace the old values. `SETTINGS NONE` works [V 25.3, 25.3.3, 26.6, 26.8].
-- `DEFAULT ROLE` is kept separate so that an error in it does not block the other changes.
+- `DEFAULT ROLE` is kept separate so that an error in it does not block the other changes. When the first statement changes the password, `DEFAULT ROLE` is deferred to the next reconcile: crossplane-runtime publishes connection details only after Update succeeds, so the new password must never wait on a statement that may fail. Without a password change both statements run, each after `VerifyOwned`.
 - If the password changed, Update returns the new `password` (and, for `generate`, the new `rotationToken`) in `ConnectionDetails`. crossplane-runtime publishes them after Update returns. If the ALTER succeeds and publishing fails, the next Observe still sees the old `rotationToken` (or a mismatched password) in the Secret and rotates again. Server and Secret converge after the first successful publish.
-- **Switching from password to jwt.** Update returns `password: nil` and `rotationToken: nil` in `ConnectionDetails`. The local Secret publisher applies a JSON merge patch, and a null value removes the key [C]. An integration test confirms it [T].
+- **Switching between password and jwt.** While the switch is pending, Observe keeps the old method's keys (`password` and `rotationToken`, or `jwtProcessor`) in the details, so a failed ALTER never strips the Secret. Update returns them as `nil` after the ALTER succeeds: the local Secret publisher applies a JSON merge patch, and a null value removes the key [C; V A26.3, A26.6]. Otherwise Observe removes stale keys that the Secret still holds, for example `rotationToken` after `generate.rotationToken` is unset. Keys that the Secret does not hold are never set to `nil`, so an unchanged user publishes no change.
 
-**Delete:** ``DROP USER IF EXISTS `name` ``. This is only reached for owned users: [4.2](#42-ownership) turns every non-owned case into `ResourceExists=false` while the MR is being deleted.
+**Delete:** ``DROP USER IF EXISTS `name` ``. This is only reached for owned users: [4.2](#42-ownership) turns every non-owned case into `ResourceExists=false` while the MR is being deleted. Delete re-checks ownership first (`VerifyOwned`) and drops only the MR's own user. A deleting MR without `Delete` in its management policies is orphaned in Observe, and Delete itself refuses then (D-26).
 
 **Connection details from Observe.** Observe returns the same full set as Create and Update. For password users it copies the current `password` and `rotationToken` from the existing connection Secret. The publisher's equality check then sees no change and does not patch the Secret on every poll.
 
@@ -1529,15 +1539,16 @@ DROP ROLE IF EXISTS `name`
 - **Name collision.** If a user with the same name exists, the result is error `NameCollision`, both before Create and in Observe. ClickHouse lets a user and a role share a name, even across storages. GRANT and REVOKE then resolve the grantee user-first, so grants meant for the role would land on the user [V 25.3, 25.3.3, 26.6, 26.8]. The check is skipped while the MR is being deleted.
 - `DROP ROLE` removes the role from every grantee and from every `default_roles_list` [V 25.3, 25.3.3, 26.6, 26.8]. This is the expected cascade.
 - v1 has nothing to update.
+- **Second guards (D-26).** A deleting Role without `Delete` in its management policies is orphaned in Observe (Warning event `Orphaned`, no SQL), and Delete does nothing without that policy. Delete runs `VerifyOwned` immediately before the `DROP`. Create refuses without `Create` in the policies. `status.atProvider.id` and `storage` are filled even when Observe fails (for example `NotOwned`).
 
 ### 5.6 Grant
 
 **Privilege catalogue.** Per client, the provider caches `SELECT privilege, aliases, level, parent_group FROM system.privileges`. It is re-read when the server version changes.
 
 - The table is readable without extra grants [V].
-- It has 206 rows on 25.3, 211 on 25.8, 233 on A26.3, 246 on A26.6 and 248 on 26.8 [V].
-- From it the provider builds a tree using `parent_group`. Leaves are privileges that are no one's parent.
-- Leaves with a NULL `level` are treated as GLOBAL. On every version tested that is only `SHOW FILESYSTEM CACHES`, plus the pseudo-privilege `NONE`, which is rejected as input [V all].
+- It has 206 rows on 25.3, 211 on 25.8, 233 on A26.3, 246 on A26.6 and 248 on 26.8 [V all].
+- From it the provider builds a tree using `parent_group` and compares **access flags** (D-33). Every privilege with a `level` carries a flag of its own; a group (NULL `level`) carries none. A privilege grants its own flag and the flags of all its descendants. Most privileges with a level are leaves, but not all: `CREATE ARBITRARY TEMPORARY TABLE` carries a flag besides that of its only child `CREATE TEMPORARY TABLE`. Granting every leaf under `CREATE` ON `*.*` therefore stores eight rows instead of one `CREATE` row, and after `REVOKE CREATE TEMPORARY TABLE` from a holder of `CREATE ARBITRARY TEMPORARY TABLE` the remaining flag is invisible in `system.grants` (`SHOW GRANTS` prints `USAGE`) [V all]. A Grant can neither see nor revoke that flag; this is a server limitation.
+- A privilege that carries no flag grants nothing and is rejected as input: on every version tested that is `SHOW FILESYSTEM CACHES` (NULL level and no children; `GRANT SHOW FILESYSTEM CACHES ON *.*` stores nothing [V 25.3.3, 26.8]) and the pseudo-privilege `NONE` [V all].
 
 **Unmanaged privileges: source privileges** (D-9). Source privileges cannot be modelled consistently across versions:
 
@@ -1556,17 +1567,17 @@ A new leaf of that shape in a future version is treated as unmanaged until the a
 
 **Normalisation.**
 
-1. **Canonicalise.** Upper-case each input, collapse spaces, and match it case-insensitively against `privilege` or any `aliases` entry. The result is the canonical name; camel-case names such as `dictGet` are kept. An unknown name, `NONE` and any unmanaged privilege are `InvalidSpec`.
+1. **Canonicalise.** Upper-case each input, collapse spaces, and match it case-insensitively against `privilege` or any `aliases` entry. The result is the canonical name; camel-case names such as `dictGet` are kept. An unknown or ambiguous name (on 25.3 `ALTER TABLE MODIFY QUERY` is an alias of two privileges), a privilege that grants nothing and any unmanaged privilege are `InvalidSpec`.
 2. **Target level.** `*.*` is GLOBAL, `db.*` is DATABASE, `db.t` is TABLE and `db.t(cols)` is COLUMN.
-3. **Expand.** `leaves(p)` is every leaf under `p` (or `p` itself if it is a leaf). Keep only the leaves applicable at the target level:
-   - GLOBAL: leaf levels GLOBAL, DATABASE, TABLE, VIEW, DICTIONARY, COLUMN;
+3. **Expand.** `flags(p)` is `p` itself if it has a level, plus every descendant that has one. Keep only the flags applicable at the target level:
+   - GLOBAL: flag levels GLOBAL, DATABASE, TABLE, VIEW, DICTIONARY, COLUMN;
    - DATABASE: DATABASE, TABLE, VIEW, DICTIONARY, COLUMN;
    - TABLE: TABLE, VIEW, DICTIONARY, COLUMN;
    - COLUMN: COLUMN only.
 
-   Unmanaged leaves are always dropped. A desired privilege with no applicable leaf is `InvalidSpec` (e.g. `CREATE DATABASE` on a table, which the server would reject with 509).
-4. **Unsupported levels.** Leaves of the levels NAMED_COLLECTION, USER_NAME, TABLE_ENGINE, DEFINER and SOURCE are rejected in v1. `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges [V 25.3, 25.3.3, 26.6, 26.8]. `ALL` on `*.*` is therefore rejected. It would fail anyway for an identity bootstrapped with `access_management`, which has no named-collection rights.
-5. **The model was checked against the server.** Expanding `ALL`, `ALTER`, `SHOW`, `CREATE`, `DROP`, `SYSTEM`, `INTROSPECTION`, `SOURCES` and `dictGet` with these rules matches the server exactly at DATABASE and TABLE level on 25.3, 26.6 and 26.8. At GLOBAL level the only differences are unsupported-level and unmanaged leaves and `SHOW FILESYSTEM CACHES` [V]. The server stores grants in a **version-dependent** group-compressed form. For example, `GRANT ALTER ON app.*` is stored as one `ALTER` row on 25.3 and 26.6, and as `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8 [V]. The provider always compares expanded leaves, never the stored form. Recorded `system.privileges` fixtures for every version in the CI matrix keep the model honest (**OQ-14**).
+   Unmanaged flags are always dropped. A desired privilege with no applicable flag is `InvalidSpec` (e.g. `CREATE DATABASE` on a table, which the server would reject with 509).
+4. **Unsupported levels.** Flags of the levels NAMED_COLLECTION, USER_NAME, TABLE_ENGINE, DEFINER and SOURCE are rejected in v1. `CREATE USER`, `ALTER USER`, `DROP USER` and `CREATE ROLE` are USER_NAME-level privileges [V 25.3, 25.3.3, 26.6, 26.8]. `ALL` on `*.*` is therefore rejected. It would fail anyway for an identity bootstrapped with `access_management`, which has no named-collection rights.
+5. **The model was checked against the server** on all five images at GLOBAL, DATABASE, TABLE and COLUMN level, for `ALL`, `ALTER`, `CREATE`, `DROP`, `SYSTEM`, `SHOW`, `dictGet`, `SELECT(a)` and `INTROSPECTION`, including the provider's own GRANT and REVOKE statements run by an administrator [V all]. The server stores grants in a **version-dependent** group-compressed form. For example, `GRANT ALTER ON app.*` is stored as one `ALTER` row on 25.3 and 26.6, and as `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8 [V]. The provider always compares expanded flags, never the stored form. The `system.privileges` catalogue of every version in the CI matrix is recorded in `internal/clients/clickhouse/sqlx/testdata/privileges/<version>.tsv`, and `TestGrantPrivilegeCatalogue` fails on any difference from the server (OQ-14, closed).
 
 **Observe**
 
@@ -1578,13 +1589,16 @@ A new leaf of that shape in a future version is treated as unmanaged until the a
 2. **Read the rows:**
 
    ```sql
-   SELECT access_type, database, table, column, is_partial_revoke, grant_option
-          [, access_object] [, is_wildcard]          -- when the columns exist (section 7)
+   SELECT toString(access_type), ifNull(database, ''), ifNull(table, ''), ifNull(column, ''),
+          toUInt8(is_partial_revoke), toUInt8(grant_option)
+          [, ifNull(access_object, '')] [, toUInt8(is_wildcard)]   -- when the columns exist (section 7)
    FROM system.grants
    WHERE user_name = {grantee:String}                -- or: role_name = {grantee:String}
    ```
 
-3. **Wildcard check on servers without `is_wildcard`** (25.3, 25.8, A26.3, A26.6). A wildcard grant (`ON team_*.*`, `ON app.ev*`) is stored with the prefix as a plain name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant on a database or table with that name [V all]. The provider then runs ``SHOW GRANTS FOR <QuoteIdent(grantee)>`` and scans each `ON` object, aware of backtick quoting, for an unquoted `*` that directly follows an identifier character or a closing backtick (with `sqlx.Lex`: a `*` token adjacent to the preceding word or quoted identifier). `SHOW GRANTS` prints wildcards unquoted (`team_*.*`, `` `team-a`*.* ``, `app.ev*`) and literal names with `*` quoted (`` `odd*name`.* ``) [V all]. If any wildcard is found, the result is error `Unsupported: grantee <g> has wildcard grants; managing its grants needs system.grants.is_wildcard (ClickHouse 26.8 or later)`. No SQL is sent.
+   An empty identifier in `GRANT` is a syntax error (62) on every image, so `''` only ever stands for NULL. `access_type` is an `Enum16`; `access_object` is `String` on 26.8 and `Nullable(String)` elsewhere [V all].
+
+3. **Wildcard check on servers without `is_wildcard`** (25.3, 25.8, A26.3, A26.6). A wildcard grant (`ON team_*.*`, `ON app.ev*`) is stored with the prefix as a plain name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant on a database or table with that name [V all]. The provider then runs ``SHOW GRANTS FOR <QuoteIdent(grantee)>`` and scans each `ON` object, aware of backtick quoting, for an unquoted `*` that directly follows an identifier character or a closing backtick (with `sqlx.Lex`: a `*` token adjacent to the preceding word or quoted identifier). `SHOW GRANTS` prints wildcards unquoted (`team_*.*`, `` `team-a`*.* ``, `app.ev*`) and literal names with `*` quoted (`` `odd*name`.* ``) [V all]. An object is the run of tokens without spaces after a top-level `ON`, so a database named like a keyword (`ON TO*.*`) is still read. Objects without a database part (`ON *`, `ON svc_*`: user and role DDL, named collections, table engines, definers, sources) are not counted: their rows are of unsupported levels and ignored anyway, and a grantee with prefix-scoped `CREATE USER` stays manageable on 25.3. If any other wildcard is found, the result is error `Unsupported: grantee <g> has wildcard grants; managing its grants needs system.grants.is_wildcard (ClickHouse 26.8 or later)`. No SQL is sent. While the MR is being deleted this orphans it (Warning event `Orphaned`, nothing revoked, D-34). On 25.3.3 and 26.8, `GRANT ... ON team_*.t` and `ON team_*.ev*` are stored as a table prefix in the literal database `team_`, and `SHOW GRANTS` prints `` team_.t* `` (a server quirk); `GRANT SELECT(a) ON app.ev*` is a syntax error (62) [V 25.3.3, 26.8].
 
 **Rows that are ignored.** These rows are never counted and never revoked:
 
@@ -1598,12 +1612,12 @@ A new leaf of that shape in a future version is treated as unmanaged until the a
 - **Covering rows** are grant rows at T or above it: global; database = db or a wildcard prefix of db; table = t or a wildcard prefix of t; for a COLUMN target, column ∈ cols.
 - **Exact rows** are non-wildcard grant rows at exactly T. For a COLUMN target that means `column ∈ cols`.
 
-Expand each row's `access_type` into applicable leaves. Then:
+Expand each row's `access_type` into applicable flags. Then:
 
-- `desired` = the expanded desired leaves.
-- `effective` = leaves L for which some covering row R grants L, and no privilege-revoke row for L lies on the path below R down to and including T. For COLUMN targets this holds per column, and L counts only if it is effective for every listed column.
-- `effectiveGO` = leaves L for which some covering row with `grant_option = 1` grants L, and no revoke row of either kind for L lies on that path.
-- `exact` = leaves from exact rows. `exactGO` = those whose row has `grant_option = 1`.
+- `desired` = the expanded desired flags.
+- `effective` = flags L for which some covering row R grants L, and no privilege-revoke row for L lies on the path below R down to and including T. For COLUMN targets this holds per column, and L counts only if it is effective for every listed column.
+- `effectiveGO` = flags L for which some covering row with `grant_option = 1` grants L, and no revoke row of either kind for L lies on that path.
+- `exact` = flags from exact rows. `exactGO` = those whose row has `grant_option = 1`.
 - Revoke rows strictly **below** T do not affect T. They are another target's business.
 
 Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows are `(SELECT, app, -, p=0)` and `(SELECT, app.t, p=1)`. A Grant of `SELECT ON app.t` therefore sees SELECT as **not** effective. The grantee really cannot read `app.t` [V 25.3, 25.3.3, 26.6, 26.8].
@@ -1612,6 +1626,7 @@ Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows ar
 
 - Normally: `exact ≠ ∅` **or** `desired ⊆ effective`.
 - **While the MR is being deleted** (`meta.WasDeleted`): `(desired ∩ exact) ≠ ∅`. Coverage and foreign privileges are ignored. Otherwise a Grant whose privileges are covered by a broader grant, or one with a foreign privilege at the same target, would report "exists" forever while Delete revokes nothing, and the finalizer would never be released.
+- **Implementation.** The controller computes the plans of Delete and of Create/Update below and uses "the delete plan is not empty" while deleting and "the apply plan is empty" for ResourceUpToDate. In every state the server can reach this equals the formulas here (absorption rules out the other states), and it can never loop on updates that change nothing.
 
 **ResourceUpToDate** = all of:
 
@@ -1637,9 +1652,9 @@ Example: after `GRANT SELECT ON app.*` and `REVOKE SELECT ON app.t`, the rows ar
 **Never create partial revokes.**
 
 - A REVOKE at a narrow level under a broader grant creates a partial revoke. It removes part of someone else's grant [V].
-- So the provider only REVOKEs leaves that are present in exact rows **and** not covered by a broader row.
-- A leaf shadowed by a broader grant is left alone. The effective state is the same.
-- The one exception is grant option: `REVOKE GRANT OPTION FOR` on an exact row whose leaf is covered above without grant option removes the narrow row cleanly [V 25.3, 25.3.3, 26.6, 26.8]. With no narrow row and a broader row that has grant option, the same statement creates a partial revoke of the grant option, so it is not issued then.
+- So the provider only REVOKEs flags that are present in exact rows **and** not covered by a broader row.
+- A flag shadowed by a broader grant is left alone. The effective state is the same.
+- The one exception is grant option: `REVOKE GRANT OPTION FOR` on an exact row whose flag is covered above without grant option removes the narrow row cleanly [V 25.3, 25.3.3, 26.6, 26.8]. With no narrow row and a broader row that has grant option, the same statement creates a partial revoke of the grant option, so it is not issued then.
 - **Side effect to know:** any GRANT the provider issues at T erases third-party partial revokes at T and below T. Re-running `GRANT SELECT ON app.*` clears every partial revoke under `app.*` [V 25.3, 25.3.3, 26.6, 26.8]. This is how a partial revoke at T is repaired, and it is documented.
 
 **Create and Update** (idempotent statements, in this order):
@@ -1651,22 +1666,24 @@ GRANT <toGrant> ON <target> TO `grantee` [WITH GRANT OPTION]
 REVOKE <(exact − desired) not covered above> ON <target> FROM `grantee`
 -- 3. foreign privileges at the target that are covered above without grant option,
 --    but hold grant option at the target
-REVOKE GRANT OPTION FOR <those leaves> ON <target> FROM `grantee`
--- 4. only if withGrantOption = false: desired exact leaves holding grant option,
+REVOKE GRANT OPTION FOR <those flags> ON <target> FROM `grantee`
+-- 4. only if withGrantOption = false: desired exact flags holding grant option,
 --    when no broader row holds grant option for them
-REVOKE GRANT OPTION FOR <those leaves> ON <target> FROM `grantee`
+REVOKE GRANT OPTION FOR <those flags> ON <target> FROM `grantee`
 ```
 
-- `toGrant = (desired − effective) ∪ (withGrantOption ? desired − effectiveGO : ∅)`. With `withGrantOption` the statement carries `WITH GRANT OPTION`. A leaf already effective without grant option must be granted again with it; a separate narrow row with grant option is then stored [V 25.3, 25.3.3, 26.6, 26.8].
-- The target is written as `*.*`, `` `db`.* ``, `` `db`.`t` ``, or column form ``SELECT(`a`, `b`), INSERT(`a`, `b`) ON `db`.`t` ``.
+- `toGrant = (desired − effective) ∪ (withGrantOption ? desired − effectiveGO : ∅)`. With `withGrantOption` the statement carries `WITH GRANT OPTION`. A flag already effective without grant option must be granted again with it; a separate narrow row with grant option is then stored [V 25.3, 25.3.3, 26.6, 26.8]. `GRANT ... WITH GRANT OPTION` at T also removes a grant-option partial revoke at T, which a plain GRANT keeps [V all].
+- Steps 3 and 4 have the same statement shape and run as one `REVOKE GRANT OPTION FOR`.
+- The target is written as `*.*`, `` `db`.* ``, `` `db`.`t` ``, or column form ``SELECT(`a`, `b`), INSERT(`a`, `b`) ON `db`.`t` ``. In a REVOKE every privilege carries its own column list (``REVOKE SELECT(`a`), INSERT(`b`) ON ...``), which every image accepts [V all].
+- Every write repeats the policy checks, re-reads the rows (a third party could have changed them since Observe) and, only if the plan is not empty, re-checks the grantee binding immediately before the statements ([4.3](#43-grants-and-role-grants-grantee-binding)). Create and Update also refuse when their management policy is missing (D-26).
 - A REVOKE of a privilege that is not held is a no-op [V].
 
-**Delete.** For each desired leaf in an exact row:
+**Delete.** For each desired flag in an exact row:
 
-- not covered above: `REVOKE <leaf> ON <target> FROM grantee`;
-- covered above without grant option, while the exact row has grant option: `REVOKE GRANT OPTION FOR <leaf> ON <target> FROM grantee`, which removes the narrow row.
+- not covered above: `REVOKE <flag> ON <target> FROM grantee`;
+- covered above without grant option, while the exact row has grant option: `REVOKE GRANT OPTION FOR <flag> ON <target> FROM grantee`, which removes the narrow row.
 
-192 and 511 count as already gone. The next Observe uses the deletion rule for ResourceExists.
+192 and 511 count as already gone. The next Observe uses the deletion rule for ResourceExists. A Grant covered by a broader grant is released at once, with nothing revoked. While deleting, every failed check (policy, binding, invalid spec, wildcard grants on a server without `is_wildcard`) orphans the MR and leaves the grants in place ([4.3](#43-grants-and-role-grants-grantee-binding)).
 
 **Policy** ([5.8](#58-policy-evaluation)): the grantee matches the user or role patterns; the database matches `databaseNamePatterns`, or is `"*"` with `allowGlobalGrants`; `withGrantOption` needs `allowGrantOption`.
 
@@ -1676,7 +1693,8 @@ The **privilege ceiling** comes from the server. The identity can only grant wha
 
 **Observe**
 
-1. Grantee checks as for Grant: `AmbiguousGrantee` for a role grantee that shares its name with a user, the storage of the grantee from `system.users` or `system.roles`, `SelfModification` for `currentUser()`, and an owned grantee when writes are allowed ([4.3](#43-grants-and-role-grants-grantee-binding)). `memberOf` itself needs no owner: it may be a role from `users.d` that `grantableRoles` lists.
+0. Name checks first ([5.8](#58-policy-evaluation)), also while deleting: the grantee against the user or role patterns, `memberOf` against `grantableRoles`. When the management policies allow Create or Update, the `adminOption` write check runs next. Both run before any SQL. A role granted to itself is `InvalidSpec`: 26.8 refuses it with 36, the other versions store a useless self-membership (A53).
+1. Grantee checks as for Grant: `AmbiguousGrantee` for a role grantee that shares its name with a user, the storage of the grantee from `system.users` or `system.roles`, `SelfModification` for `currentUser()`, and an owned grantee when writes are allowed ([4.3](#43-grants-and-role-grants-grantee-binding)). `memberOf` itself needs no owner: it may be a role from `users.d` that `grantableRoles` lists. It is read from `system.roles`; a missing `memberOf` is `DependencyMissing` when writes are allowed, and for observe-only or deleting MRs the RoleGrant is reported as absent (dropping a role removes it from every grantee). `memberOf` is always resolved as a role: a same-named user does not capture it, and a quoted keyword such as `` `SELECT` `` is granted as a role [V all]. Only role grantees need the `AmbiguousGrantee` check.
 2. Read the row:
 
    ```sql
@@ -1686,7 +1704,7 @@ The **privilege ceiling** comes from the server. The identity can only grant wha
      AND user_name = {grantee:String}                -- or: role_name = {grantee:String}
    ```
 
-   A row means it exists. It is up to date when `with_admin_option == adminOption`.
+   A row means it exists. It is up to date when `with_admin_option == adminOption`. `user_name` and `role_name` are `Nullable(String)`; `with_admin_option` and `granted_role_is_default` are `UInt8` on every version, and rows of role grantees have `granted_role_is_default = 1` [V all].
 
 **Grantee storage rule.** The server rejects `GRANT <role> TO <users_xml user>` with 495 [V], so a `users_xml` grantee gives `ReadOnlyStorage`. Separately, a users.d user whose `grants:` configuration references an SQL role loses it at startup, and the server logs "Role ... is not defined and will be ignored" [V A26.6]. Granting a role from users.d to an **SQL** user works and survives restarts [V]. That is the intended way to combine roles managed in configuration with users managed by the provider. A role from users.d granted to an SQL user also becomes one of its default roles automatically, unless the user's `defaultRoles` is `Listed` or `None`.
 
@@ -1695,9 +1713,13 @@ The **privilege ceiling** comes from the server. The identity can only grant wha
 **Update:**
 
 - to add the admin option: ``GRANT `memberOf` TO `grantee` WITH ADMIN OPTION``;
-- to remove it: ``REVOKE ADMIN OPTION FOR `memberOf` FROM `grantee` ``.
+- to remove it: ``REVOKE ADMIN OPTION FOR `memberOf` FROM `grantee` ``. It keeps the membership, and it is a no-op when the grantee holds no admin option or no membership. A plain `GRANT` would keep an existing admin option [V all].
 
-**Delete:** ``REVOKE `memberOf` FROM `grantee` ``. Revoking a role the grantee does not hold is a no-op [V]. 192 and 511 count as already gone. On 26.x the revoke also removes the role from the grantee's `default_roles_list` ([5.4](#54-user)).
+Create and Update re-check the `adminOption` write check and the grantee binding immediately before the statement. Every write needs the matching management policy and a binding with an owner, so an observe-only RoleGrant never writes, even if crossplane-runtime called Create, Update or Delete (D-26).
+
+**Delete:** ``REVOKE `memberOf` FROM `grantee` ``, exactly this membership and nothing else: the grantee's other memberships, its privileges and its default roles are never changed. Revoking a role the grantee does not hold is a no-op [V]. 192 and 511 count as already gone. The name checks and the grantee binding are repeated immediately before the REVOKE. A deleting RoleGrant without `Delete` in its management policies is orphaned in Observe (Warning event `Orphaned`, no SQL), and Delete does nothing then (D-26). On every version except 25.3 the revoke also removes the role from the grantee's `default_roles_list` ([5.4](#54-user)).
+
+**Not detected:** role-grant cycles (`GRANT a TO b`, `GRANT b TO a`), which every version accepts [V all], and two RoleGrants of the same membership, which fight like two Grants of the same target (OQ-1): deleting one revokes the membership until the other grants it again on its next poll.
 
 **Policy** ([5.8](#58-policy-evaluation)): `memberOf` matches `grantableRoles`; the grantee matches the user or role patterns; `adminOption` needs `allowAdminOption`.
 
@@ -1948,6 +1970,8 @@ Capabilities are detected per client entry and refreshed every 10 minutes, which
 | `ALTER MODIFY DATABASE COMMENT` privilege | no | yes | yes | yes | yes |
 | Source privileges | children of `SOURCES` | `READ`/`WRITE` + `access_object` | same | same | same |
 | `system.privileges` rows | 206 | 211 | 248 | 233 | 246 |
+| `REVOKE` leaves the role in `default_roles_list` | yes | no | no | no | no |
+| `GRANT r TO r` (self-grant) | stored | stored | refused (36) | stored | stored |
 
 **Supported versions** (D-17). Upstream 25.3 and later; Antalya 26.3 and later. Older servers are untested and not supported. 25.3 stays in the list on purpose: it is still widely deployed, including early patch releases, so CI tests the early patch `25.3.3.42` rather than the latest 25.3 patch. The matrix above holds for 25.3.3.42 as well [V 25.3.3]. On 25.3, database comments cannot be changed after creation, wildcard coverage is not available, and `VALID UNTIL` is visible only in `SHOW CREATE USER`. The README carries this matrix.
 
@@ -2096,10 +2120,10 @@ In `users.d` the same lines go under `grants: {query: [...]}`; the prefix syntax
 | User, Role, Grant, RoleGrant | `GRANT SELECT ON system.user_directories` | storage detection |
 | `spec.cluster` | `GRANT SELECT ON system.clusters` | topology check; without it every cluster MR fails with 497 [V 26.8] |
 | User | ``GRANT CREATE USER, ALTER USER, DROP USER ON `<prefix>`*`` (or `ON *.*`); `GRANT SHOW USERS, SHOW ROLES ON *.*` | DDL [V all for the prefix form]. `SHOW USERS` opens `system.users` and `SHOW CREATE USER`. `SHOW ROLES` is for the name-collision check. |
-| User with `settingsProfile` | `GRANT SELECT ON system.settings_profile_elements` | profile drift (fails with 497 without it [V]) |
+| User with `settingsProfile` | `GRANT SELECT ON system.settings_profile_elements` | profile drift (fails with 497 without it [V]). Users that do not set `settingsProfile` need no grant: late initialization skips the read on 497 ([5.4](#54-user)). |
 | User with `Listed` default roles, RoleGrant | `GRANT SELECT ON system.role_grants`. For each grantable role from users.d: `GRANT <role> TO <id> WITH ADMIN OPTION`, with the role among the identity's default roles. `ROLE ADMIN ON *.*` only if RoleGrant must grant roles the provider creates. | membership reads; server-enforced grantable set [V 26.8, A26.6] |
 | Role | ``GRANT CREATE ROLE, DROP ROLE ON `<prefix>`*`` (or `ON *.*`); `GRANT SHOW ROLES, SHOW USERS ON *.*` | DDL [V all for the prefix form]; name-collision check (`ALTER ROLE` once role settings exist) |
-| Grant | `GRANT SELECT ON system.grants`; `GRANT SHOW USERS, SHOW ROLES ON *.*`; plus every delegable privilege `WITH GRANT OPTION` at the widest scope it may delegate, e.g. `GRANT SELECT, INSERT, SHOW TABLES ON team_*.* TO <id> WITH GRANT OPTION` | server-enforced ceiling; grantee checks; `SHOW GRANTS FOR` on servers without `is_wildcard` |
+| Grant | `GRANT SELECT ON system.grants`; `GRANT SHOW USERS, SHOW ROLES ON *.*`; plus every delegable privilege `WITH GRANT OPTION` at the widest scope it may delegate, e.g. `GRANT SELECT, INSERT, SHOW TABLES ON team_*.* TO <id> WITH GRANT OPTION` | server-enforced ceiling; grantee checks; `SHOW GRANTS FOR` on servers without `is_wildcard`. These are enough for the column probes, the row reads and `SHOW GRANTS FOR` [V all]. The identity can revoke only what it holds `WITH GRANT OPTION` too: a foreign privilege outside that ceiling at a Grant's target cannot be revoked (497, `PermissionDenied`). |
 | Database | `GRANT CREATE DATABASE, DROP DATABASE, SHOW TABLES ON <prefix>*.*`, e.g. `ON team_*.*` (wildcard grants work [V]); on 25.8 and later also `ALTER MODIFY DATABASE COMMENT` on the same scope (the privilege does not exist on 25.3, and granting it fails with 62) | DDL plus the emptiness check. Do **not** grant `DROP TABLE`: a single server then refuses to drop non-empty databases [V]. |
 | Database with `spec.cluster` | `GRANT CLUSTER ON *.*` [V]; `GRANT SELECT ON system.clusters` (above); for Update and Delete also `GRANT REMOTE ON *.*` (stored as `READ ON REMOTE` and `WRITE ON REMOTE` on 25.8 and later) | `ON CLUSTER`; the per-host ownership check through `clusterAllReplicas(..., view(...))`, which needs nothing else [V 25.3, 25.8, 26.8]. `REMOTE` also allows the `remote()` and `cluster()` table functions toward arbitrary hosts. Without it, cluster Databases can be created and observed, but every comment change and Delete fails with `PermissionDenied` ([9.6](#96-recommended-management-policies)). |
 
@@ -2118,6 +2142,7 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
 - `protocol` uses the API casing: `Native` (D-22). `tls` is `"true"` or `"false"`.
 - Key names are exported constants in `apis/v1alpha1`, so compositions can rely on them. The `xpv2` constants are used where they exist.
 - For password users the Secret is also the provider's record of the last applied password and rotation token. It is read with the uncached API reader, trusted only when controlled by the MR ([5.4](#54-user)), and its name is immutable.
+- While a switch between password and jwt is pending, the old method's keys stay in the Secret; they are removed once the ALTER has succeeded. Stale keys, for example `rotationToken` after `generate.rotationToken` is unset, are removed by the next Observe ([5.4](#54-user)).
 
 ### 9.6 Recommended management policies
 
@@ -2140,14 +2165,14 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
 - **Error redaction.** No hash, salt, password or token appears in any returned error, condition message or event. Covers server syntax errors that echo the statement, and transport errors with HTTP bodies.
 - **SQL builders.** Golden strings per kind and per drift combination: CREATE (with `UUID`, `DEFAULT ROLE ALL EXCEPT`, `DEFAULT DATABASE`), ALTER, GRANT, REVOKE, `REVOKE GRANT OPTION FOR`, `DEFAULT ROLE`, `ON CLUSTER`, `clusterAllReplicas`.
 - **Password hash.** The test vector from [3.5](#35-user). A test also asserts that the salt is appended as hex text, never as decoded bytes.
-- **`SHOW CREATE USER` parser.** Fixtures captured through the driver from every version in the CI matrix:
+- **`SHOW CREATE USER` parser.** Fixtures captured through the driver from every version in the CI matrix (`internal/clients/clickhouse/sqlx/testdata/user/<version>.txt`, recorded by `TestUser` with `XPCH_UPDATE_FIXTURES=1`):
   - escaped claims and processors;
   - multiple methods, with `VALID UNTIL` between methods;
   - `HOST` variants, including `HOST NONE`;
   - `DEFAULT DATABASE`, `DEFAULT ROLE`, `SETTINGS PROFILE`;
   - backtick names with escapes.
 - **Claims canonicalisation and host normalisation**, including mask notation, `/32` and `/128`, the full-range rule and case-sensitive names.
-- **Privilege model.** Uses recorded `system.privileges` dumps (`testdata/privileges/<version>.tsv`, one per CI version) and recorded `system.grants` rows. Cases:
+- **Privilege model.** Uses recorded `system.privileges` dumps (`testdata/privileges/<version>.tsv`, one per CI version, recorded by `TestGrantPrivilegeCatalogue` with `XPCH_RECORD_PRIVILEGES=1`) and `system.grants` rows captured from every version. Cases:
   - `ALL ON db.*`, `ALL ON db.t`, column grants, version-dependent compression (`ALTER`);
   - merged grants;
   - **revoke-aware coverage**: a partial revoke at T under a broad grant, revokes below T, column revokes;
@@ -2216,7 +2241,7 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
 - **Scenarios** (all images unless noted):
   1. Full lifecycle per kind through the real external clients: Observe → Create → Observe up to date → drift injected with admin SQL → Update → Delete.
   2. jwt User with processor and claims (object form) round-trip (Antalya). Cross-processor login fails once the processor is pinned. On upstream, the probe reports unsupported (36 or 62) and no SQL is sent.
-  3. Password user (`sha256_hash`): log in with the published password; rotate it with `rotationToken`; delete the Secret and see `PasswordRegenerated`; switch to jwt (Antalya) and check that the `password` key is removed [T].
+  3. Password user (`sha256_hash`): log in with the published password; rotate it with `rotationToken`; delete the Secret and see `PasswordRegenerated`; switch to jwt (Antalya) and check that the `password` key is removed.
   4. Ownership:
      - collision with a pre-existing user gives `NotOwned`;
      - adopt by UUID with and without policy, and with a wrong UUID;
@@ -2257,7 +2282,15 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
   13. Names: `@`, `.`, quote, backslash, TAB, backtick, `*` and Unicode through every kind.
   14. Redaction: a forced syntax error on an `IDENTIFIED` statement leaves no hash or salt in conditions or events.
   15. Shared foundations (`TestAccessFoundation`, all images, minimal prefix-scoped identity): capability probes agree with the administrator's view and with section 7; entity reads with adversarial names; the ownership flow of a role (create, lost response recovered through the journal, forged create annotations refused, replacement detected, nothing touched while deleting); the grantee binding; the lexer on `SHOW CREATE USER` and `SHOW GRANTS` read through the driver.
-- **Harness.** `mrHarness[T]` drives any kind's external client like crossplane-runtime's managed reconciler (initializers, references, Observe, Create/Update/Delete, critical annotations, the connection Secret through crossplane-runtime's publisher). `accessFixture` starts a server with the identity of [9.4](#94-minimal-grants-for-the-provider-identity) for every access kind (password on upstream, JWT with two token processors on Antalya) and builds connectors, environments and owned grantee MRs.
+  16. Per kind, on all images with the minimal prefix-scoped identity, through the real external clients:
+      - `TestUser` covers scenarios 2, 3, 4 (users), 7, 8 and 14: the password scheme and lifecycle, `passwordSecretRef`, hosts, default roles, ownership, the provider identity, JWT users (Antalya) and `Unsupported` upstream, and the `SHOW CREATE USER` fixtures;
+      - `TestRole`: lifecycle, out-of-band drops and replacements, adoption, foreign roles, name collisions, users.d roles and users, adversarial names;
+      - `TestRoleGrant`: lifecycle, admin option, role grantees, users.d roles and users, foreign and replaced grantees, a missing `memberOf`, default roles per version, references, import without `Delete`, adversarial names;
+      - `TestGrant` covers scenarios 6 and 13: lifecycle with drift, columns, coverage and partial revokes, merged grants, grant option, delete keeping foreign privileges, wildcards, sources, the server-side ceiling, references, grantees, adversarial names, and the expansion model against the server; `TestGrantPrivilegeCatalogue` compares the recorded catalogues with the servers.
+
+      Each compares the foreign entities (`system.roles`, `system.users`, `system.role_grants`, `SHOW GRANTS` of bystanders) before and after.
+  17. End-to-end (`TestProviderEndToEndAccess`, every image): the provider's real controllers on envtest, wired as in `cmd/provider`, with a closed ClusterProviderConfig policy. A Database, a Role, a User (a generated password upstream, JWT with a pinned processor and claims on Antalya), a Grant on the database for the role and a RoleGrant of the role to the user, through references. The user logs in with the published password or a token (a token without the required claim is refused) and can do exactly what was granted (SELECT and INSERT; CREATE, ALTER, TRUNCATE, DROP, GRANT, CREATE USER and other databases give 497). A foreign privilege added at the Grant's target is revoked. A user, a role and their grants created by an administrator stay byte-identical (`SHOW CREATE`, `SHOW GRANTS`, memberships, UUIDs), although a User, a Grant and a RoleGrant point at the foreign user (`NotOwned`, nothing written). Deleting the MRs revokes and drops only what the provider created, and the foreign user still logs in with its own password. `TestProviderEndToEnd` covers the Database and an observe-only MR.
+- **Harness.** `mrHarness[T]` drives any kind's external client like crossplane-runtime's managed reconciler (initializers, references, Observe, Create/Update/Delete, critical annotations, the connection Secret through crossplane-runtime's publisher). `accessFixture` starts a server with the identity of [9.4](#94-minimal-grants-for-the-provider-identity) for every access kind (password on upstream, JWT with two token processors on Antalya) and builds connectors, environments and owned grantee MRs. The fake Kubernetes API of the harness drops spec fields that crossplane-runtime's server-side apply patch of resolved references does not name, so reference resolution through the generated resolver is exercised by the end-to-end tests on envtest.
 
 ### 10.3 API tests (mandatory)
 
@@ -2273,7 +2306,7 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
 4. Run the provider out of cluster (`go run ./cmd/provider --debug`) against a ClickHouse container.
 5. Assert with `kubectl wait` or chainsaw, including an MRAP that activates `*.clickhouse.m.infrabay.io`.
 
-Installing the real xpkg into kind needs a local registry, so it is deferred.
+Installing the real xpkg into kind needs a local registry, so it is deferred. Meanwhile the end-to-end tests of [10.2](#102-integration-tests-build-tag-integration) (scenario 17) run the provider's controllers, wired as in `cmd/provider`, against envtest and every image.
 
 ---
 
@@ -2286,7 +2319,6 @@ Installing the real xpkg into kind needs a local registry, so it is deferred.
 ├── apis/
 │   ├── generate.go                 # go:generate controller-gen + angryjet
 │   ├── clickhouse.go               # AddToScheme
-│   ├── unreleased-crds/            # generated CRDs of kinds without a controller (envtest only, never packaged)
 │   └── v1alpha1/
 │       ├── doc.go, register.go
 │       ├── providerconfig_types.go # ProviderConfig, ClusterProviderConfig, ProviderConfigUsage, shared types
@@ -2330,7 +2362,7 @@ Installing the real xpkg into kind needs a local registry, so it is deferred.
 - New files carry `// SPDX-License-Identifier: Apache-2.0` and `// Copyright <year> The provider-clickhouse Authors`.
 - Files adapted from crossplane/provider-template or crossplane-contrib/provider-sql keep the "Copyright 2020 The Crossplane Authors" notice in their header, name the upstream file, and state that they were modified, as Apache-2.0 §4(b) and §4(c) require. Today these are `cmd/provider/main.go`, `internal/controller/config/config.go`, `apis/clickhouse.go` and `apis/v1alpha1/register.go`.
 - `NOTICE` lists exactly the files that contain adapted portions. Candidates for future adaptation: the `DB` interface, the error helpers, the password drift pattern, the grant diff helpers and the test scaffolding; each is added to `NOTICE` when it is adapted, not before.
-- **Packaging.** `make generate` writes every CRD into `package/crds` and then moves the CRDs of kinds without a controller to `apis/unreleased-crds`. A unit test (`internal/controller`) fails when `package/crds` and `ManagedKinds` disagree, so a kind can only be packaged together with its controller.
+- **Packaging.** `make generate` writes every CRD into `package/crds`. A unit test (`internal/controller`) fails when `package/crds` and `ManagedKinds` disagree, so a kind can only be packaged together with its controller. Until the four access entity controllers were registered in revision 4, their CRDs were generated into `apis/unreleased-crds` instead.
 - provider-sql's `Setup` dereferences `o.MetricOptions` without a nil check; our version must check.
 
 ### 11.2 Dependencies and versions
@@ -2518,6 +2550,8 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | D-30 | Ownership of grants and role grants | Code review of the access entity foundations: the provider must never grant to or revoke from an access entity it did not create, unless adopted by UUID. | A Grant or RoleGrant writes only when its grantee is owned by a User or Role MR in the same namespace with the same ProviderConfig (a valid claim on the grantee's current UUID), in addition to the name policy. The binding is re-checked before every GRANT and REVOKE. While deleting, an unowned grantee orphans the MR ([4.3](#43-grants-and-role-grants-grantee-binding)). | Grants carry no UUID, so the grantee's claim is the only ownership anchor. Granting to an entity managed elsewhere needs adopting it first; observe-only Grants can still report the grants of any grantee that the name policy allows. |
 | D-31 | Provider flags while an MR is deleted | Review of the namespaced ProviderConfig rules. | A namespaced ProviderConfig forbidden by `--enable-namespaced-provider-configs=false` or `--namespaced-endpoint-pattern` orphans a deleting MR (`OrphanedByPolicy`, no SQL); a live MR still fails with `InvalidConfig`. | Same reasoning as D-20: changing provider flags must never leave finalizers stuck, and orphaning writes nothing. |
 | D-32 | JWT processor names | Code review of the access entity foundations: the server accepts any processor name. | Validated on every config kind (`InvalidSpec` unless a configuration key: a letter or `_`, then letters, digits, `_` or `-`, at most 128 characters), then `allowedJWTProcessors` on a ClusterProviderConfig. | No system table lists the configured processors on Antalya 26.6 [V], so syntax and the policy allow-list are the checks available. |
+| D-33 | Grant comparison model | Implementation of the Grant controller: comparing leaves granted `CREATE` on `*.*` incompletely. | Compare **access flags** (5.6): every privilege with a level carries a flag of its own, a group none, and a privilege grants its own flag and its descendants' flags. | `CREATE ARBITRARY TEMPORARY TABLE` carries a flag besides its only child's, and `SHOW FILESYSTEM CACHES` grants nothing [V all]. Flags are what the server checks, so the comparison matches it on every version; the model was checked against the provider's own statements on all five images. |
+| D-34 | Deleting a Grant whose grantee has wildcard grants, on a server without `system.grants.is_wildcard` | Grant controller review: orphan the MR, or block its deletion with `Unsupported`. | **Orphan** (Warning event `Orphaned`, nothing revoked), like every other failed check while deleting ([4.3](#43-grants-and-role-grants-grantee-binding)). | Coverage cannot be computed there, so a REVOKE could cut a partial revoke into the wildcard grant. Blocking would leave finalizers stuck. To have the privileges revoked, remove the wildcard grants first, or use 26.8. |
 
 ---
 
@@ -2525,7 +2559,7 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 
 | # | Question | Current decision |
 |---|---|---|
-| OQ-1 | Grant semantics: exclusive per exact target (chosen), or additive with a status-tracked applied set? Should overlapping Grants (same grantee and target) be detected across MRs? | Exclusive per target. Overlaps are documented as unsupported. |
+| OQ-1 | Grant semantics: exclusive per exact target (chosen), or additive with a status-tracked applied set? Should overlapping Grants (same grantee and target), or two RoleGrants of the same membership, be detected across MRs? | Exclusive per target. Overlaps are documented as unsupported. |
 | OQ-3 | Wildcard database or table *targets* (`ON team_*.*`) in `Grant`. | Not in v1. Coverage by existing wildcard rows is handled ([5.6](#56-grant)). |
 | OQ-4 | A per-membership `RoleGrant.default`, against the user-level `User.defaultRoles` (chosen). | User-level only. |
 | OQ-5 | Support `no_password` users restricted to `HOST LOCAL`, behind a policy flag? | No. |
@@ -2535,7 +2569,6 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-9 | Google service account impersonation (`impersonate.IDTokenSource`) and `external_account` credential files. | Not in v1. Cluster-scoped only if added. |
 | OQ-10 | For `Database` with `cluster`, Observe reads only the connected replica. Verify existence and comment on every replica too? | Connected replica only for Observe (so polling needs no `REMOTE`); every ON CLUSTER write, and Observe while deleting, checks the UUID on every replica ([5.3](#53-database)). |
 | OQ-11 | Settings profiles, quotas, row policies, per-user settings, `VALID UNTIL`, `HOST REGEXP/LIKE`, role settings, role-level profiles. | Later versions. |
-| OQ-14 | The privilege expansion model must match the server for every supported version. | Verified at DATABASE and TABLE level on 25.3, 26.6 and 26.8. Per-version fixtures and integration tests gate releases. 25.8 and A26.3 fixtures still to be recorded. |
 | OQ-16 | Behaviour differences in Antalya 26.6.8+ (OR REPLACE, native Hello marker) and newer upstream releases. | Add to the CI matrix when available. No OR REPLACE is used. |
 | OQ-18 | HTTP(S) transport. | Deferred; design in [6.6](#66-deferred-http-transport). |
 | OQ-19 | An `OIDCClientCredentials` token source (token URL, client ID, client secret Secret, scopes/audience) for non-Google identity providers, cluster-scoped only. | Not in v1; the sidecar pattern in `docs/auth.md` covers it meanwhile. |
@@ -2548,6 +2581,8 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-26 | Is `REMOTE` acceptable for the cluster ownership check, or should the provider connect to each host listed in the config instead? | `REMOTE` for cluster Databases that Update or Delete; Delete also needs `forceDrop`, and examples omit `Delete`. |
 | OQ-27 | Warn when `defaultDatabase` names a database that does not exist, which blocks logins? | Not in v1; documented. |
 | OQ-28 | Persist the create journal of D-29 (for example in a provider-owned Secret or as an HMAC-signed annotation with a provider-held key), so that a create interrupted by a provider restart is recovered without adoption. | Not in v1: in memory only. |
+| OQ-29 | Deleting a Grant or RoleGrant revokes its privileges or membership even if they existed before the MR ([4.3](#43-grants-and-role-grants-grantee-binding)). Record whether the MR itself issued the GRANT (a new annotation) and revoke only then? | Not in v1. Leave `Delete` out of the management policies to import existing grants and memberships. |
+| OQ-30 | Detect role-grant cycles (`GRANT a TO b`, `GRANT b TO a`), which every version accepts? | Not in v1. |
 
 **Closed in revision 2:**
 
@@ -2558,6 +2593,7 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-13 | Referenced MRs must use the same ProviderConfig. | Yes, for `*Ref` and `*Selector`, and references cannot leave the namespace ([3.1](#31-conventions)). Plain names are not checked. |
 | OQ-15 | Is `system.grants` filtered for grantees the identity cannot see? | No. With only `SELECT ON system.grants`, all rows are visible; `system.role_grants` is the same [V 25.3, 25.3.3, 26.6, 26.8]. |
 | OQ-17 | Does the `EXPLAIN AST` jwt probe need privileges on any supported version? (closed in revision 4) | No: it runs with the minimal identity on every image of the CI matrix [V all]. |
+| OQ-14 | Does the privilege expansion model match the server on every supported version? (closed in revision 4) | Yes, as access flags (D-33): checked at GLOBAL, DATABASE, TABLE and COLUMN level on all five images, including the provider's own GRANT and REVOKE statements. The recorded catalogues of all five versions are compared with the servers by `TestGrantPrivilegeCatalogue` ([5.6](#56-grant)). |
 
 ---
 
@@ -2581,13 +2617,13 @@ Versions as defined at the top: plain [V] means Antalya 26.6.4 and upstream 26.8
 | A12 | `ALTER USER ... IDENTIFIED WITH ...` replaces all methods, including ones added with `ADD IDENTIFIED`, and clears `VALID UNTIL`. `HOST` and `SETTINGS` replace the old values; `SETTINGS NONE` works. A combined `ALTER USER ... IDENTIFIED ... HOST ... SETTINGS NONE DEFAULT ROLE ALL` works. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A13 | Host rewrites: CIDR masked, mask notation converted (`/255.0.0.0` → `/8`), `/32` and `/128` shown bare, IPv6 compressed, order changed. `0.0.0.0/0` collapses to ANY (`['::/0']`) and drops host names. Host names keep their case. `HOST NONE` gives four empty arrays. `HOST LOCAL` gives `host_names=['localhost']`. In a `HOST` list, the entries after a `REGEXP` or `LIKE` entry are silently dropped on 25.3.3 and A26.6 (`HOST LIKE 'a', LIKE 'b'` stores only `a`); 26.8 keeps them. The provider never writes `REGEXP` or `LIKE`, it only reports them as drift. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A14 | `ALTER USER ... DEFAULT ROLE` with a non-granted role returns 512; `CREATE USER ... DEFAULT ROLE` accepts an existing role that is not granted yet, stores it in `default_roles_list`, and the role is active once granted; with an unknown role, 511. `DEFAULT ROLE ALL EXCEPT r` with an existing but not granted role works. An unknown grantee returns 511 in `GRANT r TO x` and in privilege `GRANT`/`REVOKE`. REVOKE of a privilege or role that is not held is a no-op. | [V 25.3, 25.3.3, 26.6, 26.8] |
-| A15 | New users start with `DEFAULT ROLE ALL`. With `Listed` or `NONE`, a later `GRANT` does not make the role default. REVOKE removes the role from `default_roles_list` on 26.6 and 26.8, and a later GRANT does not restore it; on 25.3 the stale entry stays. `DROP ROLE` removes the role from every list. | [V 25.3, 25.3.3, 26.6, 26.8] |
+| A15 | New users start with `DEFAULT ROLE ALL`. With `Listed` or `NONE`, a later `GRANT` does not make the role default. REVOKE removes the role from `default_roles_list` on 25.8, A26.3, A26.6 and 26.8, and a later GRANT does not restore it; on 25.3 (25.3.3) the stale entry stays, and a later GRANT makes the role default again. `DROP ROLE` removes the role from every list. Revision 3 named only 26.6 and 26.8. | [V all] |
 | A16 | Grants are stored expanded to level-applicable privileges in a version-dependent group-compressed form (`GRANT ALTER ON app.*`: `ALTER` on 25.3 and 26.6; `ALTER TABLE`, `ALTER DATABASE`, `ALTER VIEW` on 26.8). A narrow grant is absorbed by a broader one. `REVOKE` at the broader level removes both. A narrow REVOKE under a broad grant creates a partial revoke row. `GRANT` at T removes partial revokes at T and below. Grants on nonexistent databases are accepted. | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A17 | `REVOKE GRANT OPTION FOR` works. `GRANT ... WITH GRANT OPTION` under a broader row without grant option stores a separate narrow row; `REVOKE GRANT OPTION FOR` then removes it cleanly. With only a broader row holding grant option, `REVOKE GRANT OPTION FOR` at a narrow level creates a partial revoke of the option (`is_partial_revoke = 1, grant_option = 1`). | [V 25.3, 25.3.3, 26.6, 26.8] |
 | A18 | Wildcard grants `ON team_*.*` and `ON app.ev*` are stored with the prefix as the name (`database = 'team_'`, `table = 'ev'`), identical to a literal grant without `is_wildcard` (only 26.8 has it). `SHOW GRANTS` prints wildcards unquoted and literal `*` names quoted. Wildcards absorb narrower grants; a narrow REVOKE under one creates a partial revoke. | [V all] |
 | A19 | Source privileges: on 25.3 `S3`, `URL`, ... are children of `SOURCES` and stored by name. From 25.8 they are GLOBAL leaves under `ALL`, `READ`/`WRITE` exist at level `SOURCE`, and `GRANT S3 ON *.*` is stored as `READ`/`WRITE` with `access_object = 'S3'` while `SHOW GRANTS` prints `GRANT S3 ON *.*`. New sources per version: `YTSAURUS`, `ARROW FLIGHT` (A26.6, 26.8), `BIGQUERY`, `DISK` (26.8). | [V all] |
 | A20 | A user and a role may share a name, even across storages. GRANT and REVOKE resolve the grantee user-first. `CREATE ROLE <users.d user name>` succeeds, and a later GRANT to that name returns 495. `CREATE USER <users.d role name>` succeeds, and grants to that name land on the new user. | [V 25.3, 25.3.3, 26.6, 26.8] |
-| A21 | `system.grants` columns: 25.3 `user_name, role_name, access_type, database, table, column, is_partial_revoke, grant_option`; 25.8, A26.3 and A26.6 add `access_object`; 26.8 also adds `is_wildcard`. `system.users.valid_until`: absent on 25.3 and 25.8, `Array(DateTime)` on A26.3 and A26.6, `Array(DateTime64(0))` on 26.8, one entry per method. `default_database` exists everywhere. `auth_params` is `Array(String)`. | [V all] |
+| A21 | `system.grants` columns: 25.3 `user_name, role_name, access_type, database, table, column, is_partial_revoke, grant_option`; 25.8, A26.3 and A26.6 add `access_object`; 26.8 also adds `is_wildcard`. `system.users.valid_until`: absent on 25.3 and 25.8, `Array(DateTime)` on A26.3 and A26.6, `Array(DateTime64(0))` on 26.8, one entry per method. `default_database` exists everywhere. `auth_params` is `Array(String)`. `system.grants.access_type` is an `Enum16`; `access_object` is `String` on 26.8 and `Nullable(String)` elsewhere. `system.role_grants.user_name` and `role_name` are `Nullable(String)`, `with_admin_option` and `granted_role_is_default` are `UInt8`, and rows of role grantees have `granted_role_is_default = 1`. | [V all] |
 | A22 | `system.databases` and `system.tables` are silently filtered by privileges; `EXISTS DATABASE` fails with 497 instead. `system.users`, `roles`, `role_grants`, `grants` and `settings_profile_elements` fail with 497 without a grant. `system.grants` and `system.role_grants` are not filtered by grantee. `system.privileges` needs no grant. | [V 25.3, 26.6, 26.8]; access tables also [V 25.3.3] |
 | A23 | `DROP DATABASE` on a non-empty database needs `DROP TABLE` on its tables (497 otherwise) on a single server. With `ON CLUSTER`, remote hosts do not enforce it, even with `distributed_ddl_use_initial_user_and_roles = 1`. | [V]; [V 26.8 two shards] |
 | A24 | `CREATE DATABASE ... COMMENT` works everywhere and stores the comment unescaped. `ALTER DATABASE ... MODIFY COMMENT` works on A26.6 and 26.8. The privilege `ALTER MODIFY DATABASE COMMENT` exists on 25.8, A26.3, A26.6 and 26.8. On 25.3 the privilege is missing, and both the statement and the GRANT are syntax errors (62). | [V all] (statement: [V 25.3, 26.6, 26.8]) |
@@ -2610,6 +2646,19 @@ Versions as defined at the top: plain [V] means Antalya 26.6.4 and upstream 26.8
 | A41 | `system.columns` is filtered by `SHOW COLUMNS`: an identity with `SHOW USERS` but no `SELECT ON system.users` sees no columns of `system.users` there, and one without grants sees none at all. ``SELECT `col` FROM system.`t` LIMIT 0`` succeeds when the column exists and fails with 47 `UNKNOWN_IDENTIFIER` when it does not, with exactly the grant that reading the table needs. | [V 25.3.3, 26.6, 26.8] |
 | A42 | `users.d` YAML: `grants: {query: [...]}` accepts prefix grants (``ON `app_`*``); a `roles:` section defines roles with `storage = users_xml`. A users.d role can be granted to an SQL user, and becomes one of its default roles under `DEFAULT ROLE ALL`. | [V all] (prefix grants); [V 25.3.3, 26.6, 26.8] (roles) |
 | A43 | `system.users.valid_until` holds `1970-01-01 00:00:00` for a method without expiry. `SHOW CREATE USER` prints `SETTINGS PROFILE` with the profile as a backtick identifier and omits `HOST ANY` and `DEFAULT ROLE ALL`. No system table lists the configured token processors. | [V 26.6, 26.8] (valid_until); [V 25.3.3, 26.6, 26.8] (SHOW CREATE USER); [V A26.6] (processors) |
+| A44 | `CREATE USER ... HOST ANY DEFAULT ROLE ALL DEFAULT DATABASE NONE SETTINGS NONE`, `ALTER USER ... IDENTIFIED WITH ... HOST ... DEFAULT DATABASE ... SETTINGS PROFILE '<p>'` and the list form `HOST IP 'a', 'b', NAME 'c'` are accepted. | [V 25.3.3, 26.8, A26.6]; exercised on 25.8 and A26.3 by `TestUser` |
+| A45 | A jwt user without PROCESSOR prints `IDENTIFIED WITH jwt`. `CLAIMS '{}'` is printed verbatim; the provider treats it as no claims. jwt plus `ADD IDENTIFIED WITH plaintext_password` prints `IDENTIFIED WITH jwt PROCESSOR 'test', plaintext_password`. | [V A26.6] |
+| A46 | `ALTER USER ... ADD IDENTIFIED ... VALID UNTIL` puts the expiry only on the added method. | [V 25.3.3, 26.8, A26.6] |
+| A47 | A non-hex or short password hash gives 36 "Cannot read password hash in hex" or "must be exactly 32 bytes", with no secret in the message. | [V 25.3.3, 26.8, A26.6] |
+| A48 | `VALID UNTIL '2200-01-01'` wraps to 2063 in Antalya's `Array(DateTime)` column of `system.users`, while `SHOW CREATE USER` prints 2200; either way it is drift. An expired `VALID UNTIL` makes login fail with 516 until the provider re-applies `IDENTIFIED`. | [V A26.6]; 516 [V all] |
+| A49 | Access flags: `CREATE ARBITRARY TEMPORARY TABLE` carries a flag besides that of its only child `CREATE TEMPORARY TABLE`; granting every leaf under `CREATE` ON `*.*` stores 8 rows instead of one `CREATE` row; after `REVOKE CREATE TEMPORARY TABLE` from a holder of `CREATE ARBITRARY TEMPORARY TABLE` the remaining flag is invisible in `system.grants` (`SHOW GRANTS` prints `USAGE`). `SHOW FILESYSTEM CACHES` and `NONE` carry no flag; `GRANT SHOW FILESYSTEM CACHES ON *.*` and `GRANT NONE` store nothing. | [V all]; `SHOW FILESYSTEM CACHES` [V 25.3.3, 26.8] |
+| A50 | `GRANT ... WITH GRANT OPTION` at T removes a grant-option partial revoke at T; a plain GRANT keeps it. `REVOKE GRANT OPTION FOR` on an exact row with nothing above clears only its option. A REVOKE may give each privilege its own column list (``REVOKE SELECT(`a`), INSERT(`b`) ON ...``). | [V all] |
+| A51 | `GRANT CREATE USER ON app.*` is a syntax error (62), not 509. An empty identifier in `GRANT` is a syntax error (62). | [V all] |
+| A52 | Wildcards: a literal revoke under a wildcard on 25.3 gives a grant row and a revoke row with the same database name. `GRANT SELECT ON app.*` followed by `GRANT SELECT ON app*.*` leaves only the wildcard row. `GRANT ... ON team_*.t` and `ON team_*.ev*` are stored as a table prefix in the literal database `team_`, and `SHOW GRANTS` prints `` team_.t* ``. `GRANT SELECT(a) ON app.ev*` is a syntax error (62). | [V 25.3.3, 26.8] |
+| A53 | `GRANT r TO r` is stored as a self-membership on 25.3.3, 25.8, A26.3 and A26.6, and refused on 26.8 with 36 "Cannot grant role 'r' to itself". Role-grant cycles (`GRANT a TO b; GRANT b TO a`) are accepted on every version. | [V all] |
+| A54 | The granted role of `GRANT r TO x` is always resolved as a role: a user named `r` does not capture it, and a backtick-quoted keyword such as `` `SELECT` `` is granted as a role. Only the grantee is resolved user-first (A20). | [V all] |
+| A55 | `REVOKE ADMIN OPTION FOR r FROM x` keeps the membership, and is a no-op when `x` holds no admin option or no membership. `GRANT r TO x` without `WITH ADMIN OPTION` keeps an existing admin option. REVOKE from an unknown grantee, and `REVOKE ADMIN OPTION FOR` an unknown role, give 511. GRANT or REVOKE to or from a users_xml user or role give 495. | [V all] |
+| A56 | `CREATE USER OR REPLACE` (A30) is reported as `Replaced`: the new UUID differs from `owned-id`. | [V all] |
 
 ---
 

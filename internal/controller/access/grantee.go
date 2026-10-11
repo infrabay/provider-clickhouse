@@ -116,10 +116,13 @@ func (e *Env) BindGrantee(ctx context.Context, mg resource.ModernManaged, g Gran
 // REVOKE: the statements address the grantee by name, so it could have been
 // replaced, shadowed by a same-named user or released by its owner since
 // Observe. It also runs CheckWritable. It refuses the write unless the
-// grantee is still bound and still has the UUID observed in b. When the
-// grantee no longer exists it returns exists=false without error while the
-// MR is being deleted (there is nothing left to revoke, so Delete returns
-// without error), and DependencyMissing otherwise.
+// grantee is still bound to an owner and still has the UUID observed in b.
+// The grantee checks of an MR whose management policies allow no write
+// stop before the owner lookup, so such an MR never passes this re-check,
+// whatever crossplane-runtime calls (D-26). When the grantee no longer
+// exists it returns exists=false without error while the MR is being
+// deleted (there is nothing left to revoke, so Delete returns without
+// error), and DependencyMissing otherwise.
 func (e *Env) RebindGrantee(ctx context.Context, mg resource.ModernManaged, b Binding) (bool, error) {
 	if err := e.CheckWritable(ctx); err != nil {
 		return false, err
@@ -134,6 +137,8 @@ func (e *Env) RebindGrantee(ctx context.Context, mg resource.ModernManaged, b Bi
 		return false, reason.Wrap(reason.NotOwned, fmt.Errorf("%w; nothing was granted or revoked", orphan.err))
 	case !nb.Exists:
 		return false, nil
+	case nb.Owner == "":
+		return false, reason.Errorf(reason.NotOwned, "grantee %s is not bound to an owning User or Role (the management policies allow no write); nothing was granted or revoked", b.Grantee)
 	}
 	if b.Entity.ID != "" && nb.Entity.ID != b.Entity.ID {
 		return false, reason.Errorf(reason.Replaced, "grantee %s was replaced since it was observed (id %s, now %s); nothing was granted or revoked",

@@ -1,5 +1,16 @@
 # The provider declares safe-start: its managed resource controllers start
-# only for activated CRDs. Activate every kind of this provider.
+# only for activated CRDs. This policy activates every managed resource kind
+# of the provider: Database, User, Role, Grant and RoleGrant.
+#
+# To activate only some kinds, list their CRD names instead, for example
+#   activate:
+#     - databases.clickhouse.m.infrabay.io
+#     - users.clickhouse.m.infrabay.io
+#     - roles.clickhouse.m.infrabay.io
+#     - grants.clickhouse.m.infrabay.io
+#     - rolegrants.clickhouse.m.infrabay.io
+# A Grant or RoleGrant writes only for a grantee that a User or Role MR owns,
+# so activate User and Role together with them.
 apiVersion: apiextensions.crossplane.io/v1alpha1
 kind: ManagedResourceActivationPolicy
 metadata:
