@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -44,13 +45,15 @@ import (
 // Names of the GoogleIDToken scenario, shared with hack/e2e.
 const (
 	envGoogleAudience = "E2E_GOOGLE_AUDIENCE"
-	nsGoogle          = "xpch-e2e-google"
-	nsFakeGCP         = "xpch-e2e-fakegcp"
-	fakeGCPHost       = "fakegcp." + nsFakeGCP + ".svc.cluster.local"
-	fakeGCPControl    = 8081
-	googleCPCName     = "xpch-e2e-google"
-	googleDB          = "app_google"
-	googleRole        = "app_google_reader"
+	// envArtifacts is the diagnostics directory of the run.
+	envArtifacts   = "E2E_ARTIFACTS"
+	nsGoogle       = "xpch-e2e-google"
+	nsFakeGCP      = "xpch-e2e-fakegcp"
+	fakeGCPHost    = "fakegcp." + nsFakeGCP + ".svc.cluster.local"
+	fakeGCPControl = 8081
+	googleCPCName  = "xpch-e2e-google"
+	googleDB       = "app_google"
+	googleRole     = "app_google_reader"
 )
 
 // Token timing of the scenario. The fake issues tokens with a TTL of
@@ -90,8 +93,48 @@ var (
 // of a JSON object starts with "eyJ").
 var jwtLike = regexp.MustCompile(`eyJ[A-Za-z0-9_.-]*`)
 
-// redactTokens replaces everything that looks like a JWT with [REDACTED].
-func redactTokens(s string) string { return jwtLike.ReplaceAllString(s, "[REDACTED]") }
+// longBase64URL matches a long run of base64url characters, such as the
+// signature segment of a token without the rest (342 characters for RS256).
+// Nothing else the tests print has runs this long; hack/e2e/lib.sh
+// (e2e::redact) uses the same two patterns.
+var longBase64URL = regexp.MustCompile(`[A-Za-z0-9_-]{100,}`)
+
+// redactTokens replaces everything that looks like a JWT or a signature
+// segment with [REDACTED].
+func redactTokens(s string) string {
+	return longBase64URL.ReplaceAllString(jwtLike.ReplaceAllString(s, "[REDACTED]"), "[REDACTED]")
+}
+
+// leakFinder finds tokens in text: anything that looks like a JWT, and the
+// fingerprints (the first and last characters of the signature) of every
+// token the fake issued, which also find a signature segment, or a token
+// truncated at either end, that does not look like a JWT. A piece of a
+// signature without either end is no use without the rest. Tokens leaked in
+// another encoding (base64 of the whole token, hex) are not found.
+type leakFinder struct{ fingerprints []string }
+
+func (g *googleTenant) leakFinder(t *testing.T) leakFinder {
+	t.Helper()
+	var l leakFinder
+	for _, is := range g.fake.issued(t) {
+		l.fingerprints = append(l.fingerprints, is.Fingerprints...)
+	}
+	return l
+}
+
+// find describes what token material s holds, never the material itself, or
+// returns "".
+func (l leakFinder) find(s string) string {
+	if jwtLike.MatchString(s) {
+		return "something that looks like a JWT"
+	}
+	for _, fp := range l.fingerprints {
+		if strings.Contains(s, fp) {
+			return "a piece of a token that the fake issued"
+		}
+	}
+	return ""
+}
 
 // fakeGCP drives the fake metadata server through its control API, reached
 // with a port-forward (the control API has no Service outside the cluster).
@@ -188,17 +231,21 @@ func (f *fakeGCP) identityRequests(t *testing.T) int {
 }
 
 // jwksFetchesSince counts the JWKS fetches answered with 200 after the first
-// skip requests of the log.
-func (f *fakeGCP) jwksFetchesSince(t *testing.T, skip int) int {
+// skip requests of the log, and those of them whose key IDs (the request's
+// note "kids <kid>,<kid>") satisfy served.
+func (f *fakeGCP) jwksFetchesSince(t *testing.T, skip int, served func(kids []string) bool) (matching, all int) {
 	t.Helper()
 	rs := f.requests(t)
-	n := 0
 	for _, r := range rs[min(skip, len(rs)):] {
-		if r.Path == fakegcp.JWKSPath && r.Status == http.StatusOK {
-			n++
+		if r.Path != fakegcp.JWKSPath || r.Status != http.StatusOK {
+			continue
+		}
+		all++
+		if list, ok := strings.CutPrefix(r.Note, "kids "); ok && served(strings.Split(list, ",")) {
+			matching++
 		}
 	}
-	return n
+	return matching, all
 }
 
 // mint signs a token for id with the audience; kid "" is the active key. The
@@ -297,6 +344,7 @@ func testGoogleIDToken(t *testing.T) {
 	// make e2e-cleanup deletes MRs while the provider runs, and the Antalya
 	// tenant's deletion checks every app_ object on the server.
 	t.Cleanup(func() { g.cleanup(t) })
+	leaksChecked := false
 	for _, step := range []struct {
 		name string
 		fn   func(*testing.T)
@@ -310,17 +358,28 @@ func testGoogleIDToken(t *testing.T) {
 		{"MetadataOutage", g.metadataOutage},
 		{"FaultyToken", g.faultyToken},
 		{"AttackerToken", g.attackerToken},
+		{"NoTokenLeaks", func(t *testing.T) { leaksChecked = true; g.noTokenLeaks(t) }},
 		{"Deletion", g.deletion},
 	} {
 		if !t.Run(step.name, step.fn) {
-			return
+			break
 		}
+	}
+	// After a failed step, too: a leak is worth knowing about whatever else
+	// failed.
+	if !leaksChecked {
+		t.Run("NoTokenLeaks", g.noTokenLeaks)
 	}
 }
 
 // cleanup restores the fake and deletes what a failed scenario left. It does
-// not fail the test.
+// not fail the test. After a failure it first records the state of the
+// scenario's objects and of the fake, which the deletion below would
+// otherwise take from the diagnostics.
 func (g *googleTenant) cleanup(t *testing.T) {
+	if t.Failed() {
+		g.dumpState(t)
+	}
 	if err := g.fake.call(http.MethodPost, "reset", nil, nil); err != nil {
 		t.Logf("reset the fake: %v", err)
 	}
@@ -352,6 +411,57 @@ func (g *googleTenant) cleanup(t *testing.T) {
 			}
 			time.Sleep(2 * time.Second)
 		}
+	}
+}
+
+// dumpState writes the scenario's objects (managed fields dropped) and the
+// fake's state, request log and token summaries to $E2E_ARTIFACTS, or into
+// the test log without it, with anything that looks like a token redacted.
+func (g *googleTenant) dumpState(t *testing.T) {
+	var objs bytes.Buffer
+	for _, obj := range g.created {
+		cur, ok := obj.DeepCopyObject().(client.Object)
+		if !ok {
+			continue
+		}
+		if err := kube.Get(context.Background(), client.ObjectKeyFromObject(obj), cur); err != nil {
+			fmt.Fprintf(&objs, "# %T %s: %v\n---\n", obj, obj.GetName(), err)
+			continue
+		}
+		cur.SetManagedFields(nil)
+		b, err := yaml.Marshal(cur)
+		if err != nil {
+			fmt.Fprintf(&objs, "# %T %s: %v\n---\n", obj, obj.GetName(), err)
+			continue
+		}
+		fmt.Fprintf(&objs, "# %T\n%s---\n", obj, b)
+	}
+	fake := map[string]any{}
+	for _, path := range []string{"state", "requests", "issued"} {
+		var v any
+		if err := g.fake.call(http.MethodGet, path, nil, &v); err != nil {
+			v = err.Error()
+		}
+		fake[path] = v
+	}
+	fakeJSON, err := json.MarshalIndent(fake, "", "  ")
+	if err != nil {
+		fakeJSON = []byte(err.Error())
+	}
+	files := map[string]string{"google-objects.yaml": objs.String(), "google-fakegcp.json": string(fakeJSON) + "\n"}
+	dir := os.Getenv(envArtifacts)
+	for name, content := range files {
+		content = redactTokens(content)
+		if dir == "" {
+			t.Logf("%s:\n%s", name, content)
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Logf("write %s: %v", path, err)
+			continue
+		}
+		t.Logf("the state of the scenario is in %s", path)
 	}
 }
 
@@ -433,8 +543,25 @@ func (g *googleTenant) setup(t *testing.T) {
 	}
 	t.Logf("provider service account %s, audience %s, key %s, cache lifetimes %s", g.email, g.audience, st.ActiveKID, g.cacheLifetime)
 
+	// The token timing (see googleTokenTTL) relies on ClickHouse's default
+	// verifier_leeway of 60 s, which the processor does not set: a token of
+	// the provider's account that expired 40 s ago is accepted, one that
+	// expired 70 s ago is refused. Without this, another default would show
+	// up as an unexplained 516 later.
+	g.fake.settings(t, googleTokenTTL, googleClockOffset-30*time.Second)
+	expired := g.fake.mint(t, st.Identity, g.audience, "", fakegcp.FaultNone)
+	if _, err := g.login(t, expired); exceptionCode(err) != 516 {
+		t.Fatalf("a token that expired %s ago: code %d (%s), want 516: verifier_leeway is longer than the 60 s the token timing relies on", -(googleClockOffset - 30*time.Second + googleTokenTTL), exceptionCode(err), redactTokens(fmt.Sprint(err)))
+	}
 	// Short-lived tokens from the first one on (see googleTokenTTL).
 	g.fake.settings(t, googleTokenTTL, googleClockOffset)
+	conn, err := g.login(t, g.fake.mint(t, st.Identity, g.audience, "", fakegcp.FaultNone))
+	if err != nil {
+		t.Fatalf("a token that expired %s ago: %s: verifier_leeway is shorter than the 60 s the token timing relies on", -(googleClockOffset + googleTokenTTL), redactTokens(err.Error()))
+	}
+	if who, _ := whoami(t, conn); who != g.email {
+		t.Fatalf("logged in with the provider's token as %q, want %q", who, g.email)
+	}
 
 	port := int32(9000)
 	cpc := &v1alpha1.ClusterProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: googleCPCName}}
@@ -634,26 +761,32 @@ func (g *googleTenant) workloadLogin(t *testing.T) {
 	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: nsGoogle, Name: "reporter-clickhouse"}, sec); err != nil {
 		t.Fatalf("connection Secret: %v", err)
 	}
-	for k, v := range map[string]string{
+	// Exactly these keys (design 9.5): no password, and nothing of the
+	// provider's own credentials.
+	want := map[string]string{
 		v1alpha1.ConnectionKeyUsername:     googleWorkload.Email,
 		v1alpha1.ConnectionKeyEndpoint:     s.host,
 		v1alpha1.ConnectionKeyPort:         "9000",
 		v1alpha1.ConnectionKeyProtocol:     string(v1alpha1.ProtocolNative),
 		v1alpha1.ConnectionKeyTLS:          "false",
 		v1alpha1.ConnectionKeyJWTProcessor: fakegcp.GoogleProcessorName,
-	} {
-		if got := string(sec.Data[k]); got != v {
-			t.Errorf("connection Secret key %s = %q, want %q", k, got, v)
-		}
 	}
-	if _, ok := sec.Data[v1alpha1.ConnectionKeyPassword]; ok {
-		t.Error("the connection Secret of a JWT user has a password key")
+	if got := keys(sec.Data); !slices.Equal(got, keys(want)) {
+		t.Errorf("connection Secret keys %v, want %v", got, keys(want))
+	}
+	leaks := g.leakFinder(t)
+	for k, v := range sec.Data {
+		if what := leaks.find(string(v)); what != "" {
+			t.Errorf("connection Secret key %s holds %s", k, what)
+		} else if w, ok := want[k]; ok && string(v) != w {
+			t.Errorf("connection Secret key %s = %q, want %q", k, v, w)
+		}
 	}
 
 	s.exec(t, "CREATE TABLE "+googleDB+".events (id UInt64, what String) ENGINE = MergeTree ORDER BY id")
 	conn, err := g.login(t, g.fake.mint(t, googleWorkload, g.audience, "", fakegcp.FaultNone))
 	if err != nil {
-		t.Fatalf("the workload's login with its ID token: %v", err)
+		t.Fatalf("the workload's login with its ID token: %s", redactTokens(err.Error()))
 	}
 	if who, db := whoami(t, conn); who != googleWorkload.Email || db != googleDB {
 		t.Fatalf("logged in as %q in %q, want %q in %q", who, db, googleWorkload.Email, googleDB)
@@ -691,7 +824,7 @@ func (g *googleTenant) refused(t *testing.T, what, token string) {
 	t.Helper()
 	_, err := g.login(t, token)
 	if code := exceptionCode(err); code != 516 {
-		t.Errorf("%s: code %d (%v), want 516 (AUTHENTICATION_FAILED)", what, code, err)
+		t.Errorf("%s: code %d (%s), want 516 (AUTHENTICATION_FAILED)", what, code, redactTokens(fmt.Sprint(err)))
 	}
 }
 
@@ -803,10 +936,20 @@ func (g *googleTenant) tokenRefresh(t *testing.T) {
 	for _, mg := range g.mrs() {
 		waitMR(t, mg, time.Minute, "Ready and Synced after the token refresh", readyAndSynced)
 	}
+	// The watcher above is what catches a broken refresh: a provider that
+	// keeps a refused token still fetches new ones when it rebuilds its
+	// pool, but only after a reconcile failed. The count only checks that
+	// tokens were replaced at all. ClickHouse accepts a token for at most
+	// googleTokenTTL plus token_cache_lifetime after it was issued, and
+	// while it reconciles the provider dials at least every connection
+	// lifetime plus poll interval, so it needs a fresh token at least that
+	// often.
 	fresh := g.fake.identityRequests(t) - before
-	t.Logf("the provider fetched %d ID tokens in %s (tokens accepted for about %s)", fresh, time.Since(start).Round(time.Second), googleTokenTTL)
-	if fresh < 2 {
-		t.Errorf("the provider fetched %d ID tokens in %s, want at least 2: it did not replace its expiring tokens", fresh, time.Since(start).Round(time.Second))
+	accepted := googleTokenTTL + g.cacheLifetime
+	minFresh := int(googleRefreshWindow / (accepted + googleConnMaxLifetime + pollInterval))
+	t.Logf("the provider fetched %d ID tokens in %s (each accepted for at most %s; want at least %d)", fresh, time.Since(start).Round(time.Second), accepted, minFresh)
+	if fresh < max(minFresh, 1) {
+		t.Errorf("the provider fetched %d ID tokens in %s, want at least %d: it did not replace its expiring tokens", fresh, time.Since(start).Round(time.Second), max(minFresh, 1))
 	}
 	for _, is := range g.fake.issued(t)[issuedBefore:] {
 		if is.Via != "metadata" {
@@ -829,7 +972,7 @@ func (g *googleTenant) keyRotation(t *testing.T) {
 	w := watchSynced(g.mrs()...)
 
 	kid := g.fake.keys(t, "add", "")
-	g.awaitJWKSFetch(t, "with the new key")
+	g.awaitJWKSFetch(t, "with the new key", func(kids []string) bool { return slices.Contains(kids, kid) })
 	g.fake.keys(t, "activate", kid)
 	start := time.Now()
 	eventually(t, 3*time.Minute, "the provider holding a token of the new key", func() (bool, string) {
@@ -844,12 +987,12 @@ func (g *googleTenant) keyRotation(t *testing.T) {
 	g.setComment(t)
 
 	g.fake.keys(t, "retire", old)
-	g.awaitJWKSFetch(t, "without the old key")
+	g.awaitJWKSFetch(t, "without the old key", func(kids []string) bool { return !slices.Contains(kids, old) })
 	// A new token of the retired key is refused (no cached validation can
 	// hold it), one of the new key accepted.
 	g.refused(t, "a token signed with the retired key", g.fake.mint(t, googleWorkload, g.audience, old, fakegcp.FaultNone))
 	if _, err := g.login(t, g.fake.mint(t, googleWorkload, g.audience, kid, fakegcp.FaultNone)); err != nil {
-		t.Errorf("a token of the new key: %v", err)
+		t.Errorf("a token of the new key: %s", redactTokens(err.Error()))
 	}
 	// The provider's own token of the old key, if it still had one, is now
 	// refused on its next connection; it keeps working with a new token.
@@ -863,15 +1006,17 @@ func (g *googleTenant) keyRotation(t *testing.T) {
 }
 
 // awaitJWKSFetch waits until ClickHouse has fetched the JWKS twice since the
-// call: the first fetch may have been answered just before a change of the
-// keys, the second one cannot.
-func (g *googleTenant) awaitJWKSFetch(t *testing.T, what string) {
+// call with keys for which served (the key IDs the fake answered with) is
+// true: once ClickHouse fetches again, it has taken in the first answer.
+// Fetches come every jwks_cache_lifetime while tokens are validated; the
+// timeout leaves room for four of them beyond the default two minutes.
+func (g *googleTenant) awaitJWKSFetch(t *testing.T, what string, served func(kids []string) bool) {
 	t.Helper()
 	skip := len(g.fake.requests(t))
 	start := time.Now()
-	eventually(t, 2*time.Minute, "ClickHouse fetching the JWKS "+what, func() (bool, string) {
-		n := g.fake.jwksFetchesSince(t, skip)
-		return n >= 2, fmt.Sprintf("%d fetches", n)
+	eventually(t, 2*time.Minute+4*g.cacheLifetime, "ClickHouse fetching the JWKS "+what, func() (bool, string) {
+		n, all := g.fake.jwksFetchesSince(t, skip, served)
+		return n >= 2, fmt.Sprintf("%d of %d fetches %s", n, all, what)
 	})
 	t.Logf("ClickHouse fetched the JWKS %s within %s (jwks_cache_lifetime %s)", what, time.Since(start).Round(time.Second), g.cacheLifetime)
 }
@@ -894,22 +1039,24 @@ func failing(substrs ...string) func(resource.Managed) bool {
 }
 
 // cleanMessage fails unless the Synced message of mg is a single line of
-// reasonable length without anything that looks like a token or any of
+// reasonable length without any token material (see leakFinder) or any of
 // forbidden.
-func cleanMessage(t *testing.T, mg resource.Managed, forbidden ...string) {
+func (g *googleTenant) cleanMessage(t *testing.T, mg resource.Managed, forbidden ...string) {
 	t.Helper()
 	msg := mg.GetCondition(xpv2.TypeSynced).Message
+	if what := g.leakFinder(t).find(msg); what != "" {
+		t.Errorf("%s %s: the message holds %s: %s", kindOf(mg), mg.GetName(), what, redactTokens(msg))
+		return
+	}
 	switch {
-	case jwtLike.MatchString(msg):
-		t.Errorf("%s %s: the message contains a token: %s", kindOf(mg), mg.GetName(), redactTokens(msg))
 	case strings.ContainsAny(msg, "\r\n"):
-		t.Errorf("%s %s: the message spans several lines: %q", kindOf(mg), mg.GetName(), msg)
+		t.Errorf("%s %s: the message spans several lines: %q", kindOf(mg), mg.GetName(), redactTokens(msg))
 	case len(msg) > 1024:
 		t.Errorf("%s %s: the message is %d bytes long", kindOf(mg), mg.GetName(), len(msg))
 	}
 	for _, f := range forbidden {
 		if strings.Contains(msg, f) {
-			t.Errorf("%s %s: the message contains %q: %s", kindOf(mg), mg.GetName(), f, msg)
+			t.Errorf("%s %s: the message contains %q: %s", kindOf(mg), mg.GetName(), f, redactTokens(msg))
 		}
 	}
 }
@@ -937,9 +1084,9 @@ func (g *googleTenant) metadataOutage(t *testing.T) {
 		waitMR(t, mg, 4*time.Minute, "failing with AuthenticationFailed during the metadata outage",
 			failing(string(reason.AuthenticationFailed), "GoogleIDToken", "500"))
 		// The body's second line names details that must stay out.
-		cleanMessage(t, mg, "must not reach a managed resource")
+		g.cleanMessage(t, mg, "must not reach a managed resource")
 	}
-	t.Logf("every MR failed %s after the outage began: %s", time.Since(start).Round(time.Second), g.db.GetCondition(xpv2.TypeSynced).Message)
+	t.Logf("every MR failed %s after the outage began: %s", time.Since(start).Round(time.Second), redactTokens(g.db.GetCondition(xpv2.TypeSynced).Message))
 	failed := 0
 	for _, r := range g.fake.requests(t) {
 		if strings.HasPrefix(r.Note, "outage") {
@@ -963,9 +1110,9 @@ func (g *googleTenant) faultyToken(t *testing.T) {
 	for _, mg := range g.mrs() {
 		waitMR(t, mg, 4*time.Minute, "failing with AuthenticationFailed while the tokens are for another audience",
 			failing(string(reason.AuthenticationFailed)))
-		cleanMessage(t, mg)
+		g.cleanMessage(t, mg)
 	}
-	t.Logf("with tokens for another audience: %s", g.db.GetCondition(xpv2.TypeSynced).Message)
+	t.Logf("with tokens for another audience: %s", redactTokens(g.db.GetCondition(xpv2.TypeSynced).Message))
 	faulty := 0
 	for _, is := range g.fake.issued(t)[issuedBefore:] {
 		if is.Via == "metadata" && is.Fault == fakegcp.FaultWrongAudience {
@@ -980,14 +1127,26 @@ func (g *googleTenant) faultyToken(t *testing.T) {
 }
 
 // attackerToken presents valid tokens of the fake's key and the right
-// audience for service accounts without a ClickHouse user, and a forged
-// token for the provider's own account: every login is refused, and nothing
-// runs as those accounts.
+// audience for service accounts without a ClickHouse user, a forged token
+// for the provider's own account, and tokens of the workload with each of
+// the fake's faults: every login is refused, and nothing runs as those
+// accounts.
 func (g *googleTenant) attackerToken(t *testing.T) {
 	g.refused(t, "a token of another project's service account", g.fake.mint(t, googleAttacker, g.audience, "", fakegcp.FaultNone))
 	g.refused(t, "a token of a service account whose name the policy allows but that has no user", g.fake.mint(t, googleIntruder, g.audience, "", fakegcp.FaultNone))
 	provider := fakegcp.Identity{Email: g.email, UniqueID: "100000000000000000999"}
 	g.refused(t, "a token for the provider's account signed with a key that is not in the JWKS", g.fake.mint(t, provider, g.audience, "", fakegcp.FaultUnknownKid))
+	// Every check of the processor, not only its configuration (Setup):
+	// tokens of the workload, which has a user, that are faulty in one way
+	// each (email_verified false, wrong issuer or typ, alg none, expired,
+	// ...).
+	for _, f := range fakegcp.Faults() {
+		g.refused(t, "a token of the workload with the fault "+string(f), g.fake.mint(t, googleWorkload, g.audience, "", f))
+	}
+	// A good one still works.
+	if _, err := g.login(t, g.fake.mint(t, googleWorkload, g.audience, "", fakegcp.FaultNone)); err != nil {
+		t.Errorf("a good token of the workload after the faulty ones: %s", redactTokens(err.Error()))
+	}
 	g.srv.exec(t, "SYSTEM FLUSH LOGS")
 	for _, name := range []string{googleAttacker.Email, googleIntruder.Email} {
 		if id := g.srv.uuid(t, kindUser, name); id != "" {
@@ -997,6 +1156,99 @@ func (g *googleTenant) attackerToken(t *testing.T) {
 			t.Errorf("%d queries ran as %s", n, name)
 		}
 	}
+}
+
+// noTokenLeaks checks that no token, or piece of one (see leakFinder),
+// reached a place the provider writes to: the scenario's objects as they are
+// now (its managed resources, the config and the workload's connection
+// Secret), the events of its namespace and of the config, and the provider's
+// logs, current and previous containers, with the lines of every scenario
+// (design 5.1: tokens are never logged). It never prints what it found.
+func (g *googleTenant) noTokenLeaks(t *testing.T) {
+	leaks := g.leakFinder(t)
+	ctx := context.Background()
+	for _, obj := range g.created {
+		cur, ok := obj.DeepCopyObject().(client.Object)
+		if !ok {
+			continue
+		}
+		if err := kube.Get(ctx, client.ObjectKeyFromObject(obj), cur); err != nil {
+			continue // Deleted (the policy MRs) or never created.
+		}
+		cur.SetManagedFields(nil)
+		b, err := json.Marshal(cur)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if what := leaks.find(string(b)); what != "" {
+			t.Errorf("%T %s holds %s", obj, obj.GetName(), what)
+		}
+	}
+	sec := &corev1.Secret{}
+	if err := kube.Get(ctx, client.ObjectKey{Namespace: nsGoogle, Name: "reporter-clickhouse"}, sec); err == nil {
+		for k, v := range sec.Data {
+			if what := leaks.find(string(v)); what != "" {
+				t.Errorf("the connection Secret's key %s holds %s", k, what)
+			}
+		}
+	}
+
+	var events []corev1.Event
+	for _, l := range []struct{ ns, selector string }{
+		{nsGoogle, ""},
+		// The config's events are recorded in "default".
+		{metav1.NamespaceDefault, "involvedObject.name=" + googleCPCName},
+	} {
+		evs, err := clientset.CoreV1().Events(l.ns).List(ctx, metav1.ListOptions{FieldSelector: l.selector})
+		if err != nil {
+			t.Fatalf("events of %s: %v", l.ns, err)
+		}
+		events = append(events, evs.Items...)
+	}
+	bad, first := 0, ""
+	for _, ev := range events {
+		if what := leaks.find(ev.Message); what != "" {
+			bad++
+			if first == "" {
+				first = fmt.Sprintf("%s %s %s/%s: %s", ev.Reason, ev.InvolvedObject.Kind, ev.InvolvedObject.Namespace, ev.InvolvedObject.Name, what)
+			}
+		}
+	}
+	if bad > 0 {
+		t.Errorf("%d of %d events hold token material, first: %s", bad, len(events), first)
+	}
+
+	pods, err := clientset.CoreV1().Pods(nsCrossplane).List(ctx, metav1.ListOptions{LabelSelector: "pkg.crossplane.io/provider=" + providerName})
+	if err != nil || len(pods.Items) == 0 {
+		t.Fatalf("provider pods: %d, %v", len(pods.Items), err)
+	}
+	scanned := 0
+	for _, p := range pods.Items {
+		for _, c := range p.Spec.Containers {
+			for _, previous := range []bool{false, true} {
+				b, err := clientset.CoreV1().Pods(nsCrossplane).GetLogs(p.Name, &corev1.PodLogOptions{Container: c.Name, Previous: previous}).DoRaw(ctx)
+				if err != nil {
+					if !previous {
+						t.Errorf("log of %s/%s: %v", p.Name, c.Name, err)
+					}
+					continue // No previous container.
+				}
+				lines, bad, what := 0, 0, ""
+				for line := range strings.SplitSeq(string(b), "\n") {
+					lines++
+					if w := leaks.find(line); w != "" {
+						bad++
+						what = w
+					}
+				}
+				scanned += lines
+				if bad > 0 {
+					t.Errorf("%d of %d lines of the log of %s/%s (previous: %t) hold %s", bad, lines, p.Name, c.Name, previous, what)
+				}
+			}
+		}
+	}
+	t.Logf("searched the objects, %d events and %d lines of provider logs for JWTs and %d fingerprints of issued tokens", len(events), scanned, len(leaks.fingerprints))
 }
 
 // deletion deletes the MRs: the Grant and the RoleGrant revoke, the database

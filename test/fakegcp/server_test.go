@@ -586,6 +586,38 @@ func TestMint(t *testing.T) {
 	}
 }
 
+// TestFingerprints checks that each issued token is summarized with the
+// first and last characters of its signature, which tests search for, and
+// that an unsigned token has none.
+func TestFingerprints(t *testing.T) {
+	s, _ := newTestServer(t, Options{})
+	for _, f := range append([]Fault{FaultNone}, Faults()...) {
+		tok, err := s.Mint(MintOptions{Audience: testAudience, Fault: f})
+		if err != nil {
+			t.Fatal(err)
+		}
+		is := s.Issued()
+		fps := is[len(is)-1].Fingerprints
+		sig := tok[strings.LastIndexByte(tok, '.')+1:]
+		if f == FaultAlgNone {
+			if sig != "" || len(fps) != 0 {
+				t.Errorf("%s: signature %d characters, fingerprints %d", f, len(sig), len(fps))
+			}
+			continue
+		}
+		if len(fps) != 2 || len(fps[0]) != FingerprintLen || len(fps[1]) != FingerprintLen ||
+			!strings.HasPrefix(sig, fps[0]) || !strings.HasSuffix(sig, fps[1]) {
+			t.Errorf("%q: the fingerprints are not the ends of the signature", f)
+		}
+		// Together they are a small part of an RS256 signature: no token can
+		// be rebuilt from them. (The HMAC of hs256-confusion is keyed with
+		// the public key, so it is no secret anyway.)
+		if f != FaultHS256Confusion && 4*2*FingerprintLen > len(sig) {
+			t.Errorf("%q: the fingerprints cover %d of %d signature characters", f, 2*FingerprintLen, len(sig))
+		}
+	}
+}
+
 func TestOutages(t *testing.T) {
 	s, hs := newTestServer(t, Options{Hang: 5 * time.Second})
 	idURL := identityURL(hs, "audience=x&format=full")

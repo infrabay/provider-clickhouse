@@ -66,7 +66,7 @@ its own listener only (`ControlHandler`):
 | `SetFault(f, n)` | The next `n` tokens (or all, `n <= 0`) are defective: `wrong-audience`, `wrong-issuer`, `email-unverified`, `no-email`, `wrong-typ` (`at+jwt`), `no-typ`, `unknown-kid`, `bad-signature`, `alg-none`, `hs256-confusion` (HMAC with the RSA public key as secret), `expired`, `issued-in-future`. |
 | `SetOutage(target, mode, n)` | `metadata` (every value), `identity` (ID and access tokens) or `jwks` fail with `500`, `503`, `403` (a multi-line message, like a missing Workload Identity binding) or `timeout` (no answer until the client gives up). |
 | `Mint` | Sign a token directly, for example for a workload that logs in as a jwt user. |
-| `Requests`, `Issued` | What was requested, and summaries of issued tokens (key ID and claims, never the token). |
+| `Requests`, `Issued` | What was requested, and summaries of issued tokens (key ID and claims, never the token), each with two fingerprints: the first and last 16 characters of its signature, which tests search logs and messages for. |
 
 Logs contain key IDs and claim summaries only, never tokens or keys.
 
@@ -308,15 +308,16 @@ conditions and as the ClickHouse administrator, including
 
 | Step | Shows |
 |---|---|
-| `Setup` | The provider pod runs with the `GCE_METADATA_HOST` of [provider-runtime.yaml](../test/fakegcp/deploy/provider-runtime.yaml); the server's `google_jwt` processor is what `fakegcp.GoogleProcessor.YAML` renders; the provider's account is pinned to it. Creates a `ClusterProviderConfig` with `GoogleIDToken` credentials without a key, a closed policy, plain native (like the other Antalya configs) and `pool.connMaxLifetime: 15s`. |
+| `Setup` | The provider pod runs with the `GCE_METADATA_HOST` of [provider-runtime.yaml](../test/fakegcp/deploy/provider-runtime.yaml); the server's `google_jwt` processor is what `fakegcp.GoogleProcessor.YAML` renders; the provider's account is pinned to it; the server's `verifier_leeway` is the 60 s the token timing relies on (a token of the provider's account that expired 40 s ago is accepted, one that expired 70 s ago refused). Creates a `ClusterProviderConfig` with `GoogleIDToken` credentials without a key, a closed policy, plain native (like the other Antalya configs) and `pool.connMaxLifetime: 15s`. |
 | `Lifecycle` | `Database`, `Role`, a JWT `User` for a workload service account (`PROCESSOR 'google_jwt'`, `CLAIMS` with its unique ID), `Grant` and `RoleGrant` become Ready; the server holds them under the claimed UUIDs; every statement ran as the provider's Google service account; the provider asked the fake only for the project ID and `format=full` tokens with the configured audience (no GCE detection). |
-| `WorkloadLogin` | The connection Secret (no password); the workload logs in with an ID token minted for its email and can do exactly what the `Grant` and the `RoleGrant` give it; tokens of the recreated account and for another audience get 516. |
+| `WorkloadLogin` | The connection Secret holds exactly username, endpoint, port, protocol, tls and jwtProcessor, and no token; the workload logs in with an ID token minted for its email and can do exactly what the `Grant` and the `RoleGrant` give it; tokens of the recreated account and for another audience get 516. |
 | `Policy` | A user of another project and a password user are `PolicyViolation` and run no statement. |
-| `TokenRefresh` | Reconciles that write (database comment changes) keep succeeding for six token lifetimes, no MR leaves `Synced`, and the fake served at least two fresh tokens (all with the TTL, audience and email expected). |
-| `KeyRotation` | A key published first and used once ClickHouse fetched it (after `jwks_cache_lifetime`), the old key retired once the provider holds a token of the new one: no MR leaves `Synced`, writes go through, a token of the retired key is refused. |
+| `TokenRefresh` | Reconciles that write (database comment changes) keep succeeding for six token lifetimes and no MR leaves `Synced` (a 1 s watcher; this is what catches a provider that keeps a refused token), and the fake served fresh tokens (all with the TTL, audience and email expected; at least one per token lifetime plus token cache lifetime, connection lifetime and poll interval). |
+| `KeyRotation` | A key published first and used once ClickHouse fetched it (after `jwks_cache_lifetime`; the fake's request log shows the key IDs it served), the old key retired once the provider holds a token of the new one: no MR leaves `Synced`, writes go through, a token of the retired key is refused. |
 | `MetadataOutage` | With every metadata request failing (500), every MR becomes `Synced=False` with a single-line `AuthenticationFailed` from `GoogleIDToken`, without tokens or the response body's details; all recover once the fake answers. |
 | `FaultyToken` | With tokens for another audience, every MR fails with a clean `AuthenticationFailed` after the 516 retry (at least two faulty tokens fetched); all recover. |
-| `AttackerToken` | Valid tokens of the right audience for another project's account and for an `app-` account without a user, and a token for the provider's own account signed with a key outside the JWKS, are refused; no user exists and no query ran as those accounts. |
+| `AttackerToken` | Valid tokens of the right audience for another project's account and for an `app-` account without a user, a token for the provider's own account signed with a key outside the JWKS, and tokens of the workload with each fault of the fake (`email-unverified`, `wrong-issuer`, `wrong-typ`, `alg-none`, `expired`, ...) are refused, so every check of the processor is exercised and not only its configuration; no user exists and no query ran as those accounts. |
+| `NoTokenLeaks` | Nothing that looks like a JWT and no fingerprint of a token the fake issued is in the scenario's objects (managed resources, config, the workload's connection Secret), the events of its namespace and config, or the provider's logs (current and previous containers, every scenario's lines). Also runs after a failed step. |
 | `Deletion` | The `Grant` and the `RoleGrant` revoke, the database, role and user are dropped, all as the Google service account; the config is deleted. |
 
 To see token replacement within minutes, the fake issues tokens with a TTL
@@ -327,6 +328,33 @@ for 55 minutes whatever its `exp`, every replacement in the scenario goes
 through the 516 retry. In production the library replaces the 1-hour token
 after 55 minutes, before ClickHouse refuses it, and the 516 retry is the
 fallback.
+
+When a step fails, the scenario writes its objects (with their conditions)
+and the fake's state, request log and token summaries to
+`google-objects.yaml` and `google-fakegcp.json` in the run's diagnostics
+before its cleanup deletes them. Anything that looks like a token (a JWT, or
+a run of 100 or more base64url characters such as a signature segment) is
+redacted there, in the test's own messages and in every diagnostics file.
+
+Limits of the scenario's checks, deliberately not addressed:
+
+- **The leak search** finds JWTs and either end of an issued token's
+  signature: a whole token, a signature segment, or a token cut off at
+  either end. A token in another encoding (base64 of the whole token, hex)
+  is not found, nor is anything in places it does not read (Crossplane's own
+  logs, the ClickHouse servers' logs). Searching for every encoding would
+  only guess at how a future bug might leak.
+- **The fresh-token count** of `TokenRefresh` is a lower bound derived from
+  the timing, not a measure of a correct refresh: a provider that keeps a
+  refused token still fetches new ones when it rebuilds its pool after a
+  failed reconcile. The 1 s watcher, which sees that failure, is the check.
+- **Longer cache lifetimes** (`E2E_GOOGLE_CACHE_LIFETIME`, at most 30) make
+  the scenario slower and fetch fewer tokens; the JWKS waits allow two
+  minutes plus four cache lifetimes. The default of 10 s is what CI runs.
+- **A hanging metadata server** (`timeout` outage) is not part of the
+  scenario: it would hold provider workers for about 31 s while the other
+  servers' scenarios run in parallel. `SlowMetadataServer` and
+  `MetadataOutage` of the integration tests cover it.
 
 ## What only a test on real GKE covers
 

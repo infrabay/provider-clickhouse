@@ -18,7 +18,9 @@
 #   registry, the fake GCE metadata server, the ClickHouse servers, the
 #   tenants, crossplane-system), which takes their Secrets, Services and
 #   volumes with them;
-# - events in the default namespace about the removed objects.
+# - events in the default namespace about the removed objects;
+# - the runtime and fakegcp images the node pulled from the registry, on
+#   OrbStack (the host's Docker engine) and kind (each node's containerd).
 #
 # The harness installed Crossplane when crossplane-system carries the harness
 # label and no Crossplane Deployment runs in another namespace: run.sh
@@ -227,6 +229,28 @@ if [ "${E2E_KUBE_CONTEXT}" = "orbstack" ] && command -v docker >/dev/null 2>&1; 
 		done
 	done
 fi
+# On kind each node's containerd keeps them until the cluster is deleted, so
+# a cluster that is reused would collect a pair per run: remove them from the
+# nodes of the cluster kind-<name> (Docker containers with kind's cluster
+# label), and warn about what is left. node_images prints the IDs of those
+# images in the kind node $1.
+node_images() {
+	docker exec "$1" crictl images 2>/dev/null | awk -v a="localhost:${E2E_REGISTRY_PORT}/${E2E_PROVIDER}" \
+		-v b="localhost:${E2E_REGISTRY_PORT}/${E2E_FAKEGCP_REPO}" '$1 == a || $1 == b { print $3 }' | sort -u
+}
+case "${E2E_KUBE_CONTEXT}" in
+kind-*)
+	if command -v docker >/dev/null 2>&1; then
+		for node in $(docker ps --filter "label=io.x-k8s.kind.cluster=${E2E_KUBE_CONTEXT#kind-}" --format '{{.Names}}' 2>/dev/null); do
+			for img in $(node_images "${node}"); do
+				docker exec "${node}" crictl rmi "${img}" >/dev/null 2>&1 || true
+			done
+			left="$(node_images "${node}" | tr '\n' ' ')"
+			[ -z "${left}" ] || e2e::warn "images still in node ${node}: ${left}"
+		done
+	fi
+	;;
+esac
 
 e2e::log "checking for leftovers"
 leftovers=""

@@ -298,13 +298,18 @@ e2e::wait_until() {
 	done
 }
 
-# e2e::redact replaces every secret value the harness generated with
-# [REDACTED] in the files given as arguments (in place).
+# e2e::redact replaces every secret value the harness generated, and
+# anything that looks like a token, with [REDACTED] in the files given as
+# arguments (in place). Tokens are what test/e2e (redactTokens) treats as
+# such: a JWT or a piece of one (base64url of a JSON object starts with
+# "eyJ"), and a run of 100 or more base64url characters, such as a token's
+# signature segment on its own.
 e2e::redact() {
 	local f s value
-	[ -d "${E2E_WORKDIR}/secrets" ] || return 0
 	for f in "$@"; do
 		[ -f "${f}" ] || continue
+		LC_ALL=C sed -i.bak -E -e 's/eyJ[A-Za-z0-9_.-]*/[REDACTED]/g' -e 's/[A-Za-z0-9_-]{100,}/[REDACTED]/g' "${f}" && rm -f "${f}.bak"
+		[ -d "${E2E_WORKDIR}/secrets" ] || continue
 		for s in "${E2E_WORKDIR}"/secrets/*; do
 			[ -s "${s}" ] || continue
 			value="$(cat "${s}")"

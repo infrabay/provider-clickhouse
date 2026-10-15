@@ -173,7 +173,7 @@ func (s *Server) mint(o MintOptions, via string) (string, Issued, error) {
 	is := Issued{
 		Time: s.opts.Now(), Kid: h.Kid, Alg: h.Alg, Typ: h.Typ, Audience: c.Aud, Issuer: c.Iss,
 		Email: c.Email, Subject: c.Sub, IssuedAt: time.Unix(c.Iat, 0).UTC(), Expiry: time.Unix(c.Exp, 0).UTC(),
-		Fault: o.Fault, Via: via,
+		Fault: o.Fault, Via: via, Fingerprints: fingerprints(tok),
 	}
 	s.mu.Lock()
 	if len(s.issued) == maxLog {

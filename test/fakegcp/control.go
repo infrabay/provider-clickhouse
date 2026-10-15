@@ -23,7 +23,7 @@ const ControlPrefix = "/fakegcp/v1/"
 //	GET  /fakegcp/v1/state        State
 //	GET  /fakegcp/v1/jwks         the published keys
 //	GET  /fakegcp/v1/requests     served requests
-//	GET  /fakegcp/v1/issued       summaries of issued tokens (no tokens)
+//	GET  /fakegcp/v1/issued       summaries of issued tokens (no tokens; Issued.Fingerprints)
 //	POST /fakegcp/v1/identity     {"email": "...", "uniqueId": "..."}
 //	POST /fakegcp/v1/settings     {"ttl": "5m", "clockOffset": "-90s"} (both optional)
 //	POST /fakegcp/v1/fault        {"fault": "expired", "count": 1}  (count <= 0: until cleared)

@@ -25,9 +25,9 @@
 #  6. runs go test -tags e2e ./test/e2e/..., which activates the managed
 #     resource kinds and runs the scenarios.
 #
-# On failure, diagnostics (Secrets redacted) are written to
-# $E2E_WORKDIR/artifacts. Everything is removed afterwards (cleanup.sh) unless
-# E2E_KEEP=1.
+# On failure, diagnostics (Secrets, generated secret values and anything that
+# looks like a token redacted) are written to $E2E_WORKDIR/artifacts.
+# Everything is removed afterwards (cleanup.sh) unless E2E_KEEP=1.
 set -euo pipefail
 
 # shellcheck source=hack/e2e/lib.sh
@@ -346,9 +346,11 @@ run_tests() {
 	e2e::log "running test/e2e"
 	(
 		cd "${E2E_ROOT}"
+		# E2E_ARTIFACTS: a failed GoogleIDToken scenario writes the state of
+		# its objects and of the fake there before it deletes them.
 		# shellcheck disable=SC2086 # E2E_GO_TEST_ARGS is a list of flags.
 		E2E_POLL_INTERVAL="${E2E_POLL_INTERVAL}" E2E_CROSSPLANE_VERSION="${CROSSPLANE_VERSION}" E2E_GOOGLE_AUDIENCE="${E2E_GOOGLE_AUDIENCE}" \
-			"${GO}" test -tags e2e -count=1 -timeout "${E2E_TEST_TIMEOUT}" -v ./test/e2e/... ${E2E_GO_TEST_ARGS}
+			E2E_ARTIFACTS="${ARTIFACTS}" "${GO}" test -tags e2e -count=1 -timeout "${E2E_TEST_TIMEOUT}" -v ./test/e2e/... ${E2E_GO_TEST_ARGS}
 	) 2>&1 | tee "${ARTIFACTS}/go-test.log"
 }
 

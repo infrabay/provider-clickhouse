@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -209,6 +210,24 @@ type Issued struct {
 	// Via is "metadata" for tokens served by the identity endpoint and
 	// "mint" for Mint.
 	Via string `json:"via"`
+	// Fingerprints are the first and the last FingerprintLen characters of
+	// the token's signature segment (none for alg none). They are no
+	// credential: tests search logs, events and messages for them to find a
+	// leaked token, or a piece of one, that does not look like a JWT. The
+	// fake does not log them.
+	Fingerprints []string `json:"fingerprints,omitempty"`
+}
+
+// FingerprintLen is the length of each of Issued.Fingerprints.
+const FingerprintLen = 16
+
+// fingerprints returns Issued.Fingerprints of a signed token.
+func fingerprints(token string) []string {
+	sig := token[strings.LastIndexByte(token, '.')+1:]
+	if len(sig) < 2*FingerprintLen {
+		return nil
+	}
+	return []string{sig[:FingerprintLen], sig[len(sig)-FingerprintLen:]}
 }
 
 const maxLog = 4096

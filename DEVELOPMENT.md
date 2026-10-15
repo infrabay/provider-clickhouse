@@ -288,7 +288,7 @@ exists (for example left behind by an uninstalled Crossplane).
 | `E2E_UPSTREAM_IMAGE`, `E2E_ANTALYA_IMAGE` | 25.3.3.42-alpine, 26.6.4 Antalya | the servers |
 | `E2E_REGISTRY_IMAGE` | `registry:3.1.2` (by digest) | the in-cluster registry |
 | `E2E_REGISTRY_PORT` | `35000` | the registry's port on the node |
-| `E2E_GOOGLE_CACHE_LIFETIME` | `10` | `jwks_cache_lifetime` and `token_cache_lifetime` of the `google_jwt` processor, in seconds (production: 3600 and 300) |
+| `E2E_GOOGLE_CACHE_LIFETIME` | `10` | `jwks_cache_lifetime` and `token_cache_lifetime` of the `google_jwt` processor, in seconds, at most 30 (production: 3600 and 300) |
 | `E2E_KIND_CLUSTER`, `E2E_KIND_KUBECONFIG` | `xpch-e2e`, `_output/e2e/kind.kubeconfig` | the cluster of `make e2e-kind-up` and `make e2e-kind-down` |
 
 On failure the run writes diagnostics to `$E2E_WORKDIR/artifacts`: the
@@ -296,8 +296,12 @@ Provider and its revisions, activation policies and definitions, the
 provider's and Crossplane's logs, every managed resource and ProviderConfig
 with its conditions, events, pods, the servers' error logs and the test
 output, and the fake metadata server's request log (key IDs and claim
-summaries, never tokens). Secrets are listed by name, type and keys only,
-and every secret value the harness generated is replaced with `[REDACTED]`.
+summaries, never tokens). A failed GoogleIDToken scenario adds its objects
+and the fake's state (`google-objects.yaml`, `google-fakegcp.json`), written
+before its cleanup deletes them. Secrets are listed by name, type and keys
+only, and every secret value the harness generated, and anything that looks
+like a token (a JWT, or a run of 100 or more base64url characters such as a
+signature), is replaced with `[REDACTED]`.
 
 The run also writes diagnostics when it is interrupted (Ctrl-C, SIGTERM, a
 cancelled CI job). Afterwards (unless `E2E_KEEP=1`) `make e2e-cleanup` removes
@@ -310,10 +314,12 @@ Crossplane as its own only while `crossplane-system` carries that label and
 no Crossplane Deployment runs in another namespace; otherwise it leaves
 Crossplane, its CRDs and RBAC and the provider's CRDs alone. A
 `crossplane-system` without the label stops it. It fails if anything is left.
-On OrbStack it also removes the runtime and fakegcp images the node pulled
-from the registry; the third-party images the node pulled (Crossplane, both ClickHouse
-servers, the registry, several GB) stay in the Docker engine for later runs,
-and can be removed with `docker image rm`.
+On OrbStack and kind it also removes the runtime and fakegcp images the node
+pulled from the registry (on kind from each node's containerd, so that a
+reused cluster does not collect them). The third-party images the node
+pulled (Crossplane, both ClickHouse servers, the registry, several GB) stay
+for later runs: on OrbStack in the Docker engine, where `docker image rm`
+removes them, on kind until `make e2e-kind-down`.
 
 Known limits of the end-to-end tests:
 
