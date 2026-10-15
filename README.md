@@ -125,7 +125,9 @@ metadata:
 spec:
   package: ghcr.io/infrabay/provider-clickhouse:v0.1.0
 ---
-# The provider uses safe-start: activate its managed resource kinds.
+# The provider uses safe-start: activate its managed resource kinds (on
+# Crossplane 2.0.0 and 2.0.1 the wildcard activates the ProviderConfig kinds
+# too, which those releases require).
 apiVersion: apiextensions.crossplane.io/v1alpha1
 kind: ManagedResourceActivationPolicy
 metadata:

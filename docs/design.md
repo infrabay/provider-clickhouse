@@ -1802,7 +1802,7 @@ The policy of the `ClusterProviderConfig` is evaluated in Observe, after the eff
   - `WithLogger`;
   - `WithRecorder(event.NewAPIRecorder(...))`;
   - `WithMetricRecorder`.
-- Controllers are wrapped with `ratelimiter.NewReconciler` and `WithEventFilter(resource.DesiredStateChanged())`. They are registered through `SetupGated` with `o.Gate.Register(fn, gvk)`, so `crossplane.yaml` declares `capabilities: [safe-start]`.
+- Controllers are wrapped with `ratelimiter.NewReconciler` and `WithEventFilter(resource.DesiredStateChanged())`. They are registered through `SetupGated` with `o.Gate.Register(fn, gvk)`, so `crossplane.yaml` declares `capabilities: [safe-start]`. The ProviderConfig and ClusterProviderConfig controllers are gated too, on their own CRD and that of ProviderConfigUsage: Crossplane 2.0.0 and 2.0.1 turn the config CRDs of a safe-start provider into ManagedResourceDefinitions that an activation policy must activate (2.0.2 and later install them as CRDs), and a controller set up before its CRD exists stops the manager after the cache sync timeout. Found by the end-to-end tests ([10.4](#104-end-to-end)) with Crossplane 2.0.0; `TestConfigControllersWaitForTheirCRDs` (envtest) covers it.
 - **Connector flow:**
   1. Resolve the config by `mg.GetProviderConfigReference().Kind`:
      - **`ClusterProviderConfig`.** Get it. Validate its policy patterns (`InvalidConfig`). Check `allowedNamespaces` (skipped with `unrestricted`). If the namespace is not allowed:

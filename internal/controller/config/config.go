@@ -16,6 +16,9 @@
 package config
 
 import (
+	"fmt"
+
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
@@ -33,6 +36,42 @@ func Setup(mgr ctrl.Manager, o controller.Options) error {
 		return err
 	}
 	return setupClusterProviderConfig(mgr, o)
+}
+
+// SetupGated registers the ProviderConfig and ClusterProviderConfig
+// controllers with safe-start, like the managed resource controllers: each
+// is set up once the CRDs of its config kind and of ProviderConfigUsage are
+// installed. Crossplane 2.0.2 and later install these CRDs with the package.
+// Crossplane 2.0.0 and 2.0.1 turn them into ManagedResourceDefinitions that
+// stay inactive until an activation policy activates them; a controller set
+// up before that cannot start its watches, and the manager stops after the
+// cache sync timeout.
+func SetupGated(mgr ctrl.Manager, o controller.Options) error {
+	setupGated(o,
+		func() error { return setupProviderConfig(mgr, o) },
+		func() error { return setupClusterProviderConfig(mgr, o) })
+	return nil
+}
+
+// setupGated registers the setup functions of the two config controllers
+// with the gate of o.
+func setupGated(o controller.Options, providerConfig, clusterProviderConfig func() error) {
+	for _, c := range []struct {
+		setup   func() error
+		depends []schema.GroupVersionKind
+	}{
+		{providerConfig, []schema.GroupVersionKind{v1alpha1.ProviderConfigGroupVersionKind, v1alpha1.ProviderConfigUsageGroupVersionKind}},
+		{clusterProviderConfig, []schema.GroupVersionKind{v1alpha1.ClusterProviderConfigGroupVersionKind, v1alpha1.ProviderConfigUsageGroupVersionKind}},
+	} {
+		kind := c.depends[0].Kind
+		o.Gate.Register(func() {
+			// A failing setup panics, as the managed resource controllers'
+			// do: the manager cannot run without it.
+			if err := c.setup(); err != nil {
+				panic(fmt.Errorf("cannot set up the %s controller: %w", kind, err))
+			}
+		}, c.depends...)
+	}
 }
 
 func setupProviderConfig(mgr ctrl.Manager, o controller.Options) error {

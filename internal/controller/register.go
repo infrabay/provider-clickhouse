@@ -32,12 +32,15 @@ var ManagedKinds = []string{
 	v1alpha1.RoleGrantKind,
 }
 
-// SetupGated adds every controller to the manager. Managed resource
-// controllers are registered with safe-start: each is set up once its CRD is
-// installed and activated (capabilities: [safe-start] in crossplane.yaml).
+// SetupGated adds every controller to the manager. Every controller is
+// registered with safe-start: it is set up once the CRDs it watches are
+// installed, and for managed resource kinds activated (capabilities:
+// [safe-start] in crossplane.yaml). The ProviderConfig kinds are gated too,
+// because Crossplane 2.0.0 and 2.0.1 activate them like managed resource
+// kinds.
 func SetupGated(mgr ctrl.Manager, o controller.Options, d Dependencies) error {
 	for _, setup := range []func(ctrl.Manager, controller.Options) error{
-		config.Setup,
+		config.SetupGated,
 		func(mgr ctrl.Manager, o controller.Options) error { return database.SetupGated(mgr, o, d) },
 		func(mgr ctrl.Manager, o controller.Options) error { return user.SetupGated(mgr, o, d) },
 		func(mgr ctrl.Manager, o controller.Options) error { return role.SetupGated(mgr, o, d) },

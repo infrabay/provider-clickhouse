@@ -10,7 +10,10 @@
 #     - grants.clickhouse.m.infrabay.io
 #     - rolegrants.clickhouse.m.infrabay.io
 # A Grant or RoleGrant writes only for a grantee that a User or Role MR owns,
-# so activate User and Role together with them.
+# so activate User and Role together with them. Crossplane 2.0.0 and 2.0.1
+# activate the ProviderConfig kinds the same way: there, also list
+# providerconfigs, clusterproviderconfigs and providerconfigusages (the
+# wildcard below covers them).
 apiVersion: apiextensions.crossplane.io/v1alpha1
 kind: ManagedResourceActivationPolicy
 metadata:
