@@ -18,8 +18,8 @@ metadata:
 spec:
   crossplane:
     # The oldest Crossplane release with namespaced managed resources. The
-    # end-to-end job that will run it on kind is not written yet (design
-    # 10.4, OQ-34); the end-to-end tests run the controllers on envtest.
+    # end-to-end tests run it (make e2e-oldest, design 10.4) as well as the
+    # latest release.
     version: ">=v2.0.0"
   # Managed resource controllers start once their CRDs are activated
   # (ManagedResourceActivationPolicy, see examples/mrap.yaml).

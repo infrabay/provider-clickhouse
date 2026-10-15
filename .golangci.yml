@@ -1,5 +1,13 @@
 version: "2"
 
+run:
+  # Lint the tests behind build tags too (test/integration, test/envtest,
+  # test/e2e).
+  build-tags:
+    - integration
+    - envtest
+    - e2e
+
 linters:
   exclusions:
     # Unchecked Close/Remove/Fprint* calls: cleanup on an error path, where

@@ -405,8 +405,7 @@ policies and masking policies, which this provider does not manage yet.
 - Detecting an endpoint that reaches several servers with local user
   directories is best effort (design OQ-20).
 - `docs/auth.md`, `docs/security.md`, `docs/upgrade.md`, generated API
-  docs, quick-start example directories and an end-to-end job on kind are
-  planned (design OQ-34).
+  docs and quick-start example directories are planned (design OQ-34).
 
 ## Documentation
 

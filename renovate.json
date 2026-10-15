@@ -7,12 +7,12 @@
   "customManagers": [
     {
       "customType": "regex",
-      "description": "Tool versions annotated with `# renovate:` in the Makefile",
+      "description": "Tool versions annotated with `# renovate:` in the Makefile (registryUrl for Helm charts such as Crossplane)",
       "managerFilePatterns": [
         "/^Makefile$/"
       ],
       "matchStrings": [
-        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)\\n[A-Z_]+ \\?= (?<currentValue>\\S+)"
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: registryUrl=(?<registryUrl>\\S+))?\\n[A-Z_]+ \\?= (?<currentValue>\\S+)"
       ]
     }
   ],

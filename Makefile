@@ -10,6 +10,15 @@ CROSSPLANE_CLI_VERSION ?= v2.5.0
 # setup-envtest branch matching controller-runtime, and the kube-apiserver line.
 SETUP_ENVTEST_VERSION ?= release-0.23
 ENVTEST_K8S_VERSION ?= 1.35.x
+# Crossplane for make e2e: the latest release (crossplane-stable chart) and the
+# oldest release that package/crossplane.yaml allows (make e2e-oldest).
+# renovate: datasource=helm depName=crossplane registryUrl=https://charts.crossplane.io/stable
+CROSSPLANE_VERSION ?= 2.4.2
+CROSSPLANE_MIN_VERSION ?= 2.0.0
+# kind for make e2e-kind-up; the node image matches the kind release.
+# renovate: datasource=github-releases depName=kubernetes-sigs/kind
+KIND_VERSION ?= v0.33.0
+KIND_NODE_IMAGE ?= kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
 
 GO ?= go
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0.0-dev)
@@ -24,6 +33,14 @@ OUTPUT := $(CURDIR)/_output
 # them into bin/envtest on first use.
 SETUP_ENVTEST = $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir $(BIN)/envtest -p path
 CROSSPLANE ?= $(BIN)/crossplane
+KIND ?= $(GO) run sigs.k8s.io/kind@$(KIND_VERSION)
+# The kind cluster of make e2e-kind-up and its kubeconfig (a separate file:
+# ~/.kube/config is never touched).
+E2E_KIND_CLUSTER ?= xpch-e2e
+E2E_KIND_KUBECONFIG ?= $(OUTPUT)/e2e/kind.kubeconfig
+# The cluster's own Docker network (not kind's shared "kind" network), which
+# make e2e-kind-down removes.
+E2E_KIND_NETWORK ?= $(E2E_KIND_CLUSTER)
 HOST_OS := $(shell $(GO) env GOOS)
 HOST_ARCH := $(shell $(GO) env GOARCH)
 
@@ -51,6 +68,30 @@ integration: test-integration
 .PHONY: envtest
 envtest: ## CRD validation (CEL) and examples dry-run against a real kube-apiserver.
 	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST))" $(GO) test -tags envtest -count=1 ./test/envtest/...
+
+.PHONY: e2e
+e2e: $(CROSSPLANE) ## End-to-end tests: install the package into the local cluster E2E_KUBE_CONTEXT (required) and run test/e2e.
+	CROSSPLANE_VERSION=$(CROSSPLANE_VERSION) CROSSPLANE=$(CROSSPLANE) GO=$(GO) MAKE=$(MAKE) hack/e2e/run.sh
+
+.PHONY: e2e-oldest
+e2e-oldest: ## make e2e with the oldest Crossplane release that package/crossplane.yaml allows.
+	$(MAKE) e2e CROSSPLANE_VERSION=$(CROSSPLANE_MIN_VERSION)
+
+.PHONY: e2e-cleanup
+e2e-cleanup: ## Remove everything make e2e installed from E2E_KUBE_CONTEXT.
+	hack/e2e/cleanup.sh
+
+.PHONY: e2e-kind-up
+e2e-kind-up: ## Create the kind cluster E2E_KIND_CLUSTER for make e2e (context kind-<name>, kubeconfig E2E_KIND_KUBECONFIG).
+	@case "$(E2E_KIND_CLUSTER)" in xpch-e2e*) ;; *) echo "E2E_KIND_CLUSTER must start with xpch-e2e"; exit 1 ;; esac
+	@mkdir -p $(dir $(E2E_KIND_KUBECONFIG))
+	KIND_EXPERIMENTAL_DOCKER_NETWORK=$(E2E_KIND_NETWORK) $(KIND) create cluster --name $(E2E_KIND_CLUSTER) --image $(KIND_NODE_IMAGE) --kubeconfig $(E2E_KIND_KUBECONFIG) --wait 5m
+
+.PHONY: e2e-kind-down
+e2e-kind-down: ## Delete the kind cluster E2E_KIND_CLUSTER and its Docker network.
+	@case "$(E2E_KIND_CLUSTER)" in xpch-e2e*) ;; *) echo "E2E_KIND_CLUSTER must start with xpch-e2e"; exit 1 ;; esac
+	$(KIND) delete cluster --name $(E2E_KIND_CLUSTER) --kubeconfig $(E2E_KIND_KUBECONFIG)
+	@if docker network inspect $(E2E_KIND_NETWORK) >/dev/null 2>&1; then docker network rm $(E2E_KIND_NETWORK) >/dev/null; fi
 
 .PHONY: validate
 validate: $(CROSSPLANE) ## Validate examples against the CRDs with the Crossplane CLI.

@@ -1,0 +1,66 @@
+# A throwaway OCI registry for the provider package (hack/e2e/run.sh fills in
+# the @@...@@ placeholders). It is reached in three ways:
+#
+# - the harness pushes the .xpkg through a port-forward to the Service;
+# - the Crossplane package manager pulls the package through the Service's
+#   ClusterIP. go-containerregistry speaks plain HTTP to RFC 1918 addresses,
+#   so no TLS is needed;
+# - the node's container runtime pulls the same package as the provider's
+#   runtime image from localhost:@@REGISTRY_PORT@@. The pod uses the host
+#   network so that this address is the registry on every node, and container
+#   runtimes (Docker, containerd) speak plain HTTP to localhost registries
+#   without extra configuration. A ClusterIP address would need an
+#   insecure-registry entry in the node's runtime configuration.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: registry
+  namespace: xpch-e2e-registry
+  labels: {app.kubernetes.io/name: registry, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: registry}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: registry, app.kubernetes.io/part-of: xpch-e2e}
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      automountServiceAccountToken: false
+      tolerations:
+        - {key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule}
+      containers:
+        - name: registry
+          image: @@REGISTRY_IMAGE@@
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: REGISTRY_HTTP_ADDR, value: "0.0.0.0:@@REGISTRY_PORT@@"}
+            - {name: REGISTRY_STORAGE_FILESYSTEM_ROOTDIRECTORY, value: /var/lib/registry}
+            - {name: OTEL_TRACES_EXPORTER, value: none}
+          ports:
+            - {name: registry, containerPort: @@REGISTRY_PORT@@, protocol: TCP}
+          readinessProbe:
+            httpGet: {path: /v2/, port: @@REGISTRY_PORT@@}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/registry}
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: registry
+  namespace: xpch-e2e-registry
+  labels: {app.kubernetes.io/name: registry, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  type: ClusterIP
+  selector: {app.kubernetes.io/name: registry}
+  ports:
+    - {name: registry, port: 5000, targetPort: @@REGISTRY_PORT@@, protocol: TCP}

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Revision 5, after verifying the fixes of the review of the four access entity controllers. Revision 4 re-verified the access entity facts on upstream 25.3.3.42, built the foundations that User, Role, Grant and RoleGrant share, implemented and registered those four controllers, and fixed the findings of their review (security, ClickHouse semantics, Crossplane). Revision 3 followed the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller); revision 2 the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
+| Status | Revision 6, after the end-to-end tests of the installed package ([10.4](#104-end-to-end)) and the two fixes they found. Revision 5 verified the fixes of the review of the four access entity controllers. Revision 4 re-verified the access entity facts on upstream 25.3.3.42, built the foundations that User, Role, Grant and RoleGrant share, implemented and registered those four controllers, and fixed the findings of their review (security, ClickHouse semantics, Crossplane). Revision 3 followed the code review of the first implementation (ClusterProviderConfigs, ProviderConfigs and the Database controller); revision 2 the design review (ClickHouse semantics, Crossplane security, open-source usability). This document is the reference for implementing v1alpha1. |
 | Module and repository | `github.com/infrabay/provider-clickhouse` |
 | Package | `ghcr.io/infrabay/provider-clickhouse` |
 | API group and version | `clickhouse.m.infrabay.io/v1alpha1` |
@@ -17,6 +17,12 @@ Evidence markers used below:
 - **[T]**: an assumption. An integration test must confirm it before the feature is called done.
 
 Decisions taken during the review are collected in [section 12](#12-decisions) (D-n). Open questions are marked **OQ-n** where they come up and are collected in [section 13](#13-open-questions).
+
+### What changed in revision 6
+
+- **End-to-end tests of the real package** ([10.4](#104-end-to-end)): `make e2e` installs the `.xpkg` from a registry inside a local cluster, with Crossplane 2.0.0 (the oldest release that `crossplane.yaml` allows) and the latest release, and runs every kind against upstream 25.3.3.42 with password identities and Antalya 26.6.4 with projected service account tokens. CI runs it on kind. OQ-34 no longer lists the job.
+- **Graceful shutdown finishes running reconciles** ([5.9](#59-shared-controller-wiring)): a provider pod deleted right after a User or Role `CREATE` lost the claim, and the next process refused the entity as `NotOwned`. Running reconciles now finish on SIGTERM, and the ClickHouse pools stay open until the manager has stopped. Only a crash still needs adoption (D-29, OQ-28).
+- **The config controllers are gated** ([5.9](#59-shared-controller-wiring)): Crossplane 2.0.0 and 2.0.1 install the ProviderConfig kinds of a safe-start provider as ManagedResourceDefinitions that must be activated, and the provider stopped after the cache sync timeout while they were inactive. The ProviderConfig and ClusterProviderConfig controllers now wait for their CRDs, like the managed resource controllers.
 
 ### What changed in revision 5
 
@@ -2349,13 +2355,20 @@ These are written by crossplane-runtime's local publisher to the MR's namespace 
 
 ### 10.4 End-to-end
 
-1. Create a kind cluster `xpch-e2e`.
-2. Install Crossplane with the `crossplane-stable/crossplane` Helm chart. The CI matrix runs the oldest supported 2.x release (2.0.x) and the latest one. That keeps the `crossplane.yaml` constraint honest.
-3. `kubectl apply -f package/crds`.
-4. Run the provider out of cluster (`go run ./cmd/provider --debug`) against a ClickHouse container.
-5. Assert with `kubectl wait` or chainsaw, including an MRAP that activates `*.clickhouse.m.infrabay.io`.
+`make e2e` (`hack/e2e/run.sh`, tests in `test/e2e` with build tag `e2e`) installs the real package into a local cluster: OrbStack, Docker Desktop, kind and similar, named explicitly by `E2E_KUBE_CONTEXT`. The harness refuses any other context, and any context whose API server is not local, and never uses or changes the kubeconfig's current context. CI runs it on kind (`make e2e-kind-up`, kind at the Makefile pin, run through `go run`) with the oldest Crossplane release that `crossplane.yaml` allows (2.0.0, `make e2e-oldest`) and the latest one, which keeps the constraint honest.
 
-Installing the real xpkg into kind needs a local registry, so it is deferred. Meanwhile the end-to-end tests of [10.2](#102-integration-tests-build-tag-integration) (scenario 17) run the provider's controllers, wired as in `cmd/provider`, against envtest and every image.
+1. **Package.** `make xpkg` for the node architecture. A throwaway registry runs in the cluster on the host network; the harness pushes the `.xpkg` through a port-forward with the pinned Crossplane CLI. `Provider.spec.package` names the registry's ClusterIP: go-containerregistry, which the package manager uses, speaks plain HTTP to RFC 1918 addresses. The runtime image is the same package, pulled by the node's container runtime from `localhost:<port>`, which Docker and containerd allow over plain HTTP without configuration (a ClusterIP would need an insecure-registry entry in the node's runtime configuration). The `DeploymentRuntimeConfig` sets it. No public registry holds the provider package.
+2. **Crossplane** from the `crossplane-stable` chart (`CROSSPLANE_VERSION`) with `provider.defaultActivations=[]`, so that no activation policy exists.
+3. **Servers.** Upstream `25.3.3.42-alpine` with password identities, and Antalya `26.6.4` with JWT identities: the provider's service account logs in with its projected token (`TokenFile`, `examples/runtime/projected-token.yaml`), a tenant with a service account token stored in a Secret (`TokenSecret`). The token processor is `jwt_static_jwks` with the cluster's service account keys, read from the API server at setup ([Appendix B](#appendix-b-server-side-configuration-examples), variant b). Every identity holds exactly the grants of the README quick start, which the harness reads from `README.md`; on Antalya it also holds user DDL on `` `system:serviceaccount:xpch-e2e-`* ``. The administrators are used only for assertions.
+4. **Install.** `examples/provider.yaml` and `examples/runtime/projected-token.yaml`, with `--poll=10s`. Crossplane 2.1 and later keep a safe-start provider's runtime scaled to zero until a kind is active; 2.0 starts it right away.
+5. **Scenarios** (`TestEndToEnd`), asserted through the Kubernetes API (conditions, annotations, connection Secrets) and through SQL as the administrator:
+   - activation: before any policy the five ManagedResourceDefinitions are `Inactive` and their CRDs absent (on Crossplane 2.0.0 and 2.0.1 also those of the three ProviderConfig kinds, which the config controllers wait for, [5.9](#59-shared-controller-wiring)); a policy for `databases` creates only that CRD; `examples/mrap.yaml` activates the rest, and the provider pod becomes ready without a restart;
+   - per server, in parallel: the lifecycle of every kind on a `ClusterProviderConfig` with a closed policy and on a namespaced `ProviderConfig`; the user logs in with its connection Secret (with a service account token on Antalya; tokens of another account or audience are refused) and can do exactly what the Grant and the RoleGrant give it; drift by the administrator (`REVOKE` of a privilege and of the membership, a foreign privilege at the Grant's target, `ALTER USER ... HOST NONE`, `VALID UNTIL`, `DEFAULT DATABASE`, and a comment where the server can change it) is repaired within the poll interval plus a margin; MRs for a foreign database, user and role, and a Grant and a RoleGrant for the foreign user, are `NotOwned`, and the foreign objects stay byte-identical (UUIDs, `SHOW CREATE`, `SHOW GRANTS`, memberships); a name outside the policy, a namespace outside `allowedNamespaces` and a disallowed authentication method are `PolicyViolation` and run no statement; observe-only MRs report the UUIDs, claim nothing and run no statement that changes anything (`system.query_log`, by `log_comment`);
+   - provider restart: the provider pod is deleted right after new MRs of every kind were created; every MR becomes Ready, no claim and no UUID changes, every object was created exactly once, and no new ProviderRevision appears;
+   - deletion: the Grant and the RoleGrant revoke only their privileges and membership; a database with a table is refused (`DatabaseNotEmpty`) until the table is gone; the provider's users, roles and databases are dropped; deleting the refused MRs leaves the foreign objects as they were, and the foreign user still logs in; the configs can then be deleted.
+6. **Diagnostics** on failure in `$E2E_WORKDIR/artifacts` (Secrets by name and keys only, generated secret values redacted), and **cleanup** (`make e2e-cleanup`) afterwards unless `E2E_KEEP=1`: the cluster is left as it was, and the cleanup fails if anything remains.
+
+The integration tests of [10.2](#102-integration-tests-build-tag-integration) (scenario 17) still run the provider's controllers on envtest against every image of the matrix.
 
 ---
 
@@ -2397,7 +2410,9 @@ Installing the real xpkg into kind needs a local registry, so it is deferred. Me
 │   ├── mrap.yaml                       # ManagedResourceActivationPolicy for *.clickhouse.m.infrabay.io
 │   └── <kind>.yaml                     # one file per kind; cluster Databases without Delete
 ├── test/integration/               # build tag "integration"; the tests write the servers' config.d and users.d files
-├── test/envtest/                   # CRD validation and example dry-run
+├── test/envtest/                   # CRD validation, example dry-run, config controllers before their CRDs exist
+├── test/e2e/                       # build tag "e2e"; the installed package in a local cluster (10.4)
+├── hack/e2e/                       # make e2e: setup, cleanup, diagnostics, registry and ClickHouse manifests
 ├── hack/boilerplate.go.txt         # SPDX header
 ├── docs/                           # design.md, operations.md; api.md (generated), auth.md, security.md, upgrade.md planned (OQ-34)
 ├── .github/workflows/{test.yml,release.yml}
@@ -2483,7 +2498,7 @@ metadata:
       databases, users, roles and grants, with JWT users on Altinity Antalya.
 spec:
   crossplane:
-    version: ">=v2.0.0"   # the oldest version the planned e2e job runs (10.4, OQ-34)
+    version: ">=v2.0.0"   # the oldest version, which make e2e-oldest runs (10.4)
   capabilities: [safe-start]
 ```
 
@@ -2498,7 +2513,7 @@ spec:
 | lint | golangci-lint-action v9 |
 | govulncheck | `go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...` |
 | integration | runs on ubuntu with Docker; `make integration`; a matrix over the five images in [10.2](#102-integration-tests-build-tag-integration), plus the cluster scenario |
-| e2e | planned: kind + Crossplane 2.0.x and latest ([10.4](#104-end-to-end), **OQ-34**); meanwhile the integration job runs the controllers on envtest (scenario 17) |
+| e2e | kind (pinned, `make e2e-kind-up`) with a matrix over Crossplane 2.0.0 (`make e2e-oldest`) and the latest release (`make e2e`), both pinned in the Makefile; diagnostics are uploaded on failure ([10.4](#104-end-to-end)) |
 | gitleaks | gitleaks v8 CLI (the org action needs a licence); fake test secrets carry `gitleaks:allow` |
 
 **`release.yml`** runs on `v*` tags.
@@ -2641,7 +2656,7 @@ Decisions taken while applying the review. Where the critics disagreed, or offer
 | OQ-31 | Detect a third-party `REVOKE GRANT OPTION FOR` at a Grant's target that the server does not list (A57), while the Grant's record says it gave the grant option? | Not in v1: the state is unobservable through SQL; re-granting on every reconcile would erase third-party partial revokes below the target. The same state reached through a broader revoke is OQ-33. |
 | OQ-32 | Restore the narrower grants of the same privilege that a REVOKE at a Grant's target removes ([5.6](#56-grant))? | Not in v1. Another Grant at a narrower target grants its privilege again on its next poll. A grant option that the server hides at the narrower target is granted again only where that Grant saw the broader one (OQ-33). |
 | OQ-33 | Detect that a `REVOKE GRANT OPTION FOR` at a broader target removed a grant option that a narrower Grant recorded where the server hides it (A57): another Grant of the same grantee that turns its option on and off again between two polls of the narrower Grant, one whose own option the server hides too, or a third party ([5.6](#56-grant))? | Not in v1. The rows before and after are identical, so only the narrower Grant's own observations could tell: it forgets its record while it sees a broader grant option and grants its own again once that is gone, which covers a broader option that lasts a poll interval. Re-granting periodically would erase third-party revokes below the target, and invalidating the records of narrower Grants from the broader one would couple MRs. The failure is closed (the grantee holds less than the Grant reports); removing the record annotation makes the Grant grant the option again (`docs/operations.md`). |
-| OQ-34 | Documentation and artefacts that this design names but that do not exist yet: `docs/auth.md`, `docs/security.md`, `docs/upgrade.md`, `docs/api.md` (generated with `crd-ref-docs`, with a CI diff check), the quick-start example directories, and the end-to-end job on kind with Crossplane 2.0.x and the latest release ([10.4](#104-end-to-end), [11.4](#114-ci-github-actions)). | Not written yet. The README, this design and `docs/operations.md` cover the topics meanwhile, and the integration tests run the provider's controllers on envtest (scenario 17 of [10.2](#102-integration-tests-build-tag-integration)). |
+| OQ-34 | Documentation and artefacts that this design names but that do not exist yet: `docs/auth.md`, `docs/security.md`, `docs/upgrade.md`, `docs/api.md` (generated with `crd-ref-docs`, with a CI diff check) and the quick-start example directories. The end-to-end job on kind exists since revision 6 ([10.4](#104-end-to-end), [11.4](#114-ci-github-actions)). | Not written yet. The README, this design and `docs/operations.md` cover the topics meanwhile. |
 
 **Closed in revision 2:**
 

@@ -32,6 +32,8 @@ package/                       crossplane.yaml and the generated CRDs
 examples/                      example manifests, validated in CI
 test/envtest/                  CRD validation against a real kube-apiserver
 test/integration/              tests against ClickHouse containers
+test/e2e/                      end-to-end tests of the installed package (make e2e)
+hack/e2e/                      the end-to-end harness: setup, cleanup, diagnostics, manifests
 cluster/images/                the runtime image
 docs/design.md                 the design
 docs/operations.md             the operations runbook
@@ -48,6 +50,7 @@ make envtest           # CRD CEL rules and examples against a real kube-apiserve
 make validate          # crossplane resource validate package/crds examples
 make test-integration  # ClickHouse containers (Docker)
 make reviewable        # generate + lint + test + envtest, and fail on uncommitted generated changes
+make e2e E2E_KUBE_CONTEXT=<local context>  # the real package on a local cluster (see below)
 make help              # every target
 ```
 
@@ -150,6 +153,96 @@ docker ps -a --filter name=xpch- --format '{{.Names}}' | xargs -r docker rm -f
 Use the same `xpch-` prefix for any container you start by hand while
 developing (for example `docker run --name xpch-dev-clickhouse ...`).
 
+## End-to-end tests
+
+`make e2e` installs the real package into a local Kubernetes cluster and runs
+`test/e2e` (build tag `e2e`) against it. `hack/e2e/run.sh` does the setup:
+
+1. builds the runtime image and the `.xpkg` for the node architecture
+   (`make xpkg PLATFORMS=linux/<arch>`);
+2. starts a throwaway registry inside the cluster (namespace
+   `xpch-e2e-registry`) and pushes the package there with the pinned Crossplane
+   CLI, through a port-forward. The Crossplane package manager pulls it
+   through the registry's ClusterIP (go-containerregistry speaks plain HTTP to
+   RFC 1918 addresses). The provider's runtime image is the same package; the
+   node's container runtime pulls it from `localhost:35000`, because the
+   registry runs on the host network and container runtimes speak plain HTTP
+   to localhost registries without configuration. The
+   `DeploymentRuntimeConfig` sets that image. No public registry is involved;
+3. installs Crossplane (`CROSSPLANE_VERSION`, crossplane-stable chart) with
+   `provider.defaultActivations=[]`, so no activation policy exists;
+4. starts upstream ClickHouse 25.3.3.42 and Altinity Antalya 26.6.4 (namespace
+   `xpch-e2e-clickhouse`). Upstream has password identities for the provider
+   and for a tenant; Antalya has JWT identities for the provider's service
+   account and a tenant's service account. They are validated by a
+   `jwt_static_jwks` token processor that holds the cluster's service account
+   keys, read from the API server at setup. Every identity holds exactly the
+   grants of the README quick start, read from `README.md` at run time (on
+   Antalya plus user DDL for `system:serviceaccount:xpch-e2e-*` users). The
+   administrators are only used by the tests' assertions;
+5. installs the package with `examples/provider.yaml` and
+   `examples/runtime/projected-token.yaml` (the projected token for the
+   `TokenFile` identity), with `--poll=10s` and `--debug` added, and waits
+   until it is healthy.
+
+The tests then activate the managed resource kinds (one kind first, then
+`examples/mrap.yaml`; Crossplane 2.0.0 and 2.0.1 activate the ProviderConfig
+kinds the same way) and run, against both servers: the lifecycle of every
+kind through a `ClusterProviderConfig` with a closed policy and a namespaced
+`ProviderConfig`; a login with the connection Secret (with a service account
+token on Antalya) that can do exactly what was granted; out-of-band drift
+(`REVOKE`, `ALTER USER`, comments) repaired within the poll interval; foreign
+objects with the same names refused and byte-identical; policy violations;
+observe-only resources that never write (`system.query_log`); a provider pod
+deleted while resources are being created; and deletion, which drops and
+revokes only what the provider created.
+
+```sh
+make e2e E2E_KUBE_CONTEXT=orbstack          # latest Crossplane (CROSSPLANE_VERSION)
+make e2e-oldest E2E_KUBE_CONTEXT=orbstack   # oldest allowed (CROSSPLANE_MIN_VERSION)
+
+make e2e-kind-up                            # kind cluster xpch-e2e (own Docker network), kubeconfig _output/e2e/kind.kubeconfig
+make e2e E2E_KUBE_CONTEXT=kind-xpch-e2e E2E_KUBECONFIG=$PWD/_output/e2e/kind.kubeconfig
+make e2e-kind-down                          # deletes the cluster and its network
+
+make e2e-cleanup E2E_KUBE_CONTEXT=orbstack  # after E2E_KEEP=1 or an interrupted run
+```
+
+`E2E_KUBE_CONTEXT` is required, and must be a local cluster context
+(`orbstack`, `docker-desktop`, `minikube`, `rancher-desktop`, `kind-*`,
+`k3d-*`) whose API server is on this machine or a private network. The
+harness and the tests never use or change the kubeconfig's current context;
+every `kubectl` and `helm` call names the context. The run needs Docker (for
+the image build), `kubectl`, `helm`, `openssl` and `curl`, a single-architecture
+cluster, and about 4 GB of memory for the two servers.
+
+| Variable | Default | |
+|---|---|---|
+| `E2E_KUBECONFIG` | the default kubeconfig | a separate kubeconfig, for example kind's |
+| `CROSSPLANE_VERSION` | the Makefile pin | the Crossplane chart version |
+| `E2E_KEEP` | `0` | `1` leaves everything installed |
+| `E2E_WORKDIR` | `_output/e2e` | generated files, secrets (mode 0600) and `artifacts/` |
+| `E2E_POLL_INTERVAL` | `10s` | the provider's `--poll` |
+| `E2E_UPSTREAM_IMAGE`, `E2E_ANTALYA_IMAGE` | 25.3.3.42-alpine, 26.6.4 Antalya | the servers |
+| `E2E_REGISTRY_PORT` | `35000` | the registry's port on the node |
+
+On failure the run writes diagnostics to `$E2E_WORKDIR/artifacts`: the
+Provider and its revisions, activation policies and definitions, the
+provider's and Crossplane's logs, every managed resource and ProviderConfig
+with its conditions, events, pods, the servers' error logs and the test
+output. Secrets are listed by name, type and keys only, and every secret
+value the harness generated is replaced with `[REDACTED]`.
+
+Afterwards (unless `E2E_KEEP=1`) `make e2e-cleanup` removes everything: the
+resources of the test namespaces, the Provider, the activation policies,
+Crossplane with its CRDs, ClusterRoles, ClusterRoleBindings and webhook
+configurations, the provider's CRDs, every namespace labelled
+`app.kubernetes.io/part-of=xpch-e2e`, and events about the removed objects in
+`default`. It refuses to touch a Crossplane installation that the harness did
+not create (`crossplane-system` without that label) and fails if anything is
+left. On OrbStack it also removes the runtime images the node pulled from the
+registry.
+
 ## Running the provider locally
 
 ```sh
@@ -179,7 +272,10 @@ gofmt, vet, build, the generated-files check, unit tests and a guard against
 workstation paths; envtest and `crossplane resource validate`; golangci-lint;
 govulncheck; the integration matrix (upstream 25.3, 25.8 and 26.8, Antalya
 26.3 and 26.6; each job runs every integration and end-to-end test against
-its image); and gitleaks.
+its image); the end-to-end tests on kind with the oldest Crossplane release
+that `package/crossplane.yaml` allows and with the latest one
+(`make e2e-oldest` and `make e2e`, diagnostics uploaded on failure); and
+gitleaks.
 
 ## Releasing
 

@@ -1,0 +1,132 @@
+# ClickHouse servers of the end-to-end tests (hack/e2e/run.sh fills in the
+# @@...@@ placeholders and creates the Secrets and ConfigMaps they mount):
+#
+# - upstream: upstream ClickHouse. The provider identity is a password user
+#   in users.d (Secret upstream-users-d) with exactly the grants of the
+#   README quick start.
+# - antalya: Altinity Antalya. The provider identity is a JWT user in users.d
+#   (Secret antalya-users-d) pinned to the token processor "kubernetes"
+#   (ConfigMap antalya-config), which validates projected service account
+#   tokens against the cluster's JWKS (ConfigMap antalya-jwks, read from the
+#   API server at setup).
+#
+# The administrator (password in the Secrets upstream-admin and
+# antalya-admin) is used only by the tests' assertions. Data lives in
+# emptyDir volumes, so nothing outlives the namespace.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: upstream
+  namespace: xpch-e2e-clickhouse
+  labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: upstream, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: upstream}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: upstream, app.kubernetes.io/part-of: xpch-e2e}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: clickhouse
+          image: @@UPSTREAM_IMAGE@@
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: CLICKHOUSE_USER, value: admin}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: {secretKeyRef: {name: upstream-admin, key: password}}
+            - {name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1"}
+          ports:
+            - {name: native, containerPort: 9000}
+            - {name: http, containerPort: 8123}
+          readinessProbe:
+            httpGet: {path: /ping, port: 8123}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 512Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: users-d, mountPath: /etc/clickhouse-server/users.d/provider-clickhouse.yaml, subPath: provider-clickhouse.yaml, readOnly: true}
+            - {name: data, mountPath: /var/lib/clickhouse}
+      volumes:
+        - name: users-d
+          secret: {secretName: upstream-users-d}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: upstream
+  namespace: xpch-e2e-clickhouse
+  labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: upstream, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  selector: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: upstream}
+  ports:
+    - {name: native, port: 9000, targetPort: native}
+    - {name: http, port: 8123, targetPort: http}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: antalya
+  namespace: xpch-e2e-clickhouse
+  labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: antalya, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector:
+    matchLabels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: antalya}
+  template:
+    metadata:
+      labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: antalya, app.kubernetes.io/part-of: xpch-e2e}
+    spec:
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 5
+      containers:
+        - name: clickhouse
+          image: @@ANTALYA_IMAGE@@
+          imagePullPolicy: IfNotPresent
+          env:
+            - {name: CLICKHOUSE_USER, value: admin}
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom: {secretKeyRef: {name: antalya-admin, key: password}}
+            - {name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1"}
+          ports:
+            - {name: native, containerPort: 9000}
+            - {name: http, containerPort: 8123}
+          readinessProbe:
+            httpGet: {path: /ping, port: 8123}
+            periodSeconds: 2
+          resources:
+            requests: {cpu: 100m, memory: 512Mi}
+            limits: {memory: 2Gi}
+          volumeMounts:
+            - {name: config, mountPath: /etc/clickhouse-server/config.d/token_processors.yaml, subPath: token_processors.yaml, readOnly: true}
+            - {name: jwks, mountPath: /etc/clickhouse-server/jwks, readOnly: true}
+            - {name: users-d, mountPath: /etc/clickhouse-server/users.d/provider-clickhouse.yaml, subPath: provider-clickhouse.yaml, readOnly: true}
+            - {name: data, mountPath: /var/lib/clickhouse}
+      volumes:
+        - name: config
+          configMap: {name: antalya-config}
+        - name: jwks
+          configMap: {name: antalya-jwks}
+        - name: users-d
+          secret: {secretName: antalya-users-d}
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: antalya
+  namespace: xpch-e2e-clickhouse
+  labels: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: antalya, app.kubernetes.io/part-of: xpch-e2e}
+spec:
+  selector: {app.kubernetes.io/name: clickhouse, app.kubernetes.io/instance: antalya}
+  ports:
+    - {name: native, port: 9000, targetPort: native}
+    - {name: http, port: 8123, targetPort: http}
