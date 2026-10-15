@@ -35,6 +35,7 @@ import (
 	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/reason"
 	"github.com/infrabay/provider-clickhouse/test/fakegcp"
+	"github.com/infrabay/provider-clickhouse/test/fakegcp/fakeadc"
 )
 
 // Google service accounts of these tests. All names are examples.
@@ -101,7 +102,7 @@ func startGoogleFake(t *testing.T) *googleFake {
 	}
 	meta := serveHTTP(t, "127.0.0.1:0", fake.MetadataHandler())
 	jwks := serveHTTP(t, net.JoinHostPort(bind, "0"), fake.JWKSHandler())
-	fakegcp.UseFake(t, meta.String())
+	fakeadc.UseFake(t, meta.String())
 	_, port, _ := net.SplitHostPort(jwks.String())
 	return &googleFake{Server: fake, jwksURI: "http://host.docker.internal:" + port + fakegcp.JWKSPath}
 }
@@ -794,7 +795,7 @@ func testGoogleIDTokenAntalya(t *testing.T, image string) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !fakegcp.UsesNewAuthLibrary(ts) || fake.identityFetches() != ids {
+		if !fakeadc.UsesNewAuthLibrary(ts) || fake.identityFetches() != ids {
 			t.Fatalf("the switch did not take effect: token source %T, %d ID token requests in NewTokenSource", ts, fake.identityFetches()-ids)
 		}
 		before := len(fake.Requests())

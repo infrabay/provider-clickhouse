@@ -1,7 +1,11 @@
 // Copyright 2026 The provider-clickhouse Authors
 // SPDX-License-Identifier: Apache-2.0
 
-package fakegcp
+// Package fakeadc points the Google client libraries of a test process at a
+// fake metadata server (package fakegcp) and tells which library they use.
+// It is separate from fakegcp so that the fake, and the image of its binary,
+// depend on the standard library only.
+package fakeadc
 
 import (
 	"reflect"

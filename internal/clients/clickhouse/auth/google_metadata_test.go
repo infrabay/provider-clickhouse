@@ -18,6 +18,7 @@ import (
 
 	"github.com/infrabay/provider-clickhouse/internal/reason"
 	"github.com/infrabay/provider-clickhouse/test/fakegcp"
+	"github.com/infrabay/provider-clickhouse/test/fakegcp/fakeadc"
 )
 
 // TestGoogleSourceWithMetadataServer runs NewGoogleSource without a key
@@ -34,7 +35,7 @@ func TestGoogleSourceWithMetadataServer(t *testing.T) {
 	hs := httptest.NewServer(fake.Handler())
 	t.Cleanup(hs.Close)
 	t.Cleanup(fake.Close)
-	fakegcp.UseFake(t, strings.TrimPrefix(hs.URL, "http://"))
+	fakeadc.UseFake(t, strings.TrimPrefix(hs.URL, "http://"))
 
 	s, err := NewGoogleSource(aud, nil)
 	if err != nil {

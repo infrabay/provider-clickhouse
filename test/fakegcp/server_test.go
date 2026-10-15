@@ -25,6 +25,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/infrabay/provider-clickhouse/test/fakegcp/fakeadc"
 )
 
 const testAudience = "https://clickhouse-unit.example.com"
@@ -815,7 +817,7 @@ func indent(s, prefix string) string {
 // that both cache a metadata ID token for a fixed time whatever its exp.
 func TestGoogleLibraries(t *testing.T) {
 	s, hs := newTestServer(t, Options{})
-	UseFake(t, strings.TrimPrefix(hs.URL, "http://"))
+	fakeadc.UseFake(t, strings.TrimPrefix(hs.URL, "http://"))
 
 	for _, newAuth := range []bool{false, true} {
 		t.Run(fmt.Sprintf("newAuthLibrary=%t", newAuth), func(t *testing.T) {
@@ -839,7 +841,7 @@ func TestGoogleLibraries(t *testing.T) {
 			if newAuth {
 				wantEager = 0
 			}
-			if got := UsesNewAuthLibrary(ts); got != newAuth || eager != wantEager {
+			if got := fakeadc.UsesNewAuthLibrary(ts); got != newAuth || eager != wantEager {
 				t.Fatalf("token source %T (new auth library %t) requested %d ID tokens in NewTokenSource; want the new auth library %t and %d",
 					ts, got, eager, newAuth, wantEager)
 			}

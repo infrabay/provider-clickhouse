@@ -75,7 +75,7 @@ Logs contain key IDs and claim summaries only, never tokens or keys.
 - **GCE detection.** With `GCE_METADATA_HOST` set, `metadata.OnGCE()` returns
   true at once; without it, the probe goes to the hard-coded
   `http://169.254.169.254` and a DNS lookup of `metadata.google.internal`,
-  never to the fake. Every test sets `GCE_METADATA_HOST` (`fakegcp.UseFake`,
+  never to the fake. Every test sets `GCE_METADATA_HOST` (`fakeadc.UseFake`,
   and the deploy manifests for end-to-end tests), so detection is bypassed
   everywhere and the fake's `GET /` handler is never used by the libraries
   (`TestGoogleLibraries` fails on any request to it). A provider bug that only
@@ -121,13 +121,14 @@ log of the tests):
   server. It reads `project/project-id`, then fetches
   `instance/service-accounts/default/identity?audience=<audience>&format=full`
   at once (in `NewTokenSource`). Nothing else is requested, and no other Google
-  endpoint is contacted. Tests call `fakegcp.UseFake`, which also hides the
-  first two sources so a developer's own credentials are never used.
+  endpoint is contacted. Tests call `fakeadc.UseFake` (package
+  `test/fakegcp/fakeadc`), which also hides the first two sources so a
+  developer's own credentials are never used.
 - With `GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB=true` the
   `cloud.google.com/go/auth` path fetches lazily and requests the same URL.
   Because the requests are identical, the tests check which library is in
   use: the new one returns an `oauth2adapt` token source
-  (`fakegcp.UsesNewAuthLibrary`) and requests no token in `NewTokenSource`
+  (`fakeadc.UsesNewAuthLibrary`) and requests no token in `NewTokenSource`
   (`TestGoogleLibraries`, and a precondition of `NewAuthLibrary`).
 - The default path caches a metadata ID token for 55 minutes (the new path:
   1 h, refreshed 5 min early) **whatever its `exp`** (`TestGoogleLibraries`
