@@ -3,7 +3,10 @@
 # treat the pod as running on Google Cloud without probing 169.254.169.254.
 # Use it instead of runtime/gke-workload-identity.yaml in e2e tests; the
 # Google service account annotation is not needed because the fake serves
-# tokens for the identity given in its --email flag.
+# tokens for the identity given in its --email flag. make e2e adds the same
+# variable to the DeploymentRuntimeConfig of
+# examples/runtime/projected-token.yaml instead of using this one, and checks
+# that the provider pod runs with this value.
 apiVersion: pkg.crossplane.io/v1beta1
 kind: DeploymentRuntimeConfig
 metadata:
@@ -21,7 +24,7 @@ spec:
             - name: package-runtime
               env:
                 - name: GCE_METADATA_HOST
-                  value: fakegcp.fakegcp.svc.cluster.local
+                  value: fakegcp.xpch-e2e-fakegcp.svc.cluster.local
 ---
 # GoogleIDToken credentials without a key: Application Default Credentials,
 # which on a pod with GCE_METADATA_HOST means the fake. The audience equals

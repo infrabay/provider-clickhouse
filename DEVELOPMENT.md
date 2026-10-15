@@ -159,31 +159,46 @@ developing (for example `docker run --name xpch-dev-clickhouse ...`).
 `test/e2e` (build tag `e2e`) against it. `hack/e2e/run.sh` does the setup:
 
 1. builds the runtime image and the `.xpkg` for the node architecture
-   (`make xpkg PLATFORMS=linux/<arch>`);
+   (`make xpkg PLATFORMS=linux/<arch>`), and the test-only image of the fake
+   GCE metadata server and Google JWKS (`make fakegcp-image`,
+   [test/fakegcp](test/fakegcp));
 2. starts a throwaway registry inside the cluster (namespace
    `xpch-e2e-registry`) and pushes the package there with the pinned Crossplane
-   CLI, through a port-forward. The Crossplane package manager pulls it
-   through the registry's ClusterIP (go-containerregistry speaks plain HTTP to
-   RFC 1918 addresses). The provider's runtime image is the same package; the
-   node's container runtime pulls it from `localhost:35000`, because the
-   registry runs on the host network and container runtimes speak plain HTTP
-   to localhost registries without configuration. The
-   `DeploymentRuntimeConfig` sets that image. No public registry is involved;
+   CLI, and the fakegcp image with the pinned crane (`CRANE_VERSION`, built
+   with `go install`), through a port-forward. The Crossplane package manager
+   pulls the package through the registry's ClusterIP (go-containerregistry
+   speaks plain HTTP to RFC 1918 addresses). The provider's runtime image is
+   the same package; the node's container runtime pulls it, and the fakegcp
+   image, from `localhost:35000`, because the registry runs on the host
+   network and container runtimes speak plain HTTP to localhost registries
+   without configuration. Both are referenced by the digest of the push. No
+   public registry is involved;
 3. installs Crossplane (`CROSSPLANE_VERSION`, crossplane-stable chart) with
    `provider.defaultActivations=[]`, so no activation policy exists;
-4. starts upstream ClickHouse 25.3.3.42 and Altinity Antalya 26.6.4 (namespace
-   `xpch-e2e-clickhouse`). Upstream has password identities for the provider
-   and for a tenant; Antalya has JWT identities for the provider's service
-   account and a tenant's service account. They are validated by a
-   `jwt_static_jwks` token processor that holds the cluster's service account
-   keys, read from the API server at setup. Every identity holds exactly the
-   grants of the README quick start, read from `README.md` at run time (on
-   Antalya plus user DDL for `system:serviceaccount:xpch-e2e-*` users). The
-   administrators are only used by the tests' assertions;
+4. starts the fake metadata server and JWKS from
+   [test/fakegcp/deploy/fakegcp.yaml](test/fakegcp/deploy/fakegcp.yaml)
+   (namespace `xpch-e2e-fakegcp`), and upstream ClickHouse 25.3.3.42 and
+   Altinity Antalya 26.6.4 (namespace `xpch-e2e-clickhouse`). Upstream has
+   password identities for the provider and for a tenant. Antalya has JWT
+   identities for the provider's service account and a tenant's service
+   account, validated by a `jwt_static_jwks` token processor that holds the
+   cluster's service account keys, read from the API server at setup; and
+   for the provider's Google service account (the fake's `--email`), pinned
+   to a production-style `google_jwt` processor (`jwt_dynamic_jwks`,
+   `jwks_uri` the fake's Service, `expected_issuer`
+   `https://accounts.google.com`, a per-run audience, `expected_typ: JWT`,
+   `email_verified`, `username_claim: email`, cache lifetimes of 10 s). Every
+   identity holds exactly the grants of the README quick start, read from
+   `README.md` at run time (on Antalya plus user DDL for
+   `system:serviceaccount:xpch-e2e-*` users, and for the Google identity for
+   users named `app-*`, after workload service accounts). The administrators
+   are only used by the tests' assertions;
 5. installs the package with `examples/provider.yaml` and
    `examples/runtime/projected-token.yaml` (the projected token for the
-   `TokenFile` identity), with `--poll=10s` and `--debug` added, and waits
-   until it is healthy.
+   `TokenFile` identity), with `--poll=10s`, `--debug` and
+   `GCE_METADATA_HOST` (the fake's Service, as
+   [test/fakegcp/deploy/provider-runtime.yaml](test/fakegcp/deploy/provider-runtime.yaml)
+   documents) added, and waits until it is healthy.
 
 The tests then activate the managed resource kinds (one kind first, then
 `examples/mrap.yaml`; Crossplane 2.0.0 and 2.0.1 activate the ProviderConfig
@@ -202,6 +217,30 @@ write; a provider pod deleted while 40 roles per server are being created (the
 test checks that the old pod was still creating after its deletion and left
 roles to the new pod); and deletion, which drops and revokes only what the
 provider created.
+
+In parallel, the GoogleIDToken scenario (`test/e2e/google_test.go`) mirrors
+GKE Workload Identity without Google: a `ClusterProviderConfig` with
+`credentials.source: GoogleIDToken` (no key: Application Default
+Credentials, which `GCE_METADATA_HOST` sends to the fake) and a closed policy
+manages a `Database`, a `Role`, a JWT `User` for a workload service account
+(`PROCESSOR 'google_jwt'`, pinned to the account's unique ID), a `Grant` and a
+`RoleGrant`. It checks the conditions, the server's objects, and that every
+statement ran as the Google service account (`system.query_log.user`); the
+workload logs in with an ID token minted for its email and can do exactly
+what was granted, while tokens of a recreated account or for another
+audience are refused. The fake issues tokens that ClickHouse accepts for
+about 20 s (its clock runs 60 s behind, which cancels ClickHouse's default
+leeway) and the config's connections live 15 s, so the provider replaces its
+token every half minute: reconciles that write keep succeeding across six
+token lifetimes, and the fake counts the fresh tokens. A key rotation (the
+new key published first, used once ClickHouse has fetched it, the old one
+retired) does not interrupt the provider. A metadata outage (500) and tokens
+for another audience make every MR `Synced=False` with a single-line
+`AuthenticationFailed` without token material or response bodies, and they
+recover once the fake does. Tokens of the right audience for accounts
+without a user, and a token for the provider's account signed with an
+unknown key, are refused. [docs/testing-google-tokens.md](docs/testing-google-tokens.md)
+lists what only a test on real GKE covers.
 
 ```sh
 make e2e E2E_KUBE_CONTEXT=orbstack          # latest Crossplane (CROSSPLANE_VERSION)
@@ -226,8 +265,9 @@ local; the name allow-list is the main protection. The harness and the tests
 never use or change the kubeconfig's current context; every `kubectl` and
 `helm` call names the context. The run needs Docker (for the image build),
 `kubectl`, `helm`, `openssl` and `curl` (`make e2e-tools` puts the pinned
-kubectl and Helm into `bin/`; CI uses those), a single-architecture cluster,
-and about 4 GB of memory for the two servers.
+kubectl and Helm into `bin/`; CI uses those), the Go module proxy (for
+crane, the first time), a single-architecture cluster, and about 4 GB of
+memory for the two servers.
 
 The cluster must not have a Crossplane that the harness did not install:
 `make e2e` refuses to start if a Crossplane Deployment runs in any namespace,
@@ -248,14 +288,16 @@ exists (for example left behind by an uninstalled Crossplane).
 | `E2E_UPSTREAM_IMAGE`, `E2E_ANTALYA_IMAGE` | 25.3.3.42-alpine, 26.6.4 Antalya | the servers |
 | `E2E_REGISTRY_IMAGE` | `registry:3.1.2` (by digest) | the in-cluster registry |
 | `E2E_REGISTRY_PORT` | `35000` | the registry's port on the node |
+| `E2E_GOOGLE_CACHE_LIFETIME` | `10` | `jwks_cache_lifetime` and `token_cache_lifetime` of the `google_jwt` processor, in seconds (production: 3600 and 300) |
 | `E2E_KIND_CLUSTER`, `E2E_KIND_KUBECONFIG` | `xpch-e2e`, `_output/e2e/kind.kubeconfig` | the cluster of `make e2e-kind-up` and `make e2e-kind-down` |
 
 On failure the run writes diagnostics to `$E2E_WORKDIR/artifacts`: the
 Provider and its revisions, activation policies and definitions, the
 provider's and Crossplane's logs, every managed resource and ProviderConfig
 with its conditions, events, pods, the servers' error logs and the test
-output. Secrets are listed by name, type and keys only, and every secret
-value the harness generated is replaced with `[REDACTED]`.
+output, and the fake metadata server's request log (key IDs and claim
+summaries, never tokens). Secrets are listed by name, type and keys only,
+and every secret value the harness generated is replaced with `[REDACTED]`.
 
 The run also writes diagnostics when it is interrupted (Ctrl-C, SIGTERM, a
 cancelled CI job). Afterwards (unless `E2E_KEEP=1`) `make e2e-cleanup` removes
@@ -268,8 +310,8 @@ Crossplane as its own only while `crossplane-system` carries that label and
 no Crossplane Deployment runs in another namespace; otherwise it leaves
 Crossplane, its CRDs and RBAC and the provider's CRDs alone. A
 `crossplane-system` without the label stops it. It fails if anything is left.
-On OrbStack it also removes the runtime images the node pulled from the
-registry; the third-party images the node pulled (Crossplane, both ClickHouse
+On OrbStack it also removes the runtime and fakegcp images the node pulled
+from the registry; the third-party images the node pulled (Crossplane, both ClickHouse
 servers, the registry, several GB) stay in the Docker engine for later runs,
 and can be removed with `docker image rm`.
 
@@ -291,6 +333,13 @@ Known limits of the end-to-end tests:
   push, so a push by someone else cannot change what the cluster runs. If the
   port is taken, the registry does not become ready and the run stops after 5
   minutes. Set `E2E_REGISTRY_PORT` to move it.
+- The GoogleIDToken scenario runs against a fake of the GKE metadata server
+  and of Google's JWKS, with tokens and connections that live seconds instead
+  of an hour and half an hour, and plain native connections to ClickHouse.
+  It cannot show GCE detection without `GCE_METADATA_HOST`, the Workload
+  Identity binding, Google's real keys, rotation cadence and HTTPS, or
+  ClickHouse's egress to `www.googleapis.com`; see
+  [docs/testing-google-tokens.md](docs/testing-google-tokens.md).
 
 ## Running the provider locally
 

@@ -4,16 +4,20 @@ Manifests that run the fake GCE metadata server and Google JWKS of
 [`test/fakegcp`](..) in a Kubernetes cluster, so that an end-to-end test can
 exercise the provider's `GoogleIDToken` credentials (Application Default
 Credentials, as on GKE with Workload Identity) and ClickHouse's
-`jwt_dynamic_jwks` processor without Google. They are not wired into
-`test/e2e` yet. See [docs/testing-google-tokens.md](../../../docs/testing-google-tokens.md)
-for what the fake simulates and what it does not.
+`jwt_dynamic_jwks` processor without Google. `make e2e` deploys
+`fakegcp.yaml` (with the image it pushed to its in-cluster registry, by
+digest) and sets the `GCE_METADATA_HOST` of `provider-runtime.yaml` on the
+provider; `test/e2e/google_test.go` drives the fake through its control
+API. See [docs/testing-google-tokens.md](../../../docs/testing-google-tokens.md)
+for what the fake simulates, what the end-to-end scenario covers and what
+it does not.
 
 **Test clusters only.** The control API mints tokens for any identity, and
 whatever trusts the fake's JWKS trusts those tokens.
 
 | File | What |
 |---|---|
-| `fakegcp.yaml` | Namespace `fakegcp`, Deployment (distroless, non-root, read-only root file system), Service `fakegcp` on port 80 (metadata server and `/oauth2/v3/certs`) and Service `fakegcp-control` on 8081 (control API). |
+| `fakegcp.yaml` | Namespace `xpch-e2e-fakegcp` (with the e2e harness label, so `make e2e-cleanup` removes it), Deployment (distroless, non-root, read-only root file system), Service `fakegcp` on port 80 (metadata server and `/oauth2/v3/certs`) and Service `fakegcp-control` on 8081 (control API). |
 | `clickhouse-google-jwt.yaml` | ConfigMap with the `google_jwt` processor (`jwks_uri` = the fake) and the provider's service account as a users.d jwt user pinned to it. Mount the keys into `config.d` and `users.d` of an Antalya 26.6 server. |
 | `provider-runtime.yaml` | `DeploymentRuntimeConfig` that sets `GCE_METADATA_HOST` for the provider, and a `ClusterProviderConfig` with `GoogleIDToken` credentials and the matching audience. |
 
@@ -27,7 +31,7 @@ whatever trusts the fake's JWKS trusts those tokens.
 docker build -f test/fakegcp/Dockerfile -t fakegcp:dev .
 
 kubectl apply -f test/fakegcp/deploy/fakegcp.yaml
-kubectl -n fakegcp rollout status deploy/fakegcp
+kubectl -n xpch-e2e-fakegcp rollout status deploy/fakegcp
 
 # ClickHouse: apply the ConfigMap in its namespace and mount it (see the file).
 kubectl -n clickhouse apply -f test/fakegcp/deploy/clickhouse-google-jwt.yaml
@@ -39,7 +43,7 @@ kubectl apply -f test/fakegcp/deploy/provider-runtime.yaml
 ```
 
 Names to keep consistent if you change them: the Service DNS name
-(`fakegcp.fakegcp.svc.cluster.local`) appears in `GCE_METADATA_HOST` and in
+(`fakegcp.xpch-e2e-fakegcp.svc.cluster.local`) appears in `GCE_METADATA_HOST` and in
 `jwks_uri`; the audience (`https://clickhouse-e2e.example.com`) in the
 processor and in the `ClusterProviderConfig`; the service account email in the
 Deployment's `--email` and in users.d. Unit tests in `test/fakegcp` keep them
@@ -47,11 +51,14 @@ honest: `TestDeployManifests` decodes every manifest strictly into its
 Kubernetes or provider type and checks that these names agree (and that the
 ClusterProviderConfig's policy compiles and allows the processor), and
 `TestProcessorYAML` checks that the processor in the ConfigMap is the one
-`fakegcp.GoogleProcessor.YAML` renders.
+`fakegcp.GoogleProcessor.YAML` renders. `TestDeployManifests` also checks
+what `hack/e2e/run.sh` relies on: the image `fakegcp:dev` it replaces, the
+`--email` flag it reads for the provider's ClickHouse user, and the
+namespace label.
 
 ## Driving the fake from a test
 
-Port-forward the control API (`kubectl -n fakegcp port-forward svc/fakegcp-control 8081`)
+Port-forward the control API (`kubectl -n xpch-e2e-fakegcp port-forward svc/fakegcp-control 8081`)
 and call it with JSON:
 
 ```console

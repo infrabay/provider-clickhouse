@@ -28,6 +28,11 @@ KIND_NODE_IMAGE ?= kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae9
 KUBECTL_VERSION ?= v1.37.1
 # renovate: datasource=github-releases depName=helm/helm
 HELM_VERSION ?= v4.3.0
+# crane pushes the test-only fakegcp image of make e2e to the in-cluster
+# registry (built from source with go install, checksum-verified by the Go
+# module proxy).
+# renovate: datasource=go depName=github.com/google/go-containerregistry
+CRANE_VERSION ?= v0.22.1
 
 GO ?= go
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0.0-dev)
@@ -42,6 +47,7 @@ OUTPUT := $(CURDIR)/_output
 # them into bin/envtest on first use.
 SETUP_ENVTEST = $(GO) run sigs.k8s.io/controller-runtime/tools/setup-envtest@$(SETUP_ENVTEST_VERSION) use $(ENVTEST_K8S_VERSION) --bin-dir $(BIN)/envtest -p path
 CROSSPLANE ?= $(BIN)/crossplane
+CRANE ?= $(BIN)/crane-$(CRANE_VERSION)
 KIND ?= $(GO) run sigs.k8s.io/kind@$(KIND_VERSION)
 # The kind cluster of make e2e-kind-up and its kubeconfig (a separate file:
 # ~/.kube/config is never touched).
@@ -79,8 +85,8 @@ envtest: ## CRD validation (CEL) and examples dry-run against a real kube-apiser
 	KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST))" $(GO) test -tags envtest -count=1 ./test/envtest/...
 
 .PHONY: e2e
-e2e: $(CROSSPLANE) ## End-to-end tests: install the package into the local cluster E2E_KUBE_CONTEXT (required) and run test/e2e.
-	CROSSPLANE_VERSION=$(CROSSPLANE_VERSION) CROSSPLANE=$(CROSSPLANE) GO=$(GO) MAKE=$(MAKE) hack/e2e/run.sh
+e2e: $(CROSSPLANE) $(CRANE) ## End-to-end tests: install the package into the local cluster E2E_KUBE_CONTEXT (required) and run test/e2e.
+	CROSSPLANE_VERSION=$(CROSSPLANE_VERSION) CROSSPLANE=$(CROSSPLANE) CRANE=$(CRANE) GO=$(GO) MAKE=$(MAKE) hack/e2e/run.sh
 
 .PHONY: e2e-oldest
 e2e-oldest: ## make e2e with the oldest Crossplane release that package/crossplane.yaml allows.
@@ -162,6 +168,12 @@ $(CROSSPLANE):
 .PHONY: crossplane
 crossplane: $(CROSSPLANE) ## Fetch the pinned Crossplane CLI into bin/ (sha256-verified).
 
+$(CRANE):
+	@mkdir -p $(BIN)/crane-download
+	GOBIN=$(BIN)/crane-download $(GO) install github.com/google/go-containerregistry/cmd/crane@$(CRANE_VERSION)
+	mv $(BIN)/crane-download/crane $@
+	rm -rf $(BIN)/crane-download
+
 .PHONY: image
 image: ## Build the runtime image tarball for each platform into _output/.
 	@mkdir -p $(OUTPUT)
@@ -171,6 +183,16 @@ image: ## Build the runtime image tarball for each platform into _output/.
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN)/$${os}_$${arch}/provider ./cmd/provider || exit 1; \
 		docker buildx build --platform $$os/$$arch -f cluster/images/provider-clickhouse/Dockerfile \
 			--output type=docker,dest=$(OUTPUT)/image-$$arch.tar . || exit 1; \
+	done
+
+.PHONY: fakegcp-image
+fakegcp-image: ## Build the test-only fakegcp image tarball (test/fakegcp) for each platform into _output/, for make e2e.
+	@mkdir -p $(OUTPUT)
+	@for p in $(PLATFORMS); do \
+		arch=$${p#*/}; \
+		echo "==> fakegcp $$p"; \
+		docker buildx build --platform $$p -f test/fakegcp/Dockerfile \
+			--output type=docker,dest=$(OUTPUT)/fakegcp-$$arch.tar . || exit 1; \
 	done
 
 .PHONY: xpkg

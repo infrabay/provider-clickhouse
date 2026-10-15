@@ -289,6 +289,72 @@ did.
 | `NewAuthLibrary` | The `cloud.google.com/go/auth` path, after checking that the switch took effect. |
 | `TestGoogleIDTokenUpstream` | Upstream without JWT support fails cleanly. |
 
+## The end-to-end scenario in Kubernetes
+
+`make e2e` (DEVELOPMENT.md, "End-to-end tests"; design 10.4) runs the same
+setup with the real provider package in a local cluster: the fake runs from
+[test/fakegcp/deploy/fakegcp.yaml](../test/fakegcp/deploy/fakegcp.yaml)
+(namespace `xpch-e2e-fakegcp`, image pushed by digest to the harness's
+in-cluster registry), the provider pod has `GCE_METADATA_HOST` set to the
+fake's Service, and Antalya 26.6.4 has the `google_jwt` processor above with
+`jwks_uri` pointing at the fake, a per-run audience and cache lifetimes of
+10 s, next to the processor for Kubernetes tokens. The provider's Google
+service account (the fake's `--email`) is a users.d jwt user pinned to
+`google_jwt` with the README grants plus user DDL on `` `app-`* ``.
+`TestEndToEnd/Scenarios/google` (`test/e2e/google_test.go`) runs in parallel
+with the other servers' scenarios and asserts through the managed resources'
+conditions and as the ClickHouse administrator, including
+`system.query_log.user`:
+
+| Step | Shows |
+|---|---|
+| `Setup` | The provider pod runs with the `GCE_METADATA_HOST` of [provider-runtime.yaml](../test/fakegcp/deploy/provider-runtime.yaml); the server's `google_jwt` processor is what `fakegcp.GoogleProcessor.YAML` renders; the provider's account is pinned to it. Creates a `ClusterProviderConfig` with `GoogleIDToken` credentials without a key, a closed policy, plain native (like the other Antalya configs) and `pool.connMaxLifetime: 15s`. |
+| `Lifecycle` | `Database`, `Role`, a JWT `User` for a workload service account (`PROCESSOR 'google_jwt'`, `CLAIMS` with its unique ID), `Grant` and `RoleGrant` become Ready; the server holds them under the claimed UUIDs; every statement ran as the provider's Google service account; the provider asked the fake only for the project ID and `format=full` tokens with the configured audience (no GCE detection). |
+| `WorkloadLogin` | The connection Secret (no password); the workload logs in with an ID token minted for its email and can do exactly what the `Grant` and the `RoleGrant` give it; tokens of the recreated account and for another audience get 516. |
+| `Policy` | A user of another project and a password user are `PolicyViolation` and run no statement. |
+| `TokenRefresh` | Reconciles that write (database comment changes) keep succeeding for six token lifetimes, no MR leaves `Synced`, and the fake served at least two fresh tokens (all with the TTL, audience and email expected). |
+| `KeyRotation` | A key published first and used once ClickHouse fetched it (after `jwks_cache_lifetime`), the old key retired once the provider holds a token of the new one: no MR leaves `Synced`, writes go through, a token of the retired key is refused. |
+| `MetadataOutage` | With every metadata request failing (500), every MR becomes `Synced=False` with a single-line `AuthenticationFailed` from `GoogleIDToken`, without tokens or the response body's details; all recover once the fake answers. |
+| `FaultyToken` | With tokens for another audience, every MR fails with a clean `AuthenticationFailed` after the 516 retry (at least two faulty tokens fetched); all recover. |
+| `AttackerToken` | Valid tokens of the right audience for another project's account and for an `app-` account without a user, and a token for the provider's own account signed with a key outside the JWKS, are refused; no user exists and no query ran as those accounts. |
+| `Deletion` | The `Grant` and the `RoleGrant` revoke, the database, role and user are dropped, all as the Google service account; the config is deleted. |
+
+To see token replacement within minutes, the fake issues tokens with a TTL
+of 20 s and a clock 60 s behind, which cancels ClickHouse's default
+`verifier_leeway`: ClickHouse accepts each token for about 20 s, as it would
+a 20-second token without leeway. Since the library caches a metadata token
+for 55 minutes whatever its `exp`, every replacement in the scenario goes
+through the 516 retry. In production the library replaces the 1-hour token
+after 55 minutes, before ClickHouse refuses it, and the 516 retry is the
+fallback.
+
+## What only a test on real GKE covers
+
+The fake makes the provider's side and ClickHouse's side meet without
+Google. A staging test on a real GKE cluster with Workload Identity and a
+real Antalya server is still the only check of:
+
+- **GCE detection and the real metadata server**: the provider without
+  `GCE_METADATA_HOST`, so `metadata.OnGCE()` probes `169.254.169.254` and
+  `metadata.google.internal`; the GKE metadata server's latency, rate limits,
+  caching, error texts and whatever it adds to `format=full` tokens.
+- **The Workload Identity binding**: `iam.gke.io/gcp-service-account` on the
+  provider's Kubernetes service account (`examples/runtime/gke-workload-identity.yaml`),
+  `roles/iam.workloadIdentityUser` on the Google service account, and the
+  error when the binding is missing (the fake's `403` only imitates it).
+- **Google's real tokens and keys**: tokens of 1 hour replaced by the
+  library after 55 minutes, Google's signing keys, their rotation cadence and
+  `max-age`, and the `jwks_uri` over HTTPS (`https://www.googleapis.com/oauth2/v3/certs`)
+  with ClickHouse's CA bundle.
+- **The network**: ClickHouse's egress to `www.googleapis.com` (proxies,
+  network policies, `remote_url_allow_hosts`) and the provider's access to
+  the metadata server.
+- **TLS to ClickHouse with a Google token** (the e2e servers serve plain
+  native; the integration test `TestAntalyaTokenFile` sends a JWT over TLS,
+  signed with a test key instead of Google's).
+- **Production cache lifetimes** (`jwks_cache_lifetime: 3600`,
+  `token_cache_lifetime: 300`) and production connection lifetimes.
+
 ## Open points
 
 - **One intermittent failure on Antalya 26.3.13.** In one full run,

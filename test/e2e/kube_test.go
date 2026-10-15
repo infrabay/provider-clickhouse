@@ -75,10 +75,11 @@ func get(t *testing.T, obj client.Object) {
 	}
 }
 
-// conditions formats an MR's Ready and Synced conditions.
+// conditions formats an MR's Ready and Synced conditions, with anything that
+// looks like a token redacted.
 func conditions(mg resource.Managed) string {
 	ready, synced := mg.GetCondition(xpv2.TypeReady), mg.GetCondition(xpv2.TypeSynced)
-	return fmt.Sprintf("ready=%s %s %s; synced=%s %s %s", ready.Status, ready.Reason, ready.Message, synced.Status, synced.Reason, synced.Message)
+	return redactTokens(fmt.Sprintf("ready=%s %s %s; synced=%s %s %s", ready.Status, ready.Reason, ready.Message, synced.Status, synced.Reason, synced.Message))
 }
 
 // readyAndSynced is true when Ready and Synced are both True.

@@ -788,7 +788,7 @@ func TestProcessorYAML(t *testing.T) {
 	}
 	// The Kubernetes manifest renders the same processor against the fake.
 	k8s := p
-	k8s.JWKSURI = "http://fakegcp.fakegcp.svc.cluster.local" + JWKSPath
+	k8s.JWKSURI = "http://fakegcp.xpch-e2e-fakegcp.svc.cluster.local" + JWKSPath
 	k8s.Audience = "https://clickhouse-e2e.example.com"
 	k8s.JWKSCacheLifetime, k8s.TokenCacheLifetime = 60*time.Second, 60*time.Second
 	cm, err := os.ReadFile("deploy/clickhouse-google-jwt.yaml")

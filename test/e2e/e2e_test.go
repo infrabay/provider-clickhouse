@@ -73,7 +73,11 @@ const creationGracePeriod = 30 * time.Second
 //     token on Antalya) with exactly the granted privileges, out-of-band
 //     drift repaired within the poll interval, foreign objects with the same
 //     names refused and left byte-identical, the ClusterProviderConfig
-//     policy, and observe-only resources that never write.
+//     policy, and observe-only resources that never write. In parallel with
+//     them, the GoogleIDToken scenario (google_test.go): the provider logs in
+//     to Antalya as a Google service account through the fake metadata
+//     server, across token refreshes, a key rotation, a metadata outage and
+//     faulty tokens.
 //  3. ProviderRestart: the provider pod is deleted while new resources are
 //     being created (the test checks that creates were still running);
 //     ownership survives and nothing is created twice.
@@ -91,6 +95,12 @@ func TestEndToEnd(t *testing.T) {
 				tn.scenarios(t)
 			})
 		}
+		// It deletes its resources before the later phases, which check
+		// every app_ object on Antalya.
+		t.Run("google", func(t *testing.T) {
+			t.Parallel()
+			testGoogleIDToken(t)
+		})
 	})
 	t.Run("ProviderRestart", func(t *testing.T) { testRestart(t, tenants) })
 	t.Run("Deletion", func(t *testing.T) {

@@ -5,8 +5,8 @@
 # Writes diagnostics of a failed end-to-end run into the directory $1: the
 # Provider and its revisions, activation policies and definitions, the
 # provider's and Crossplane's logs, every managed resource and ProviderConfig
-# of the test namespaces with their conditions, events, pods, and the
-# ClickHouse server logs. Secrets are listed by name, type and keys only, never
+# of the test namespaces with their conditions, events, pods, the
+# ClickHouse server logs and the fake GCE metadata server's request log. Secrets are listed by name, type and keys only, never
 # with their data, and every secret value the harness generated is replaced
 # with [REDACTED] in all files.
 set -uo pipefail
@@ -62,6 +62,8 @@ for server in upstream antalya; do
 	dump "clickhouse-${server}.err.log" exec -n "${E2E_NS_CLICKHOUSE}" "deployment/${server}" -- tail -n 1000 /var/log/clickhouse-server/clickhouse-server.err.log
 done
 dump registry.log logs -n "${E2E_NS_REGISTRY}" deployment/registry --tail=500
+# The fake logs requests, key IDs and claim summaries, never tokens or keys.
+dump fakegcp.log logs -n "${E2E_NS_FAKEGCP}" deployment/fakegcp --tail=5000
 
 e2e::redact "${out}"/*
 echo "diagnostics written to ${out}" >&2

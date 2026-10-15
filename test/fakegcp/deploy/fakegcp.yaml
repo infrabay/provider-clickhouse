@@ -3,34 +3,42 @@
 # control API mints tokens for any identity, and a pod that trusts its JWKS
 # trusts those tokens.
 #
-# Image: docker build -f test/fakegcp/Dockerfile -t fakegcp:dev . and load it
-# into the cluster (OrbStack and kind share or load local images).
+# make e2e (hack/e2e/run.sh) builds the image (make fakegcp-image), pushes it
+# to its in-cluster registry and applies this file with "image: fakegcp:dev"
+# replaced by the pushed image's digest. By hand: docker build -f
+# test/fakegcp/Dockerfile -t fakegcp:dev . and load it into the cluster
+# (OrbStack shares local images; kind: kind load docker-image fakegcp:dev).
+#
+# The namespace carries the e2e harness label, so make e2e-cleanup removes it
+# with everything else the harness created.
 #
 # Endpoints, inside the cluster:
-#   http://fakegcp.fakegcp.svc.cluster.local/computeMetadata/v1/...  (GCE_METADATA_HOST=fakegcp.fakegcp.svc.cluster.local)
-#   http://fakegcp.fakegcp.svc.cluster.local/oauth2/v3/certs          (jwks_uri for ClickHouse)
-#   http://fakegcp-control.fakegcp.svc.cluster.local:8081/fakegcp/v1/ (test control API; port-forward from the test)
+#   http://fakegcp.xpch-e2e-fakegcp.svc.cluster.local/computeMetadata/v1/...  (GCE_METADATA_HOST=fakegcp.xpch-e2e-fakegcp.svc.cluster.local)
+#   http://fakegcp.xpch-e2e-fakegcp.svc.cluster.local/oauth2/v3/certs          (jwks_uri for ClickHouse)
+#   http://fakegcp-control.xpch-e2e-fakegcp.svc.cluster.local:8081/fakegcp/v1/ (test control API; port-forward from the test)
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: fakegcp
+  name: xpch-e2e-fakegcp
   labels:
+    app.kubernetes.io/part-of: xpch-e2e
     pod-security.kubernetes.io/enforce: restricted
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: fakegcp
-  namespace: fakegcp
+  namespace: xpch-e2e-fakegcp
 automountServiceAccountToken: false
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: fakegcp
-  namespace: fakegcp
+  namespace: xpch-e2e-fakegcp
   labels:
     app.kubernetes.io/name: fakegcp
+    app.kubernetes.io/part-of: xpch-e2e
 spec:
   # One replica: keys, faults and outages live in memory.
   replicas: 1
@@ -41,6 +49,7 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: fakegcp
+        app.kubernetes.io/part-of: xpch-e2e
     spec:
       serviceAccountName: fakegcp
       automountServiceAccountToken: false
@@ -72,9 +81,10 @@ spec:
               path: /healthz
               port: control
           livenessProbe:
-            # The detection root needs no Metadata-Flavor header.
-            httpGet:
-              path: /
+            # A TCP probe, not GET /: the fake records every HTTP request, and
+            # the end-to-end tests fail on any request that the Google client
+            # libraries should not send, GCE detection (GET /) included.
+            tcpSocket:
               port: metadata
           resources:
             requests: {cpu: 10m, memory: 32Mi}
@@ -91,7 +101,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fakegcp
-  namespace: fakegcp
+  namespace: xpch-e2e-fakegcp
 spec:
   selector:
     app.kubernetes.io/name: fakegcp
@@ -105,7 +115,7 @@ apiVersion: v1
 kind: Service
 metadata:
   name: fakegcp-control
-  namespace: fakegcp
+  namespace: xpch-e2e-fakegcp
 spec:
   selector:
     app.kubernetes.io/name: fakegcp

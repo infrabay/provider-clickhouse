@@ -15,8 +15,9 @@
 #   the ClusterRoles, ClusterRoleBindings and webhook configurations whose
 #   names start with "crossplane";
 # - every namespace with the label app.kubernetes.io/part-of=xpch-e2e (the
-#   registry, the ClickHouse servers, the tenants, crossplane-system), which
-#   takes their Secrets, Services and volumes with them;
+#   registry, the fake GCE metadata server, the ClickHouse servers, the
+#   tenants, crossplane-system), which takes their Secrets, Services and
+#   volumes with them;
 # - events in the default namespace about the removed objects.
 #
 # The harness installed Crossplane when crossplane-system carries the harness
@@ -214,14 +215,16 @@ for ev in $(k get events -n default -o 'jsonpath={range .items[*]}{.metadata.nam
 done
 
 # On OrbStack the node's container runtime is the host's Docker engine: drop
-# the runtime images it pulled from the registry (by tag or, as run.sh
-# references them, by digest). Built images stay, and so do the third-party
-# images the node pulled (Crossplane, ClickHouse, the registry), which later
-# runs reuse.
+# the runtime and fakegcp images it pulled from the registry (by tag or, as
+# run.sh references them, by digest). Built images stay, and so do the
+# third-party images the node pulled (Crossplane, ClickHouse, the registry),
+# which later runs reuse.
 if [ "${E2E_KUBE_CONTEXT}" = "orbstack" ] && command -v docker >/dev/null 2>&1; then
-	for img in $(docker images --digests --format '{{.Repository}}:{{.Tag}} {{.Repository}}@{{.Digest}}' "localhost:${E2E_REGISTRY_PORT}/${E2E_PROVIDER}" 2>/dev/null |
-		tr ' ' '\n' | grep -v -E ':<none>$|@<none>$' || true); do
-		docker image rm "${img}" >/dev/null 2>&1 || true
+	for repo in "${E2E_PROVIDER}" "${E2E_FAKEGCP_REPO}"; do
+		for img in $(docker images --digests --format '{{.Repository}}:{{.Tag}} {{.Repository}}@{{.Digest}}' "localhost:${E2E_REGISTRY_PORT}/${repo}" 2>/dev/null |
+			tr ' ' '\n' | grep -v -E ':<none>$|@<none>$' || true); do
+			docker image rm "${img}" >/dev/null 2>&1 || true
+		done
 	done
 fi
 

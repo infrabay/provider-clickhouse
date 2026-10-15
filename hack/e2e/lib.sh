@@ -31,6 +31,11 @@ E2E_LABEL="${E2E_LABEL_KEY}=${E2E_LABEL_VALUE}"
 E2E_NS_REGISTRY="xpch-e2e-registry"
 E2E_NS_CLICKHOUSE="xpch-e2e-clickhouse"
 E2E_NS_CROSSPLANE="crossplane-system"
+# The fake GCE metadata server and Google JWKS (test/fakegcp/deploy) and the
+# tenant namespace of the GoogleIDToken scenario.
+E2E_NS_FAKEGCP="xpch-e2e-fakegcp"
+E2E_NS_GOOGLE="xpch-e2e-google"
+E2E_FAKEGCP_REPO="fakegcp"
 E2E_PROVIDER="provider-clickhouse"
 E2E_MR_KINDS="databases users roles grants rolegrants"
 E2E_GROUP="clickhouse.m.infrabay.io"
@@ -307,6 +312,19 @@ e2e::redact() {
 			sed -i.bak "s/${value}/[REDACTED]/g" "${f}" && rm -f "${f}.bak"
 		done
 	done
+}
+
+# e2e::registry_digest prints the digest of the manifest that the registry
+# at 127.0.0.1:$1 serves for repository $2 and tag $3, or fails.
+e2e::registry_digest() {
+	local digest
+	digest="$(curl -fsS -o /dev/null -D - \
+		-H 'Accept: application/vnd.oci.image.index.v1+json' -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+		-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+		"http://127.0.0.1:$1/v2/$2/manifests/$3" | tr -d '\r' |
+		sed -n -E 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: (sha256:[0-9a-f]{64})$/\1/p')"
+	[ -n "${digest}" ] || return 1
+	printf '%s' "${digest}"
 }
 
 # e2e::readme_grants prints the grants of the provider identity from the README

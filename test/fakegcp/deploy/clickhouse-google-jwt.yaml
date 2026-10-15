@@ -24,7 +24,7 @@ data:
     token_processors:
       google_jwt:
         type: jwt_dynamic_jwks
-        jwks_uri: "http://fakegcp.fakegcp.svc.cluster.local/oauth2/v3/certs"
+        jwks_uri: "http://fakegcp.xpch-e2e-fakegcp.svc.cluster.local/oauth2/v3/certs"
         expected_issuer: "https://accounts.google.com"
         expected_audience: "https://clickhouse-e2e.example.com"
         expected_typ: JWT

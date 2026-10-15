@@ -103,6 +103,17 @@ func TestDeployManifests(t *testing.T) {
 	if flags["listen"] != ":8080" || flags["control-listen"] != ":8081" {
 		t.Errorf("fakegcp args %v", ctr.Args)
 	}
+	// make e2e (hack/e2e/run.sh) replaces exactly "image: fakegcp:dev" with
+	// the image it pushed, reads the --email flag for the provider's
+	// ClickHouse user, and relies on the namespace's harness label for the
+	// cleanup.
+	if ctr.Image != "fakegcp:dev" || flags["email"] == "" {
+		t.Errorf("fakegcp image %q, --email %q; hack/e2e/run.sh expects fakegcp:dev and an --email flag", ctr.Image, flags["email"])
+	}
+	ns := only(t, fake, all[*corev1.Namespace])
+	if ns.Labels["app.kubernetes.io/part-of"] != "xpch-e2e" || dep.Namespace != ns.Name {
+		t.Errorf("namespace %s labels %v, Deployment in %s; want the e2e harness label app.kubernetes.io/part-of=xpch-e2e", ns.Name, ns.Labels, dep.Namespace)
+	}
 	ports := map[string]int32{}
 	for _, p := range ctr.Ports {
 		ports[p.Name] = p.ContainerPort
