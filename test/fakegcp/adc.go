@@ -4,8 +4,26 @@
 package fakegcp
 
 import (
+	"reflect"
+	"strings"
 	"testing"
+
+	"golang.org/x/oauth2"
 )
+
+// UsesNewAuthLibrary reports whether ts, a token source returned by
+// google.golang.org/api/idtoken.NewTokenSource, comes from
+// cloud.google.com/go/auth (wrapped by its oauth2adapt package: with
+// GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB=true, and always with a key)
+// rather than from golang.org/x/oauth2. Both send the same metadata request,
+// so tests check this to know which library they exercised.
+func UsesNewAuthLibrary(ts oauth2.TokenSource) bool {
+	t := reflect.TypeOf(ts)
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	return t != nil && strings.HasPrefix(t.PkgPath(), "cloud.google.com/go/auth/")
+}
 
 // UseFake points the Google client libraries in this process at the fake
 // metadata server at host ("host:port") for the rest of the test, and hides

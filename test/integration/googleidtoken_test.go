@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/moby/moby/api/types/container"
 	"github.com/testcontainers/testcontainers-go"
+	"google.golang.org/api/idtoken"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -54,7 +56,8 @@ const (
 	googleTokenCacheLifetime = 10 * time.Second
 
 	// envGoogleUpstreamImages are upstream images that must fail cleanly
-	// with GoogleIDToken credentials (no JWT login).
+	// with GoogleIDToken credentials (no JWT login). Unset, the default is
+	// used unless XPCH_UPSTREAM_IMAGES=none.
 	envGoogleUpstreamImages    = "XPCH_GOOGLE_UPSTREAM_IMAGES"
 	defaultGoogleUpstreamImage = "clickhouse/clickhouse-server:25.3.3.42-alpine"
 
@@ -154,10 +157,12 @@ func googleAntalyaServer(t *testing.T, image string, fake *googleFake, audience 
     grants:
       query:
 %s`, googleProvider.Email, fakegcp.GoogleProcessorName, grantsYAML(googleGrants()))
-	return startServer(t, image, map[string]string{
+	s := startServer(t, image, map[string]string{
 		"/etc/clickhouse-server/config.d/token_processors.yaml":   p.YAML(),
 		"/etc/clickhouse-server/users.d/provider-clickhouse.yaml": usersD,
 	}, hostAccess)
+	logServerTokenEvents(t, s)
+	return s
 }
 
 // googleCPC is a ClusterProviderConfig with GoogleIDToken credentials and no
@@ -232,6 +237,63 @@ func cleanError(t *testing.T, what string, err error) {
 	if len(msg) > 1024 {
 		t.Errorf("%s: the error is %d bytes long", what, len(msg))
 	}
+}
+
+// jwtLike matches anything that looks like a JWT or a piece of one
+// (base64url of a JSON object starts with "eyJ").
+var jwtLike = regexp.MustCompile(`eyJ[A-Za-z0-9_.-]*`)
+
+// redactTokens replaces everything that looks like a JWT.
+func redactTokens(s string) string { return jwtLike.ReplaceAllString(s, "<redacted>") }
+
+func TestRedactTokens(t *testing.T) {
+	in := "Failed to verify eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiIxIn0.c2ln-_x: bad; header eyJhbGciOi... and user app-api@example-project.iam.gserviceaccount.com"
+	want := "Failed to verify <redacted>: bad; header <redacted> and user app-api@example-project.iam.gserviceaccount.com"
+	if got := redactTokens(in); got != want {
+		t.Errorf("redactTokens:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// logServerTokenEvents registers a cleanup that, if t failed, logs the
+// server's recent token processor log lines from system.text_log, such as
+// "google_jwt: Failed to validate JWT: Connection refused", with anything
+// that looks like a JWT redacted. The fake records only the JWKS fetches
+// that reached it: a fetch that failed on the way (network, DNS) looks like
+// a refused token in the tests and shows only here. The queries are bounded,
+// so a dead connection cannot stall cleanup.
+func logServerTokenEvents(t *testing.T, s *server) {
+	t.Helper()
+	t.Cleanup(func() {
+		if !t.Failed() {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_ = s.admin.Exec(ctx, "SYSTEM FLUSH LOGS")
+		// Antalya logs token validation as TokenAuthentication and
+		// AccessTokenAuthentication.
+		rows, err := s.admin.Query(ctx, `SELECT toString(event_time_microseconds), toString(level), logger_name, substring(message, 1, 300)
+FROM system.text_log
+WHERE logger_name ILIKE '%token%' OR logger_name ILIKE '%jwk%' OR logger_name ILIKE '%jwt%' OR message ILIKE '%jwks%'
+ORDER BY event_time_microseconds DESC
+LIMIT 60`)
+		if err != nil {
+			t.Logf("cannot read the server's token log: %v", err)
+			return
+		}
+		defer rows.Close() //nolint:errcheck // Test diagnostics.
+		var lines []string
+		for rows.Next() {
+			var ts, level, logger, msg string
+			if err := rows.Scan(&ts, &level, &logger, &msg); err != nil {
+				t.Logf("cannot read the server's token log: %v", err)
+				return
+			}
+			lines = append(lines, fmt.Sprintf("%s %s %s: %s", ts, level, logger, strings.ReplaceAll(msg, "\n", " ")))
+		}
+		slices.Reverse(lines)
+		t.Logf("server's token processor log (last %d lines, JWTs redacted):\n%s", len(lines), redactTokens(strings.Join(lines, "\n")))
+	})
 }
 
 // identityFetches returns how many ID tokens the provider requested.
@@ -539,10 +601,14 @@ func testGoogleIDTokenAntalya(t *testing.T, image string) {
 
 	t.Run("ShortLivedTokenIsReplacedVia516", func(t *testing.T) {
 		// A token issued 60 s ago with a 5 s lifetime: ClickHouse accepts it
-		// (60 s leeway) for about 5 more seconds. The Google library caches
-		// metadata ID tokens for 55 minutes whatever their exp, so the
-		// provider keeps sending it on new connections until ClickHouse
-		// refuses it; the 516 retry then fetches a fresh token.
+		// (60 s leeway) for about 5 more seconds. The Google libraries cache
+		// metadata ID tokens for a fixed 55 min (or 1 h) whatever their exp
+		// (TestGoogleLibraries), so the provider keeps sending it on new
+		// connections until ClickHouse refuses it; the 516 retry then
+		// fetches a fresh token. GoogleSource itself does honour the expiry
+		// the library reports (TestGoogleSourceHonoursExpiry), so a library
+		// that reported exp would replace the token before the dial instead;
+		// either way exactly one fresh token is fetched.
 		if err := fake.SetTTL(5 * time.Second); err != nil {
 			t.Fatal(err)
 		}
@@ -562,13 +628,13 @@ func testGoogleIDTokenAntalya(t *testing.T, image string) {
 		// pool's connMaxLifetime (2 s): the next statement dials again.
 		time.Sleep(googleTokenCacheLifetime + 3*time.Second)
 		if n := fake.identityFetches() - before; n != 1 {
-			t.Fatalf("the provider refreshed proactively (%d requests); the test assumes it does not", n)
+			t.Logf("the provider fetched %d ID tokens while idle", n-1)
 		}
 		if o := h.reconcile("google-short"); o.err != nil || !o.obs.ResourceExists {
 			t.Fatalf("observe with an expired cached token: %s", o)
 		}
 		if n := fake.identityFetches() - before; n != 2 {
-			t.Fatalf("%d ID token requests, want 2: the 516 retry fetches exactly one fresh token", n)
+			t.Fatalf("%d ID token requests, want 2: exactly one fresh token replaces the expired one", n)
 		}
 		fake.Reset()
 		h.delete("google-short")
@@ -719,6 +785,18 @@ func testGoogleIDTokenAntalya(t *testing.T, image string) {
 		// cloud.google.com/go/auth instead of golang.org/x/oauth2 (opt-in
 		// today, the default later).
 		t.Setenv("GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB", "true")
+		// Both libraries send the same request, so first make sure the
+		// switch takes effect for the call the provider makes without a key
+		// (idtoken.NewTokenSource with the audience and no options): the
+		// new library returns an oauth2adapt source and fetches lazily.
+		ids := fake.identityFetches()
+		ts, err := idtoken.NewTokenSource(context.Background(), audience)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !fakegcp.UsesNewAuthLibrary(ts) || fake.identityFetches() != ids {
+			t.Fatalf("the switch did not take effect: token source %T, %d ID token requests in NewTokenSource", ts, fake.identityFetches()-ids)
+		}
 		before := len(fake.Requests())
 		mustConnect(t, "new auth library")
 		var full bool
@@ -734,15 +812,45 @@ func testGoogleIDTokenAntalya(t *testing.T, image string) {
 	})
 }
 
+// skipGoogleUpstream reports whether TestGoogleIDTokenUpstream is skipped:
+// XPCH_UPSTREAM_IMAGES=none (a run without upstream images, such as the
+// Antalya-only CI jobs) skips it unless XPCH_GOOGLE_UPSTREAM_IMAGES names
+// images.
+func skipGoogleUpstream(getenv func(string) string) bool {
+	return getenv(envUpstreamImages) == "none" && getenv(envGoogleUpstreamImages) == ""
+}
+
+func TestSkipGoogleUpstream(t *testing.T) {
+	for _, tc := range []struct {
+		upstream, google string
+		skip             bool
+	}{
+		{"", "", false},
+		{defaultUpstreamImages, "", false},
+		{"none", "", true},
+		{"none", defaultGoogleUpstreamImage, false},
+		{"", "none", false}, // images() skips on XPCH_GOOGLE_UPSTREAM_IMAGES=none itself
+	} {
+		env := map[string]string{envUpstreamImages: tc.upstream, envGoogleUpstreamImages: tc.google}
+		if got := skipGoogleUpstream(func(k string) string { return env[k] }); got != tc.skip {
+			t.Errorf("%s=%q %s=%q: skip %t, want %t", envUpstreamImages, tc.upstream, envGoogleUpstreamImages, tc.google, got, tc.skip)
+		}
+	}
+}
+
 // TestGoogleIDTokenUpstream: upstream ClickHouse has no JWT login. With
 // GoogleIDToken credentials the provider fails cleanly with
 // AuthenticationFailed after one retry, and never sees a user.
 func TestGoogleIDTokenUpstream(t *testing.T) {
+	if skipGoogleUpstream(os.Getenv) {
+		t.Skipf("%s=none and %s is unset", envUpstreamImages, envGoogleUpstreamImages)
+	}
 	for _, image := range images(t, envGoogleUpstreamImages, defaultGoogleUpstreamImage) {
 		t.Run(image, func(t *testing.T) {
 			fake := startGoogleFake(t)
 			audience := "https://clickhouse-" + randHex(4) + ".example.com"
 			srv := startServer(t, image, nil)
+			logServerTokenEvents(t, srv)
 			kube := newKube(t, googleCPC(srv, "google", audience))
 			h := newHarness(t, kube, nil)
 			h.createMR("upstream", v1alpha1.DatabaseParameters{Name: new("app_upstream")}, "ClusterProviderConfig", "google")

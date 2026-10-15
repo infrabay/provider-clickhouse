@@ -23,8 +23,9 @@ metadata request to `GCE_METADATA_HOST` when it is set.
 GKE metadata servers:
 
 - `GET /` answers without any request header and with `Metadata-Flavor: Google`,
-  the header the Go library's GCE detection looks for. Every response carries
-  it.
+  as the real server does for GCE detection. Every response carries it. The
+  Go libraries never call it in these tests, though: see GCE detection under
+  "What is not simulated".
 - Requests below `/computeMetadata/v1/` need `Metadata-Flavor: Google` (403
   otherwise). Requests with `X-Forwarded-For` are refused (403). Only `GET` and
   `HEAD` are allowed.
@@ -71,6 +72,16 @@ Logs contain key IDs and claim summaries only, never tokens or keys.
 
 ## What is not simulated
 
+- **GCE detection.** With `GCE_METADATA_HOST` set, `metadata.OnGCE()` returns
+  true at once; without it, the probe goes to the hard-coded
+  `http://169.254.169.254` and a DNS lookup of `metadata.google.internal`,
+  never to the fake. Every test sets `GCE_METADATA_HOST` (`fakegcp.UseFake`,
+  and the deploy manifests for end-to-end tests), so detection is bypassed
+  everywhere and the fake's `GET /` handler is never used by the libraries
+  (`TestGoogleLibraries` fails on any request to it). A provider bug that only
+  breaks detection on real GKE would not show up, for example an early
+  `OnGCE` call with a cancelled context, which memoizes false for the life
+  of the process.
 - **The real GKE metadata server**: the Workload Identity binding
   (`iam.gke.io/gcp-service-account`, `roles/iam.workloadIdentityUser`), the
   per-pod identity, its latency, rate limits and caching, the exact text of
@@ -114,12 +125,22 @@ log of the tests):
   first two sources so a developer's own credentials are never used.
 - With `GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB=true` the
   `cloud.google.com/go/auth` path fetches lazily and requests the same URL.
+  Because the requests are identical, the tests check which library is in
+  use: the new one returns an `oauth2adapt` token source
+  (`fakegcp.UsesNewAuthLibrary`) and requests no token in `NewTokenSource`
+  (`TestGoogleLibraries`, and a precondition of `NewAuthLibrary`).
 - The default path caches a metadata ID token for 55 minutes (the new path:
-  1 h, refreshed 5 min early) **whatever its `exp`**. Google's tokens live
-  1 h, so this only matters for shorter tokens: the provider keeps sending a
-  short-lived token on new connections until ClickHouse refuses it, and the
-  516 retry (design 6.4) then fetches a fresh one
+  1 h, refreshed 5 min early) **whatever its `exp`** (`TestGoogleLibraries`
+  checks the expiry the libraries report for a 5-minute token). Google's
+  tokens live 1 h, so this only matters for shorter tokens: the provider
+  keeps sending a short-lived token on new connections until ClickHouse
+  refuses it, and the 516 retry (design 6.4) then fetches a fresh one
   (`ShortLivedTokenIsReplacedVia516`).
+- The provider's `GoogleSource` caches a token only until the expiry the
+  library reports (oauth2 refreshes 10 s early), without waiting for a 516
+  (`TestGoogleSourceHonoursExpiry`). The integration tests cannot see this:
+  the libraries' fixed 55 min to 1 h is longer than any test, so a source
+  that cached its first token forever would pass them all.
 - The metadata client gives each attempt 5 s and retries 5xx, 429 and timeouts
   five times with jittered backoff from 100 ms. A failing metadata server
   costs 1.5 to 3 s; a hanging one about 31 s (measured in two runs: 1.4 to
@@ -147,8 +168,9 @@ read in `src/Access/TokenProcessorsJWT.cpp`, `Common/JWKSProvider.cpp` and
   is missing.
 - A valid Google token for a service account that is not a ClickHouse user is
   refused (516): without `user_directories/token` nothing creates users.
-- The leeway is exactly 60 s for `exp` and `iat`: a metadata clock 30 s off
-  works, 2 min ahead or 62 min behind gives 516.
+- The leeway for `exp` and `iat` is `verifier_leeway`, 60 s unless
+  configured (read in `TokenProcessorsParse.cpp`). The tests bound it: a
+  metadata clock 30 s off works, 2 min ahead or 62 min behind gives 516.
 - An unknown `kid` does not trigger a JWKS refetch: a new key is accepted only
   after `jwks_cache_lifetime`. A key published before it is used (Google's
   practice) switches without a failure (`KeyRotation`).
@@ -178,7 +200,8 @@ Tests, docs and the Kubernetes manifests render the processor with
 `fakegcp.GoogleProcessor.YAML`. Production (`fakegcp.ProductionGoogleProcessor`)
 differs from the tests only in `jwks_uri` and in the cache lifetimes, which
 the tests shorten to 10 s so that rotation and expiry happen within seconds.
-A unit test checks that this block matches the renderer:
+`TestProcessorYAML` checks that this block, and the one in the design's
+server configuration examples (Appendix B), match the renderer:
 
 ```yaml
 token_processors:
@@ -193,6 +216,12 @@ token_processors:
     jwks_cache_lifetime: 3600
     token_cache_lifetime: 300
 ```
+
+Every validation key matters. A processor with only `expected_issuer`,
+`expected_audience` and `username_claim` (an earlier version of the design's
+example) accepted tokens with `typ` `at+jwt`, without `typ` and with
+`email_verified: false` on 26.6.4 (checked once by hand against the fake);
+wrong issuers and audiences were still refused.
 
 Users log in through it as SQL users
 (`IDENTIFIED WITH jwt PROCESSOR 'google_jwt' CLAIMS '{"sub":"…"}'`) or as
@@ -211,13 +240,15 @@ go test -race ./test/fakegcp/... ./internal/clients/clickhouse/auth/...
 ```
 
 Besides the fake itself they run `TestGoogleLibraries` (the Google client
-libraries and Google's own `idtoken.Validator` against the fake),
+libraries and Google's own `idtoken.Validator` against the fake, which library
+is in use, and the libraries' fixed token expiry),
 `TestGoogleSourceWithMetadataServer` (the provider's `GoogleSource`: caching,
-`Invalidate`, retries, scrubbed errors), `TestProcessorYAML` (the processor in
-this document and in the ConfigMap is the rendered one) and
-`TestDeployManifests` (the Kubernetes manifests decode strictly into their
-Kubernetes and provider types and agree on the Service name, audience, service
-account and processor).
+`Invalidate`, retries, scrubbed errors), `TestGoogleSourceHonoursExpiry`
+(`GoogleSource` drops a token at the expiry the library reports),
+`TestProcessorYAML` (the processor in this document, in the design and in the
+ConfigMap is the rendered one) and `TestDeployManifests` (the Kubernetes
+manifests decode strictly into their Kubernetes and provider types and agree
+on the Service name, audience, service account and processor).
 
 Integration tests (Docker; the containers reach the test process as
 `host.docker.internal`):
@@ -228,12 +259,20 @@ TESTCONTAINERS_RYUK_DISABLED=true go test -tags integration -count=1 -run TestGo
 
 `make test-integration` runs them with every other integration test. The
 Antalya test takes about two minutes, mostly waiting for cache lifetimes and
-the metadata client's timeouts.
+the metadata client's timeouts. It supports Antalya 26.6.4 (the default) and
+26.3.13 (the CI job "antalya 26.3"); see "Open points" for one unexplained
+failure on 26.3.13.
+
+When a test fails, the server's token processor log lines from
+`system.text_log` are logged (JWTs redacted), for example
+`google_jwt: Failed to validate JWT: Connection refused` for a JWKS fetch that
+never reached the fake. The fake's request log shows only the fetches that
+did.
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `XPCH_ANTALYA_IMAGES` | `altinity/clickhouse-server:26.6.4.20001.altinityantalya` | Antalya images for `TestGoogleIDTokenAntalya` |
-| `XPCH_GOOGLE_UPSTREAM_IMAGES` | `clickhouse/clickhouse-server:25.3.3.42-alpine` | Upstream images that must fail cleanly |
+| `XPCH_GOOGLE_UPSTREAM_IMAGES` | `clickhouse/clickhouse-server:25.3.3.42-alpine`, or none if `XPCH_UPSTREAM_IMAGES=none` | Upstream images that must fail cleanly; the Antalya-only CI jobs set `XPCH_UPSTREAM_IMAGES=none` and so skip `TestGoogleIDTokenUpstream` |
 | `XPCH_FAKEGCP_BIND` | `127.0.0.1` on macOS and Windows, `0.0.0.0` on Linux | Address of the fake's JWKS listener; containers reach it through `host.docker.internal` (the metadata listener is always on `127.0.0.1`) |
 | `XPCH_FAKEGCP_LOG` | unset | `1` logs the fake's requests and issued tokens (key IDs and claims only) |
 
@@ -244,10 +283,25 @@ the metadata client's timeouts.
 | `FaultyTokensAreRejected` | Every fault gives 516, one invalidate and exactly one fresh token, and an error without token material. |
 | `AttackerServiceAccount`, `ClockSkew` | See above. |
 | `KeyRotation` | Pre-published key: no failure. Immediate rotation: 516 until `jwks_cache_lifetime`, then accepted. Retired key: refused after the refresh. |
-| `ShortLivedTokenIsReplacedVia516`, `ServerTokenCacheIgnoresExp` | Token expiry on the provider and the server side. |
+| `ShortLivedTokenIsReplacedVia516`, `ServerTokenCacheIgnoresExp` | Token expiry on the provider side (exactly one fresh token replaces an expired one: through the 516 retry with today's libraries, before the dial if a library reported `exp`) and on the server side. |
 | `MetadataOutage`, `SlowMetadataServer`, `JWKSOutage` | 500, 403 and hanging metadata server: clean `AuthenticationFailed`, recovery; slow server; JWKS outage. |
-| `NewAuthLibrary` | The `cloud.google.com/go/auth` path. |
+| `NewAuthLibrary` | The `cloud.google.com/go/auth` path, after checking that the switch took effect. |
 | `TestGoogleIDTokenUpstream` | Upstream without JWT support fails cleanly. |
+
+## Open points
+
+- **One intermittent failure on Antalya 26.3.13.** In one full run,
+  `SlowMetadataServer` got 516 after about 10 s, and `JWKSOutage` and
+  `NewAuthLibrary` got 516 within milliseconds after it, without a JWKS fetch
+  reaching the fake; the run's cleanup then took about 15 minutes before the
+  container was stopped. It did not happen in six other full runs or in
+  several subset runs. The pattern fits JWKS fetches that failed on the
+  network, for example while another workload was using the same Docker
+  host, but the cause is unknown. Failures now log the server's token
+  processor lines, which tell a network failure (`Connection refused`,
+  timeouts) from a refused token. Not changed: a bound on the shared
+  harness's container cleanup, because it is unknown which cleanup step hung,
+  and `go test -timeout` already bounds the run.
 
 ## Running the fake elsewhere
 

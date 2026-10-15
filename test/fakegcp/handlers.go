@@ -91,7 +91,8 @@ func (s *Server) logged(next func(w *statusWriter, r *http.Request)) http.Handle
 // metadata servers:
 //
 //   - every response carries "Metadata-Flavor: Google" (the Go library's
-//     GCE detection, without GCE_METADATA_HOST, checks it on GET /);
+//     GCE detection checks it on GET / of 169.254.169.254, and only without
+//     GCE_METADATA_HOST, so never on this fake);
 //   - requests with an X-Forwarded-For header are refused with 403;
 //   - requests below /computeMetadata/v1/ without "Metadata-Flavor: Google"
 //     are refused with 403; GET / needs no header;

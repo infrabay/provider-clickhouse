@@ -773,13 +773,16 @@ func TestProcessorYAML(t *testing.T) {
 	if got := p.YAML(); got != want {
 		t.Fatalf("production processor:\n%s\nwant:\n%s", got, want)
 	}
-	// The docs show exactly this rendering.
-	doc, err := os.ReadFile("../../docs/testing-google-tokens.md")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(doc), want) {
-		t.Errorf("docs/testing-google-tokens.md does not contain the production processor as rendered:\n%s", want)
+	// The docs and the design's server configuration examples (Appendix B)
+	// show exactly this rendering.
+	for _, path := range []string{"docs/testing-google-tokens.md", "docs/design.md"} {
+		doc, err := os.ReadFile("../../" + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(doc), want) {
+			t.Errorf("%s does not contain the production processor as rendered:\n%s", path, want)
+		}
 	}
 	// The Kubernetes manifest renders the same processor against the fake.
 	k8s := p
@@ -807,7 +810,9 @@ func indent(s, prefix string) string {
 
 // TestGoogleLibraries runs the Google client libraries against the fake
 // exactly as the provider uses them on GKE: Application Default Credentials
-// with GCE_METADATA_HOST, and nothing else.
+// with GCE_METADATA_HOST, and nothing else. It also pins two library
+// behaviours the integration tests rely on: which library is in use, and
+// that both cache a metadata ID token for a fixed time whatever its exp.
 func TestGoogleLibraries(t *testing.T) {
 	s, hs := newTestServer(t, Options{})
 	UseFake(t, strings.TrimPrefix(hs.URL, "http://"))
@@ -815,10 +820,41 @@ func TestGoogleLibraries(t *testing.T) {
 	for _, newAuth := range []bool{false, true} {
 		t.Run(fmt.Sprintf("newAuthLibrary=%t", newAuth), func(t *testing.T) {
 			t.Setenv("GOOGLE_API_GO_EXPERIMENTAL_ENABLE_NEW_AUTH_LIB", fmt.Sprint(newAuth))
-			before := len(s.Requests())
-			tok := libraryToken(t, testAudience)
+			// Tokens that expire in 5 min.
+			if err := s.SetTTL(5 * time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(s.Reset)
+			before, ids := len(s.Requests()), s.Count(IdentityPath)
+			ts, otok, eager := libraryToken(t, s, testAudience)
+			tok := otok.AccessToken
 			if _, c, err := verify(t, s, tok); err != nil || c["email"] != testIdentity.Email {
 				t.Fatalf("library token: %v %v", c, err)
+			}
+			// The switch took effect: both libraries send the same request,
+			// but only cloud.google.com/go/auth returns an oauth2adapt token
+			// source and fetches on the first Token call instead of in
+			// NewTokenSource.
+			wantEager := 1
+			if newAuth {
+				wantEager = 0
+			}
+			if got := UsesNewAuthLibrary(ts); got != newAuth || eager != wantEager {
+				t.Fatalf("token source %T (new auth library %t) requested %d ID tokens in NewTokenSource; want the new auth library %t and %d",
+					ts, got, eager, newAuth, wantEager)
+			}
+			// The library's expiry is fixed (55 min; the new library: 1 h,
+			// and it refreshes 5 min early), not the token's exp: a
+			// short-lived token is reused until it is refused.
+			life := 55 * time.Minute
+			if newAuth {
+				life = time.Hour
+			}
+			if d := time.Until(otok.Expiry); d > life || d < life-time.Minute {
+				t.Errorf("the library's token expires in %s, want about %s whatever the token's exp (5 min)", d.Round(time.Second), life)
+			}
+			if again, err := ts.Token(); err != nil || again.AccessToken != tok || s.Count(IdentityPath)-ids != 1 {
+				t.Errorf("a second Token call: %v, %d ID token requests in all; want the cached token and 1", err, s.Count(IdentityPath)-ids)
 			}
 			// Google's own validator accepts it against the fake's JWKS.
 			v := googleValidator(t, hs)
@@ -831,6 +867,8 @@ func TestGoogleLibraries(t *testing.T) {
 			}
 			// The libraries asked for format=full with the audience, and
 			// touched nothing but the project ID and the identity endpoint.
+			// Not even GET /: with GCE_METADATA_HOST set they skip GCE
+			// detection, so the fake's root handler is never exercised.
 			for _, r := range s.Requests()[before:] {
 				switch r.Path {
 				case IdentityPath:

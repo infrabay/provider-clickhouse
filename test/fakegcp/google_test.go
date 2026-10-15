@@ -11,23 +11,29 @@ import (
 	"strings"
 	"testing"
 
+	"golang.org/x/oauth2"
 	"google.golang.org/api/idtoken"
 	"google.golang.org/api/option"
 )
 
 // libraryToken fetches an ID token the way the provider does: through
-// idtoken.NewTokenSource with Application Default Credentials.
-func libraryToken(t *testing.T, audience string) string {
+// idtoken.NewTokenSource with Application Default Credentials. It returns
+// the token source, its token, and how many ID tokens NewTokenSource itself
+// requested from s (golang.org/x/oauth2 fetches at once,
+// cloud.google.com/go/auth on the first Token call).
+func libraryToken(t *testing.T, s *Server, audience string) (oauth2.TokenSource, *oauth2.Token, int) {
 	t.Helper()
+	before := s.Count(IdentityPath)
 	ts, err := idtoken.NewTokenSource(context.Background(), audience)
 	if err != nil {
 		t.Fatalf("idtoken.NewTokenSource: %v", err)
 	}
+	eager := s.Count(IdentityPath) - before
 	tok, err := ts.Token()
 	if err != nil {
 		t.Fatalf("Token: %v", err)
 	}
-	return tok.AccessToken
+	return ts, tok, eager
 }
 
 // toFake sends requests for Google's JWKS to the fake and fails every other
