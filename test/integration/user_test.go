@@ -663,7 +663,9 @@ func testUserPasswordLifecycle(t *testing.T, f *accessFixture) {
 func testUserPasswordSecretRef(t *testing.T, f *accessFixture) {
 	ctx := context.Background()
 	h := newUserHarness(t, f)
-	pw := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "api-pw"}, Data: map[string][]byte{"password": []byte("Initial-Passw0rd-1")}}
+	// Throwaway passwords, generated per run.
+	initial, second := "Initial-"+randHex(8), "Second-"+randHex(8)
+	pw := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: "api-pw"}, Data: map[string][]byte{"password": []byte(initial)}}
 	if err := f.kube.Create(ctx, pw); err != nil {
 		t.Fatal(err)
 	}
@@ -674,10 +676,10 @@ func testUserPasswordSecretRef(t *testing.T, f *accessFixture) {
 	}
 	h.createUser("api", "app_api", ref)
 	h.mustReconcile("api", "create", created)
-	if got := string(h.secret("api")[v1alpha1.ConnectionKeyPassword]); got != "Initial-Passw0rd-1" {
+	if got := string(h.secret("api")[v1alpha1.ConnectionKeyPassword]); got != initial {
 		t.Fatalf("published password %q", got)
 	}
-	if err := f.loginPassword(t, "app_api", "Initial-Passw0rd-1"); err != nil {
+	if err := f.loginPassword(t, "app_api", initial); err != nil {
 		t.Fatal(err)
 	}
 	h.mustReconcile("api", "late-initialize", func(o outcome) bool { return o.err == nil && o.obs.ResourceUpToDate })
@@ -688,18 +690,18 @@ func testUserPasswordSecretRef(t *testing.T, f *accessFixture) {
 	if err := f.kube.Get(ctx, client.ObjectKeyFromObject(pw), pw); err != nil {
 		t.Fatal(err)
 	}
-	pw.Data["password"] = []byte("Second-Passw0rd-2")
+	pw.Data["password"] = []byte(second)
 	if err := f.kube.Update(ctx, pw); err != nil {
 		t.Fatal(err)
 	}
 	h.mustReconcile("api", "rotate", updated)
-	if got := string(h.secret("api")[v1alpha1.ConnectionKeyPassword]); got != "Second-Passw0rd-2" {
+	if got := string(h.secret("api")[v1alpha1.ConnectionKeyPassword]); got != second {
 		t.Fatalf("published password %q", got)
 	}
 	if diff := cmpStrings([]string{string(user.ReasonPasswordRotated)}, h.events()); diff != "" {
 		t.Errorf("events: %s", diff)
 	}
-	if err := f.loginPassword(t, "app_api", "Second-Passw0rd-2"); err != nil {
+	if err := f.loginPassword(t, "app_api", second); err != nil {
 		t.Fatal(err)
 	}
 	h.mustReconcile("api", "steady after rotation", steady)
@@ -714,7 +716,7 @@ func testUserPasswordSecretRef(t *testing.T, f *accessFixture) {
 		t.Fatal(err)
 	}
 	h.mustReconcile("api", "missing password Secret", failedWith(reason.DependencyMissing))
-	if err := f.loginPassword(t, "app_api", "Second-Passw0rd-2"); err != nil {
+	if err := f.loginPassword(t, "app_api", second); err != nil {
 		t.Fatalf("the password must not change: %v", err)
 	}
 }

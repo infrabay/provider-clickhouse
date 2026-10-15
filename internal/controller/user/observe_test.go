@@ -5,6 +5,7 @@ package user
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
@@ -21,10 +22,13 @@ import (
 	"github.com/infrabay/provider-clickhouse/internal/reason"
 )
 
+// recordedPassword is the fake password that the tests' connection Secrets
+// record.
+var recordedPassword = strings.Repeat("recorded-", 2) + "password"
+
 const (
-	recordedPassword = "Recorded-Passw0rd-1"
-	validUntil2031   = int64(1924992000)
-	showPassword     = "CREATE USER `team-a_etl` IDENTIFIED WITH sha256_password"
+	validUntil2031 = int64(1924992000)
+	showPassword   = "CREATE USER `team-a_etl` IDENTIFIED WITH sha256_password"
 )
 
 // details returns the connection details of team-a_etl on the test

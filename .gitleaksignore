@@ -1,3 +1,14 @@
 # Fingerprints of gitleaks findings that are known false positives, one per
 # line (gitleaks prints the fingerprint of each finding). Prefer an inline
 # "gitleaks:allow" comment on fake test secrets instead.
+
+# Commit 7b9386e (Add the User controller) added fake test passwords that the
+# generic-api-key rule flags. None was ever a real secret: one is the password
+# a unit test records in a fake connection Secret (no server involved), the
+# others log in to throwaway ClickHouse containers of an integration test.
+# The fixtures are now computed at test time; these entries only cover the
+# old commit.
+7b9386ee00b525fabda0d4416992e1adc9b16641:internal/controller/user/observe_test.go:generic-api-key:25
+7b9386ee00b525fabda0d4416992e1adc9b16641:test/integration/user_test.go:generic-api-key:678
+7b9386ee00b525fabda0d4416992e1adc9b16641:test/integration/user_test.go:generic-api-key:700
+7b9386ee00b525fabda0d4416992e1adc9b16641:test/integration/user_test.go:generic-api-key:715
