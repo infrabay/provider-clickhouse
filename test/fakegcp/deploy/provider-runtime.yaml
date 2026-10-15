@@ -1,0 +1,48 @@
+# Points the provider at the fake metadata server. The Google client
+# libraries read GCE_METADATA_HOST on every request and, when it is set,
+# treat the pod as running on Google Cloud without probing 169.254.169.254.
+# Use it instead of runtime/gke-workload-identity.yaml in e2e tests; the
+# Google service account annotation is not needed because the fake serves
+# tokens for the identity given in its --email flag.
+apiVersion: pkg.crossplane.io/v1beta1
+kind: DeploymentRuntimeConfig
+metadata:
+  name: provider-clickhouse-fakegcp
+spec:
+  serviceAccountTemplate:
+    metadata:
+      name: provider-clickhouse
+  deploymentTemplate:
+    spec:
+      selector: {}
+      template:
+        spec:
+          containers:
+            - name: package-runtime
+              env:
+                - name: GCE_METADATA_HOST
+                  value: fakegcp.fakegcp.svc.cluster.local
+---
+# GoogleIDToken credentials without a key: Application Default Credentials,
+# which on a pod with GCE_METADATA_HOST means the fake. The audience equals
+# expected_audience of the google_jwt processor. TLS is off only because the
+# e2e ClickHouse serves plain native; production keeps tls.enabled.
+apiVersion: clickhouse.m.infrabay.io/v1alpha1
+kind: ClusterProviderConfig
+metadata:
+  name: clickhouse-google
+spec:
+  endpoint:
+    host: clickhouse.clickhouse.svc.cluster.local
+    port: 9000
+  allowInsecureTransport: true
+  credentials:
+    source: GoogleIDToken
+    googleIDToken:
+      audience: https://clickhouse-e2e.example.com
+  policy:
+    allowedNamespaces: ["team-a"]
+    databaseNamePatterns: ["app_.+"]
+    userNamePatterns: ['app-[a-z0-9-]+@example-project\.iam\.gserviceaccount\.com']
+    allowedAuthentication: [JWT]
+    allowedJWTProcessors: [google_jwt]
