@@ -57,7 +57,10 @@ response was lost is recognised by its UUID.
 
 For `User` and `Role` the provider records every `CREATE` it sends in
 memory. When the response was lost, the next reconcile recognises the entity
-and claims it (event `CreateRecovered`). After a provider restart that
+and claims it (event `CreateRecovered`). A graceful provider restart (the
+pod is deleted, a node is drained, a new package revision rolls out) lets
+the reconciles that are running finish, so their claims are recorded. After
+the provider process was killed or crashed in the middle of a create, the
 record is gone, and the resource reports `NotOwned` with the hint that a
 create by this resource did not complete. Check that the entity is the one
 the resource created, for example in `system.query_log`, where every

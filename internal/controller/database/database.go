@@ -127,7 +127,7 @@ func Setup(mgr ctrl.Manager, o controller.Options, d Dependencies) error {
 		WithOptions(o.ForControllerRuntime()).
 		WithEventFilter(resource.DesiredStateChanged()).
 		For(&v1alpha1.Database{}).
-		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
+		Complete(access.FinishOnShutdown(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter)))
 }
 
 func forProviderName(mg resource.Managed) *string {

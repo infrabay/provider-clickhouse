@@ -286,15 +286,17 @@ func (c *Cache) Close() {
 	c.entries = map[string]*entry{}
 }
 
-// Start runs Sweep every minute until ctx is done, then closes every pool. It
-// implements controller-runtime's manager.Runnable.
+// Start runs Sweep every minute until ctx is done. It implements
+// controller-runtime's manager.Runnable. It does not close the pools when it
+// returns: the manager stops runnables like this one before the controllers,
+// whose running reconciles still use them (access.FinishOnShutdown). Call
+// Close once the manager has stopped.
 func (c *Cache) Start(ctx context.Context) error {
 	t := time.NewTicker(DefaultSweepInterval)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			c.Close()
 			return nil
 		case <-t.C:
 			c.Sweep()

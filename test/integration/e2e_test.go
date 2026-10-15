@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,10 +32,12 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/crossplane/crossplane-runtime/v2/pkg/controller"
@@ -50,6 +53,7 @@ import (
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
 	xpcontroller "github.com/infrabay/provider-clickhouse/internal/controller"
 	"github.com/infrabay/provider-clickhouse/internal/controller/access"
+	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/controller/providerconfig"
 	"github.com/infrabay/provider-clickhouse/internal/reason"
 )
@@ -61,6 +65,15 @@ import (
 // policies. It needs KUBEBUILDER_ASSETS (make test-integration sets it).
 func startProvider(t *testing.T) client.Client {
 	t.Helper()
+	cfg := startAPIServer(t)
+	runProvider(t, cfg, providerRun{})
+	return kubeClient(t, cfg)
+}
+
+// startAPIServer starts a kube-apiserver (envtest) with every packaged CRD
+// installed, until the test ends.
+func startAPIServer(t *testing.T) *rest.Config {
+	t.Helper()
 	env := &envtest.Environment{
 		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "package", "crds")},
 		ErrorIfCRDPathMissing: true,
@@ -70,18 +83,51 @@ func startProvider(t *testing.T) client.Client {
 		t.Fatalf("cannot start envtest: %v", err)
 	}
 	t.Cleanup(func() { _ = env.Stop() })
+	return cfg
+}
 
+// providerScheme holds the provider's kinds and the CRD kind.
+func providerScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{clientgoscheme.AddToScheme, apis.AddToScheme, apiextensionsv1.AddToScheme} {
 		if err := add(scheme); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return scheme
+}
+
+// kubeClient returns a client of the API server.
+func kubeClient(t *testing.T, cfg *rest.Config) client.Client {
+	t.Helper()
+	kube, err := client.New(cfg, client.Options{Scheme: providerScheme(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return kube
+}
+
+// providerRun configures runProvider. The zero value runs the provider as
+// cmd/provider does.
+type providerRun struct {
+	// open opens ClickHouse connection pools; nil means ch.OpenDriver.
+	open ch.Opener
+	// runnables are added to the manager as well.
+	runnables []manager.Runnable
+}
+
+// runProvider starts a manager with the provider's controllers, as a new
+// provider process would (with an empty create journal), and returns a
+// function that stops it as SIGTERM does, waits until it has stopped and
+// returns its error. The test's cleanup stops it too.
+func runProvider(t *testing.T, cfg *rest.Config, run providerRun) func() error {
+	t.Helper()
 	// Every test starts its own manager in this process; controller names
 	// are only unique per manager.
 	skip := true
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Scheme:                 scheme,
+		Scheme:                 providerScheme(t),
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
 		Controller:             ctrlconfig.Controller{SkipNameValidation: &skip},
@@ -97,29 +143,42 @@ func startProvider(t *testing.T) client.Client {
 		Features:                &feature.Flags{},
 		Gate:                    new(gate.Gate[schema.GroupVersionKind]),
 	}
-	cache := ch.NewCache(ch.OpenDriver)
-	if err := mgr.Add(cache); err != nil {
-		t.Fatal(err)
+	open := run.open
+	if open == nil {
+		open = ch.OpenDriver
+	}
+	cache := ch.NewCache(open)
+	for _, r := range append([]manager.Runnable{cache}, run.runnables...) {
+		if err := mgr.Add(r); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := customresourcesgate.Setup(mgr, o); err != nil {
 		t.Fatal(err)
 	}
-	if err := xpcontroller.SetupGated(mgr, o, xpcontroller.Dependencies{Cache: cache, Flags: providerconfig.Flags{EnableNamespacedProviderConfigs: true}}); err != nil {
+	deps := xpcontroller.Dependencies{Cache: cache, Flags: providerconfig.Flags{EnableNamespacedProviderConfigs: true}, Journal: ownership.NewJournal()}
+	if err := xpcontroller.SetupGated(mgr, o, deps); err != nil {
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- mgr.Start(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	kube, err := client.New(cfg, client.Options{Scheme: scheme})
-	if err != nil {
-		t.Fatal(err)
+	var (
+		once    sync.Once
+		stopErr error
+	)
+	stop := func() error {
+		once.Do(func() {
+			cancel()
+			stopErr = <-done
+			// As cmd/provider does: the pools are closed once the manager
+			// has stopped.
+			cache.Close()
+		})
+		return stopErr
 	}
-	return kube
+	t.Cleanup(func() { _ = stop() })
+	return stop
 }
 
 // TestProviderEndToEnd runs the provider's controllers, wired as in

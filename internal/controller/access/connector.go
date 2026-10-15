@@ -131,6 +131,7 @@ func NewConnector[T resource.ModernManaged](mgr ctrl.Manager, d Dependencies, ki
 		Recorder:   recorder,
 		References: refs,
 		NewClient:  newClient,
+		Journal:    d.Journal,
 	}
 }
 

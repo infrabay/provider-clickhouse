@@ -19,6 +19,7 @@ import (
 	"github.com/crossplane/crossplane-runtime/v2/pkg/statemetrics"
 
 	ch "github.com/infrabay/provider-clickhouse/internal/clients/clickhouse"
+	"github.com/infrabay/provider-clickhouse/internal/controller/ownership"
 	"github.com/infrabay/provider-clickhouse/internal/controller/providerconfig"
 )
 
@@ -28,6 +29,10 @@ type Dependencies struct {
 	Cache *ch.Cache
 	// Flags are the provider flags that govern ProviderConfigs.
 	Flags providerconfig.Flags
+	// Journal is the create journal of User and Role (D-29); nil means
+	// ownership.DefaultJournal, the journal of this process. Tests that run
+	// several managers in one process give each its own.
+	Journal *ownership.Journal
 }
 
 // A Controller describes the controller of one access entity kind.
@@ -113,7 +118,7 @@ func Setup[T resource.ModernManaged](mgr ctrl.Manager, o controller.Options, c C
 		WithOptions(o.ForControllerRuntime()).
 		WithEventFilter(resource.DesiredStateChanged()).
 		For(c.Object).
-		Complete(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter))
+		Complete(FinishOnShutdown(ratelimiter.NewReconciler(name, r, o.GlobalRateLimiter)))
 }
 
 // SetupGated registers setup with safe-start: it runs once the CRD of gvk is

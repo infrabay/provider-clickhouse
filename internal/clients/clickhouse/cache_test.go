@@ -381,3 +381,38 @@ func TestServerSetAndAccessStorage(t *testing.T) {
 		t.Errorf("replicated storage is always fine: %v", err)
 	}
 }
+
+// TestCacheStartLeavesPoolsOpen: the manager stops the cache before the
+// controllers, so Start must not close the pools that running reconciles
+// still use; Close does, once the manager has stopped.
+func TestCacheStartLeavesPoolsOpen(t *testing.T) {
+	o := &opener{}
+	c := NewCache(o.open)
+	h, err := c.Acquire(context.Background(), Key{Identity: "ClusterProviderConfig/cpc", Version: "v"}, pwCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- c.Start(ctx) }()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not return after its context ended")
+	}
+	if o.conns[0].isClosed() {
+		t.Fatal("Start closed a pool that a reconcile still uses")
+	}
+	if err := h.Exec(context.Background(), "SELECT 1"); err != nil {
+		t.Fatalf("a reconcile running at shutdown cannot use its pool: %v", err)
+	}
+	_ = h.Close()
+	c.Close()
+	if !o.conns[0].isClosed() {
+		t.Fatal("Close must close every pool")
+	}
+}

@@ -173,7 +173,8 @@ func main() {
 	}
 
 	// One connection pool per ProviderConfig, shared by all controllers. The
-	// cache sweeps idle pools and closes every pool on shutdown.
+	// cache sweeps idle pools; every pool is closed once the manager has
+	// stopped, after the reconciles that were running at shutdown finished.
 	clients := ch.NewCache(ch.OpenDriver)
 	kingpin.FatalIfError(mgr.Add(clients), "Cannot add the ClickHouse client cache")
 
@@ -190,5 +191,7 @@ func main() {
 
 	kingpin.FatalIfError(customresourcesgate.Setup(mgr, o), "Cannot set up the CRD gate controller")
 	kingpin.FatalIfError(xpcontroller.SetupGated(mgr, o, deps), "Cannot set up ClickHouse controllers")
-	kingpin.FatalIfError(mgr.Start(ctrl.SetupSignalHandler()), "Cannot start controller manager")
+	err = mgr.Start(ctrl.SetupSignalHandler())
+	clients.Close()
+	kingpin.FatalIfError(err, "Cannot start controller manager")
 }
