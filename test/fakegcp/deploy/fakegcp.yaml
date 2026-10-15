@@ -1,0 +1,115 @@
+# Test-only fake GCE metadata server and Google JWKS (test/fakegcp) for
+# end-to-end tests. Never apply it to a cluster that runs real workloads: the
+# control API mints tokens for any identity, and a pod that trusts its JWKS
+# trusts those tokens.
+#
+# Image: docker build -f test/fakegcp/Dockerfile -t fakegcp:dev . and load it
+# into the cluster (OrbStack and kind share or load local images).
+#
+# Endpoints, inside the cluster:
+#   http://fakegcp.fakegcp.svc.cluster.local/computeMetadata/v1/...  (GCE_METADATA_HOST=fakegcp.fakegcp.svc.cluster.local)
+#   http://fakegcp.fakegcp.svc.cluster.local/oauth2/v3/certs          (jwks_uri for ClickHouse)
+#   http://fakegcp-control.fakegcp.svc.cluster.local:8081/fakegcp/v1/ (test control API; port-forward from the test)
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fakegcp
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fakegcp
+  namespace: fakegcp
+automountServiceAccountToken: false
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fakegcp
+  namespace: fakegcp
+  labels:
+    app.kubernetes.io/name: fakegcp
+spec:
+  # One replica: keys, faults and outages live in memory.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: fakegcp
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: fakegcp
+    spec:
+      serviceAccountName: fakegcp
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: fakegcp
+          image: fakegcp:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --listen=:8080
+            - --control-listen=:8081
+            # The provider's Google service account (Workload Identity).
+            - --email=provider-clickhouse@example-project.iam.gserviceaccount.com
+            - --unique-id=100000000000000000101
+            - --project-id=example-project
+            - --ttl=1h
+          ports:
+            - name: metadata
+              containerPort: 8080
+            - name: control
+              containerPort: 8081
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: control
+          livenessProbe:
+            # The detection root needs no Metadata-Flavor header.
+            httpGet:
+              path: /
+              port: metadata
+          resources:
+            requests: {cpu: 10m, memory: 32Mi}
+            limits: {memory: 128Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+# Metadata server and JWKS. Port 80, like metadata.google.internal, so that
+# GCE_METADATA_HOST needs no port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakegcp
+  namespace: fakegcp
+spec:
+  selector:
+    app.kubernetes.io/name: fakegcp
+  ports:
+    - name: http
+      port: 80
+      targetPort: metadata
+---
+# Test control API. Reach it with kubectl port-forward; do not expose it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: fakegcp-control
+  namespace: fakegcp
+spec:
+  selector:
+    app.kubernetes.io/name: fakegcp
+  ports:
+    - name: control
+      port: 8081
+      targetPort: control

@@ -2756,17 +2756,23 @@ Versions as defined at the top: plain [V] means Antalya 26.6.4 and upstream 26.8
 
 These belong to the ClickHouse deployment, not to the provider. Names are examples.
 
-**Token processors (Antalya, `config.d/token_processors.yaml`).** Processor types in Antalya 26.6 include `google`, `openid`, `entra`, `jwt_static_key`, `jwt_static_jwks` and `jwt_dynamic_jwks` [C].
+**Token processors (Antalya, `config.d/token_processors.yaml`).** Processor types in Antalya 26.6 include `google`, `openid`, `entra`, `jwt_static_key`, `jwt_static_jwks` and `jwt_dynamic_jwks` [C]. The `google` type (opaque access tokens) is known not to work in 26.6.4; Google ID tokens (GoogleIDToken source, jwt users) use `jwt_dynamic_jwks`:
 
 ```yaml
 token_processors:
-  google:                                   # Google ID tokens (GoogleIDToken source, jwt users)
+  google_jwt:
     type: jwt_dynamic_jwks
-    jwks_uri: https://www.googleapis.com/oauth2/v3/certs
-    expected_issuer: https://accounts.google.com
-    expected_audience: https://clickhouse.example.com   # = credentials.googleIDToken.audience; unique per deployment
+    jwks_uri: "https://www.googleapis.com/oauth2/v3/certs"
+    expected_issuer: "https://accounts.google.com"
+    expected_audience: "https://clickhouse.example.com"
+    expected_typ: JWT
+    claims: '{"email_verified": true}'
     username_claim: email
+    jwks_cache_lifetime: 3600
+    token_cache_lifetime: 300
 ```
+
+`expected_audience` equals `credentials.googleIDToken.audience` and is unique per deployment. Without `expected_typ` and `claims`, 26.6.4 accepts tokens with another or no `typ` and with `email_verified: false` [V A26.6]. An accepted token stays in the token cache past its `exp`, so keep `token_cache_lifetime` short [V A26.6]. Never enable `user_directories/token` with it: any Google service account can mint a token for any audience, and the jwt users are the only allow-list. The integration tests run this block against a fake Google, with only `jwks_uri` and the cache lifetimes changed ([testing-google-tokens.md](testing-google-tokens.md)).
 
 **Kubernetes service account tokens** (TokenFile source, and jwt users named `system:serviceaccount:<ns>:<name>`). Copy `issuer` and `jwks_uri` from `<issuer>/.well-known/openid-configuration` (`kubectl get --raw /.well-known/openid-configuration`). Choose one variant:
 

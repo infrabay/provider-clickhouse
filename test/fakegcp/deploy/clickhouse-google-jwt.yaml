@@ -1,0 +1,50 @@
+# ClickHouse (Altinity Antalya 26.6) configuration for Google ID tokens
+# against the fake: the production google_jwt processor with jwks_uri
+# pointing at the fake's Service, and the provider's Google service account
+# as a users.d jwt user pinned to it. Apply it to the ClickHouse namespace and
+# mount the keys into the server's config.d and users.d:
+#
+#   token_processors.yaml   -> /etc/clickhouse-server/config.d/token_processors.yaml
+#   provider-clickhouse.yaml -> /etc/clickhouse-server/users.d/provider-clickhouse.yaml
+#
+# The processor is rendered by fakegcp.GoogleProcessor.YAML (a unit test
+# keeps this copy in sync); production differs only in jwks_uri
+# (https://www.googleapis.com/oauth2/v3/certs) and in the cache lifetimes
+# (3600 s and 300 s, see fakegcp.ProductionGoogleProcessor). Do not enable
+# user_directories/token: any Google service account can mint a token for
+# any audience, and the jwt users are the only allow-list.
+#
+# ClickHouse 26.6 fetches an http:// jwks_uri as well as https://.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: clickhouse-google-jwt
+data:
+  token_processors.yaml: |
+    token_processors:
+      google_jwt:
+        type: jwt_dynamic_jwks
+        jwks_uri: "http://fakegcp.fakegcp.svc.cluster.local/oauth2/v3/certs"
+        expected_issuer: "https://accounts.google.com"
+        expected_audience: "https://clickhouse-e2e.example.com"
+        expected_typ: JWT
+        claims: '{"email_verified": true}'
+        username_claim: email
+        jwks_cache_lifetime: 60
+        token_cache_lifetime: 60
+  provider-clickhouse.yaml: |
+    users:
+      "provider-clickhouse@example-project.iam.gserviceaccount.com":
+        jwt:
+          processor: google_jwt
+        networks: {ip: ["::/0"]}
+        profile: default
+        quota: default
+        grants:
+          query:
+            # Users named after workload service accounts (app-...@...).
+            - "GRANT CREATE USER, ALTER USER, DROP USER ON `app-`*"
+            - "GRANT SHOW USERS, SHOW ROLES ON *.*"
+            - "GRANT SELECT ON system.user_directories"
+            - "GRANT CREATE DATABASE, DROP DATABASE, SHOW TABLES ON app_*.*"
+            - "GRANT ALTER MODIFY DATABASE COMMENT ON app_*.*"
