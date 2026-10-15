@@ -314,6 +314,126 @@ func TestCacheRenewReusesConcurrentRenewal(t *testing.T) {
 	}
 }
 
+// TestCacheRenewWaitsForRunningRenewal: two operations on one pool hit 516 at
+// the same time, as when several reconciles dial with a token that ClickHouse
+// has just started to refuse. The second one must wait for the pool the first
+// one is still building and use it, not fail with AuthenticationFailed.
+func TestCacheRenewWaitsForRunningRenewal(t *testing.T) {
+	ts := &countingTS{}
+	cfg := Config{Host: "h", Port: 9440, Protocol: ProtocolNative, TokenSource: ts}
+	o := &opener{}
+	gate := make(chan struct{})
+	building := make(chan struct{})
+	open := func(cfg Config) (Conn, error) {
+		if o.count() == 1 {
+			// The rebuild: held until the second operation has failed too.
+			close(building)
+			<-gate
+		}
+		return o.open(cfg)
+	}
+	c := NewCache(open)
+	ctx := context.Background()
+	k := Key{Identity: "ClusterProviderConfig//jwt", Version: "v"}
+	h1, _ := c.Acquire(ctx, k, cfg)
+	h2, _ := c.Acquire(ctx, k, cfg)
+	defer h1.Close() //nolint:errcheck // Test cleanup.
+	defer h2.Close() //nolint:errcheck // Test cleanup.
+
+	o.mu.Lock()
+	o.failLeft, o.failCode = 2, CodeAuthenticationFailed
+	o.mu.Unlock()
+	errs := make(chan error, 2)
+	go func() { errs <- h1.Exec(ctx, "SELECT 1") }()
+	<-building
+	go func() { errs <- h2.Exec(ctx, "SELECT 1") }()
+	// h2's statement has failed on the old pool once both scripted
+	// failures are used and the token was invalidated twice; give it a
+	// moment to reach the renewal.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ts.mu.Lock()
+		n := ts.invalidated
+		ts.mu.Unlock()
+		if n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the second operation did not fail on the old pool (invalidated %d times)", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	got := 0
+	select {
+	case err := <-errs:
+		got++
+		t.Errorf("an operation returned while the renewal was still running: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(gate)
+	for ; got < 2; got++ {
+		if err := <-errs; err != nil {
+			t.Errorf("Exec() = %v, want success with the renewed pool", err)
+		}
+	}
+	if o.count() != 2 {
+		t.Errorf("opened %d pools, want 2 (one renewal for both operations)", o.count())
+	}
+}
+
+// TestCacheRenewAfterFailedRenewal: when the renewal another operation is
+// running fails, the waiting operation gets its own 516 as
+// AuthenticationFailed and does not dial.
+func TestCacheRenewAfterFailedRenewal(t *testing.T) {
+	ts := &countingTS{}
+	cfg := Config{Host: "h", Port: 9440, Protocol: ProtocolNative, TokenSource: ts}
+	o := &opener{}
+	gate := make(chan struct{})
+	building := make(chan struct{})
+	open := func(cfg Config) (Conn, error) {
+		if o.count() == 1 {
+			close(building)
+			<-gate
+			return nil, &ServerError{Code: CodeAuthenticationFailed, Message: "still refused"}
+		}
+		return o.open(cfg)
+	}
+	c := NewCache(open)
+	ctx := context.Background()
+	k := Key{Identity: "ClusterProviderConfig//jwt", Version: "v"}
+	h1, _ := c.Acquire(ctx, k, cfg)
+	h2, _ := c.Acquire(ctx, k, cfg)
+	defer h1.Close() //nolint:errcheck // Test cleanup.
+	defer h2.Close() //nolint:errcheck // Test cleanup.
+
+	o.mu.Lock()
+	o.failLeft, o.failCode = 2, CodeAuthenticationFailed
+	o.mu.Unlock()
+	errs := make(chan error, 2)
+	go func() { errs <- h1.Exec(ctx, "SELECT 1") }()
+	<-building
+	go func() { errs <- h2.Exec(ctx, "SELECT 1") }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ts.mu.Lock()
+		n := ts.invalidated
+		ts.mu.Unlock()
+		if n == 2 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+	for range 2 {
+		if err := <-errs; !reason.Is(err, reason.AuthenticationFailed) || !IsAuthenticationFailed(err) {
+			t.Errorf("Exec() = %v, want AuthenticationFailed", err)
+		}
+	}
+	if o.count() != 1 {
+		t.Errorf("opened %d pools, want only the first one (the failed renewal opened none)", o.count())
+	}
+}
+
 func TestCacheNoRetryWithPassword(t *testing.T) {
 	o := &opener{}
 	c := NewCache(o.open)

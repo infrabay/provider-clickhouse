@@ -97,6 +97,23 @@ type entry struct {
 	stale    bool
 	closed   bool
 	lastUsed time.Time
+	// renewed is set when renew retires the entry to rebuild it, and closed
+	// when that rebuild has finished, successfully or not.
+	renewed chan struct{}
+}
+
+// renewing reports whether a renewal that retired e is still running. c.mu
+// must be held.
+func (e *entry) renewing() bool {
+	if e.renewed == nil {
+		return false
+	}
+	select {
+	case <-e.renewed:
+		return false
+	default:
+		return true
+	}
 }
 
 // errStale is returned by renew when the pool it was asked to replace is no
@@ -215,27 +232,51 @@ func (c *Cache) release(e *entry) {
 //     dials at most once more.
 //   - If a pool of the same version already replaced it (a concurrent
 //     renew), that pool is used.
+//   - If another operation is still rebuilding old (several operations on
+//     the pool failed at once, as when a token expires), renew waits for it
+//     and then uses its pool, or returns errStale if that rebuild failed.
 //   - Otherwise the configuration changed meanwhile, or the pool was
 //     retired, and errStale is returned. A stale configuration (an old
 //     password or token source, or an old endpoint) never replaces a newer
 //     pool; the next reconcile uses the new configuration.
 func (c *Cache) renew(ctx context.Context, old *entry) (*Handle, error) {
 	c.mu.Lock()
-	cur, ok := c.entries[old.key.Identity]
-	switch {
-	case ok && cur == old:
-		c.retireLocked(old)
-	case ok && cur.key.Version == old.key.Version && !cur.stale:
-		cur.refs++
-		cur.lastUsed = c.now()
-		c.mu.Unlock()
-		return &Handle{cache: c, e: cur}, nil
-	default:
-		c.mu.Unlock()
-		return nil, errStale
+	for {
+		cur, ok := c.entries[old.key.Identity]
+		switch {
+		case ok && cur == old:
+			c.retireLocked(old)
+			done := make(chan struct{})
+			old.renewed = done
+			c.mu.Unlock()
+			h, err := c.rebuild(ctx, old)
+			close(done)
+			return h, err
+		case ok && cur.key.Version == old.key.Version && !cur.stale:
+			cur.refs++
+			cur.lastUsed = c.now()
+			c.mu.Unlock()
+			return &Handle{cache: c, e: cur}, nil
+		case !ok && old.renewing():
+			done := old.renewed
+			c.mu.Unlock()
+			select {
+			case <-done:
+			case <-ctx.Done():
+				// The caller reports its own 516, as without the wait.
+				return nil, errStale
+			}
+			c.mu.Lock()
+		default:
+			c.mu.Unlock()
+			return nil, errStale
+		}
 	}
-	c.mu.Unlock()
+}
 
+// rebuild builds a pool from the configuration of the retired pool old and
+// installs it, unless another pool was installed meanwhile.
+func (c *Cache) rebuild(ctx context.Context, old *entry) (*Handle, error) {
 	e, err := c.build(ctx, old.key, old.cfg, false)
 	if err != nil {
 		return nil, err

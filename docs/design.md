@@ -1953,6 +1953,7 @@ If a statement fails with 516 and the auth is token-based:
 2. Replace the pool, depending on the identity's current cache entry:
    - it is still the failed pool: retire it and build a fresh one from the same configuration. The new pool's probe is **not** retried on 516 again, so one operation invalidates the token once and dials at most once more;
    - another reconcile already replaced it with a pool of the same key version: use that pool;
+   - another reconcile is still replacing it (several statements on the pool got 516 at once, as when ClickHouse starts to refuse a token that every new connection presents): wait for that rebuild and use its pool; if the rebuild fails, return the original 516 as `AuthenticationFailed`;
    - the key version changed meanwhile (new generation or Secret), or the pool was retired: do not rebuild. A pool built from the old configuration (old password, token source or endpoint) would retire the newer pool and make pools flap. The original 516 is returned as `AuthenticationFailed`, and the next reconcile resolves the new configuration.
 3. Retry the statement **once**.
 
