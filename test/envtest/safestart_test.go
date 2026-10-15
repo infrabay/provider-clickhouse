@@ -57,7 +57,10 @@ func TestConfigControllersWaitForTheirCRDs(t *testing.T) {
 		}
 	}
 	skip := true
-	const syncTimeout = 3 * time.Second
+	// The same timeout applies once the CRDs are installed, when the
+	// controllers' watches wait for the API server to serve the new kinds; a
+	// few seconds of discovery lag on a loaded CI runner exceeded 3s.
+	const syncTimeout = 15 * time.Second
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Scheme:                 s,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
@@ -104,7 +107,7 @@ func TestConfigControllersWaitForTheirCRDs(t *testing.T) {
 	}
 
 	// Longer than the cache sync timeout without the CRDs.
-	time.Sleep(2*syncTimeout + time.Second)
+	time.Sleep(syncTimeout + 5*time.Second)
 	running("while the config CRDs were missing")
 
 	crds := filepath.Join("..", "..", "package", "crds")
