@@ -9,6 +9,8 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"slices"
 	"strconv"
 	"testing"
@@ -23,6 +25,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/resource"
 
 	"github.com/infrabay/provider-clickhouse/apis/v1alpha1"
@@ -44,7 +47,22 @@ const (
 	legacyRole    = "app_legacy_role"
 	jwtProcessor  = "kubernetes"
 	tokenAudience = "clickhouse"
+	// restartRole is the role of the restart scenario's RoleGrant;
+	// restartRolePrefix starts the names of the roles it creates at once.
+	restartRole       = "app_restart_role"
+	restartRolePrefix = "app_restart_role_"
 )
+
+// restartRoles is the number of extra Role MRs per server that the restart
+// scenario creates at once, so that creates are still running when the
+// provider pod gets SIGTERM.
+const restartRoles = 40
+
+// creationGracePeriod is crossplane-runtime's default creation grace period:
+// within it after a create, an external resource that Observe reports
+// missing is taken as not visible yet, and the reconciler waits with backoff
+// instead of creating it again.
+const creationGracePeriod = 30 * time.Second
 
 // TestEndToEnd runs every scenario against both servers:
 //
@@ -57,7 +75,8 @@ const (
 //     names refused and left byte-identical, the ClusterProviderConfig
 //     policy, and observe-only resources that never write.
 //  3. ProviderRestart: the provider pod is deleted while new resources are
-//     being created; ownership survives and nothing is created twice.
+//     being created (the test checks that creates were still running);
+//     ownership survives and nothing is created twice.
 //  4. Deletion, per server: deleting the resources revokes and drops only
 //     what the provider created.
 func TestEndToEnd(t *testing.T) {
@@ -108,6 +127,8 @@ type tenant struct {
 	foreignMRs []resource.Managed
 	policyMRs  []resource.Managed
 	restart    []resource.Managed
+	// restartRoles are the extra Role MRs of the restart scenario.
+	restartRoles []resource.Managed
 
 	foreignObjs     [][2]string
 	foreign         []string
@@ -134,6 +155,16 @@ func newTenant(t *testing.T, name string) *tenant {
 // the token of a service account of the tenant namespace.
 func (tn *tenant) serviceAccountUser(sa string) string {
 	return "system:serviceaccount:" + tn.ns + ":" + sa
+}
+
+// identities returns the ClickHouse users of the provider's identity (the
+// ClusterProviderConfig) and of the tenant's identity (the namespaced
+// ProviderConfig), as hack/e2e/run.sh configures them.
+func (tn *tenant) identities() (provider, tenant string) {
+	if tn.jwt {
+		return "system:serviceaccount:" + nsCrossplane + ":" + providerName, tn.serviceAccountUser("tenant-admin")
+	}
+	return providerName, "tenant-admin"
 }
 
 func (tn *tenant) meta(name string) metav1.ObjectMeta {
@@ -197,12 +228,17 @@ func (tn *tenant) scenarios(t *testing.T) {
 func (tn *tenant) configs(t *testing.T) {
 	port := int32(9000)
 	conn := v1alpha1.ConnectionSpec{Endpoint: v1alpha1.Endpoint{Host: tn.srv.host, Port: &port}, AllowInsecureTransport: true}
+	// grantableRoles is narrower than roleNamePatterns, so that the policy
+	// scenario can refuse a RoleGrant of a role that the tenant may create
+	// but not grant. Both servers allow the "kubernetes" processor, so that
+	// a jwt user on upstream is refused by allowedAuthentication alone.
 	policy := v1alpha1.ClusterPolicy{
 		AllowedNamespaces:    []string{tn.ns},
 		DatabaseNamePatterns: []string{"app_[a-z0-9_]+"},
 		UserNamePatterns:     []string{"app_[a-z0-9_]+"},
 		RoleNamePatterns:     []string{"app_[a-z0-9_]+"},
-		GrantableRoles:       []string{"app_[a-z0-9_]+"},
+		GrantableRoles:       []string{roleReader, restartRole},
+		AllowedJWTProcessors: []string{jwtProcessor},
 	}
 	cpc := &v1alpha1.ClusterProviderConfig{ObjectMeta: metav1.ObjectMeta{Name: tn.cpc.Name}}
 	cpc.Spec.ConnectionSpec = conn
@@ -214,7 +250,6 @@ func (tn *tenant) configs(t *testing.T) {
 		// of its own service account stored in a Secret.
 		policy.UserNamePatterns = append(policy.UserNamePatterns, "system:serviceaccount:{namespace}:[a-z0-9-]+")
 		policy.AllowedAuthentication = []v1alpha1.AuthenticationMethod{v1alpha1.AuthenticationMethodJWT}
-		policy.AllowedJWTProcessors = []string{jwtProcessor}
 		cpc.Spec.Credentials = v1alpha1.ClusterCredentials{
 			Source:    v1alpha1.CredentialsSourceTokenFile,
 			TokenFile: &v1alpha1.TokenFileCredentials{Path: "/var/run/secrets/clickhouse/token", Audience: tokenAudience},
@@ -255,7 +290,7 @@ func (tn *tenant) createForeign(t *testing.T) {
 	s := tn.srv
 	tn.foreignPassword = randomHex(16)
 	s.exec(t, "CREATE DATABASE "+foreignDB+" COMMENT 'theirs'")
-	s.exec(t, "CREATE USER "+foreignUser+" IDENTIFIED WITH sha256_password BY "+ch.QuoteString(tn.foreignPassword)+" SETTINGS max_threads = 3")
+	s.execSecret(t, "CREATE USER "+foreignUser+" IDENTIFIED WITH sha256_password BY "+ch.QuoteString(tn.foreignPassword)+" SETTINGS max_threads = 3", tn.foreignPassword)
 	s.exec(t, "CREATE ROLE "+foreignRole)
 	s.exec(t, "GRANT SELECT ON "+foreignDB+".* TO "+foreignRole)
 	s.exec(t, "GRANT "+foreignRole+" TO "+foreignUser)
@@ -347,6 +382,23 @@ func (tn *tenant) lifecycle(t *testing.T) {
 	if err := kube.List(context.Background(), usages, client.InNamespace(tn.ns)); err != nil || len(usages.Items) < len(all) {
 		t.Errorf("ProviderConfigUsages in %s: %d (%v), want at least %d", tn.ns, len(usages.Items), err, len(all))
 	}
+	// Each MR ran every statement (system.query_log, by log_comment) as the
+	// identity of its own config: the provider's for the
+	// ClusterProviderConfig, the tenant's for the namespaced ProviderConfig.
+	// Both identities hold the same grants, so only this tells a tenant's MRs
+	// running with the provider's credentials apart.
+	providerID, tenantID := tn.identities()
+	for _, c := range []struct {
+		lc, want string
+	}{
+		{"Database/" + tn.ns + "/shop", providerID}, {"Role/" + tn.ns + "/reader", providerID}, {"User/" + tn.ns + "/app", providerID},
+		{"Grant/" + tn.ns + "/reader-shop", providerID}, {"RoleGrant/" + tn.ns + "/app-reader", providerID},
+		{"Database/" + tn.ns + "/scratch", tenantID}, {"Role/" + tn.ns + "/tenant-role", tenantID},
+	} {
+		if got := s.usersOf(t, c.lc); !slices.Equal(got, []string{c.want}) {
+			t.Errorf("%s ran as %q, want only %q", c.lc, got, c.want)
+		}
+	}
 
 	// A spec change reaches the server (comment changes need 25.8 or
 	// later).
@@ -380,10 +432,7 @@ func (tn *tenant) login(t *testing.T) {
 	s.exec(t, "CREATE DATABASE e2e_other")
 	s.exec(t, "CREATE TABLE e2e_other.secrets (x UInt8) ENGINE = Memory")
 
-	sec := &corev1.Secret{}
-	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: tn.ns, Name: "app-clickhouse"}, sec); err != nil {
-		t.Fatalf("connection Secret: %v", err)
-	}
+	sec := tn.appSecret(t)
 	want := map[string]string{
 		v1alpha1.ConnectionKeyUsername: tn.userName,
 		v1alpha1.ConnectionKeyEndpoint: s.host,
@@ -391,27 +440,20 @@ func (tn *tenant) login(t *testing.T) {
 		v1alpha1.ConnectionKeyProtocol: string(v1alpha1.ProtocolNative),
 		v1alpha1.ConnectionKeyTLS:      "false",
 	}
-	opts := &chgo.Options{}
 	if tn.jwt {
 		want[v1alpha1.ConnectionKeyJWTProcessor] = jwtProcessor
 		if _, ok := sec.Data[v1alpha1.ConnectionKeyPassword]; ok {
 			t.Error("the connection Secret of a JWT user has a password key")
 		}
-		token := serviceAccountToken(t, tn.ns, "reporter", tokenAudience)
-		opts.GetJWT = func(context.Context) (string, error) { return token, nil }
-	} else {
-		password := string(sec.Data[v1alpha1.ConnectionKeyPassword])
-		if len(password) != 32 {
-			t.Fatalf("the connection Secret holds a password of %d characters, want 32", len(password))
-		}
-		opts.Auth = chgo.Auth{Username: string(sec.Data[v1alpha1.ConnectionKeyUsername]), Password: password}
+	} else if n := len(sec.Data[v1alpha1.ConnectionKeyPassword]); n != 32 {
+		t.Fatalf("the connection Secret holds a password of %d characters, want 32", n)
 	}
 	for k, v := range want {
 		if got := string(sec.Data[k]); got != v {
 			t.Errorf("connection Secret key %s = %q, want %q", k, got, v)
 		}
 	}
-	conn, err := s.open(t, opts)
+	conn, err := s.open(t, tn.appLogin(t, sec))
 	if err != nil {
 		t.Fatalf("login with the connection Secret: %v", err)
 	}
@@ -457,6 +499,29 @@ func (tn *tenant) login(t *testing.T) {
 	tn.sameForeign(t, "the user's session")
 }
 
+// appSecret reads the connection Secret of the User MR "app".
+func (tn *tenant) appSecret(t *testing.T) *corev1.Secret {
+	t.Helper()
+	sec := &corev1.Secret{}
+	if err := kube.Get(context.Background(), client.ObjectKey{Namespace: tn.ns, Name: "app-clickhouse"}, sec); err != nil {
+		t.Fatalf("connection Secret: %v", err)
+	}
+	return sec
+}
+
+// appLogin returns the options to log in as the User MR "app" with what its
+// connection Secret holds: the username and the generated password on
+// upstream; on Antalya, where the Secret holds no secret, a token of the
+// user's service account.
+func (tn *tenant) appLogin(t *testing.T, sec *corev1.Secret) *chgo.Options {
+	t.Helper()
+	if tn.jwt {
+		token := serviceAccountToken(t, tn.ns, "reporter", tokenAudience)
+		return &chgo.Options{GetJWT: func(context.Context) (string, error) { return token, nil }}
+	}
+	return &chgo.Options{Auth: chgo.Auth{Username: string(sec.Data[v1alpha1.ConnectionKeyUsername]), Password: string(sec.Data[v1alpha1.ConnectionKeyPassword])}}
+}
+
 // drift changes the provider's objects as the administrator and checks that
 // each change is repaired within the poll interval, plus a margin for the
 // reconcile itself, for one that was running when the change was made, and
@@ -479,12 +544,6 @@ func (tn *tenant) drift(t *testing.T) {
 		return slices.Equal(got, granted), fmtList(got)
 	})
 
-	s.exec(t, "REVOKE "+roleReader+" FROM "+user)
-	tn.repaired(t, limit, "REVOKE of the role from the user", func() (bool, string) {
-		ok, _ := s.member(t, tn.userName, roleReader)
-		return ok, "member " + boolString(ok)
-	})
-
 	definition := s.showCreate(t, kindUser, tn.userName)
 	for _, alter := range []string{"HOST NONE", "VALID UNTIL '2035-01-01 00:00:00'", "DEFAULT DATABASE e2e_other"} {
 		s.exec(t, "ALTER USER "+user+" "+alter)
@@ -502,8 +561,40 @@ func (tn *tenant) drift(t *testing.T) {
 			return got == want, "comment " + got
 		})
 	}
+
+	// A revoked membership makes the RoleGrant's external resource missing.
+	// Within crossplane-runtime's creation grace period after the RoleGrant
+	// was created, the reconciler takes that as not visible yet and backs
+	// off instead of granting again, so the repair would take longer than
+	// the poll interval. The REVOKE is therefore made once that period is
+	// over (usually it is by now).
+	get(t, tn.roleGrant)
+	if created := meta.GetExternalCreateSucceeded(tn.roleGrant); created.IsZero() {
+		t.Errorf("RoleGrant %s has no %s annotation", tn.roleGrant.GetName(), meta.AnnotationKeyExternalCreateSucceeded)
+	} else if wait := time.Until(created.Add(creationGracePeriod + 2*time.Second)); wait > 0 {
+		t.Logf("%s: waiting %s for the creation grace period of the RoleGrant to end", tn.name, wait.Round(100*time.Millisecond))
+		time.Sleep(wait)
+	}
+	s.exec(t, "REVOKE "+roleReader+" FROM "+user)
+	tn.repaired(t, limit, "REVOKE of the role from the user", func() (bool, string) {
+		ok, _ := s.member(t, tn.userName, roleReader)
+		return ok, "member " + boolString(ok)
+	})
+
 	for _, mg := range []resource.Managed{tn.db, tn.role, tn.user, tn.grant, tn.roleGrant} {
 		waitMR(t, mg, time.Minute, "Ready and Synced after the drift", readyAndSynced)
+	}
+
+	// Repairing the user re-applies its definition, IDENTIFIED clause
+	// included (VALID UNTIL belongs to it): the user still logs in with what
+	// the connection Secret holds. SHOW CREATE USER never shows the
+	// password, so only a login can tell.
+	conn, err := s.open(t, tn.appLogin(t, tn.appSecret(t)))
+	if err != nil {
+		t.Fatalf("login with the connection Secret after the drift repairs: %v", err)
+	}
+	if who, _ := whoami(t, conn); who != tn.userName {
+		t.Errorf("logged in as %q after the drift repairs, want %q", who, tn.userName)
 	}
 	tn.sameForeign(t, "repairing the drift")
 }
@@ -559,34 +650,53 @@ func (tn *tenant) foreignRefused(t *testing.T) {
 	tn.sameForeign(t, "MRs pointing at the foreign objects")
 }
 
-// policy checks the ClusterProviderConfig policy: a name outside the
-// allowed patterns, a namespace outside allowedNamespaces and an
-// authentication method the policy does not allow are refused with
+// policy checks the ClusterProviderConfig policy: a database, a role and a
+// user name outside the allowed patterns (on Antalya the user of another
+// namespace's service account), a namespace outside allowedNamespaces, an
+// authentication method the policy does not allow, and a RoleGrant of a role
+// outside grantableRoles (one the tenant owns and may name) are refused with
 // PolicyViolation, and nothing reaches the server.
 func (tn *tenant) policy(t *testing.T) {
+	s := tn.srv
 	outside := tn.database("outside", "other_db", tn.cpc)
+	outsideRole := tn.roleMR("outside-role", "other_role", tn.cpc)
+	outsideUserName := "other_user"
+	if tn.jwt {
+		outsideUserName = "system:serviceaccount:xpch-e2e-upstream:intruder"
+	}
+	outsideUser := tn.userMR("outside-user", outsideUserName)
 	intruder := tn.roleMR("intruder-"+tn.name, "app_outsider_role", tn.cpc)
 	intruder.Namespace = nsOutsider
 	wrongAuth := tn.userMR("wrong-auth", "app_wrong_auth")
 	if tn.jwt {
 		wrongAuth.Spec.ForProvider.Authentication = v1alpha1.UserAuthentication{Password: &v1alpha1.PasswordAuthentication{Generate: &v1alpha1.GeneratePassword{}}}
 	} else {
+		// The "kubernetes" processor is allowed on upstream too: only
+		// allowedAuthentication refuses this user.
 		wrongAuth.Spec.ForProvider.Authentication = v1alpha1.UserAuthentication{JWT: &v1alpha1.JWTAuthentication{Processor: jwtProcessor}}
 	}
-	tn.policyMRs = []resource.Managed{outside, intruder, wrongAuth}
+	ungrantable := &v1alpha1.RoleGrant{ObjectMeta: tn.meta("ungrantable")}
+	ungrantable.Spec.ProviderConfigReference = tn.cpc
+	ungrantable.Spec.ForProvider = v1alpha1.RoleGrantParameters{MemberOf: new("app_tenant_role"), UserRef: &xpv2.NamespacedReference{Name: "app"}}
+	tn.policyMRs = []resource.Managed{outside, outsideRole, outsideUser, intruder, wrongAuth, ungrantable}
 	for _, mg := range tn.policyMRs {
 		create(t, mg)
 	}
 	for _, mg := range tn.policyMRs {
 		waitMR(t, mg, 2*time.Minute, "refused with PolicyViolation", refusedWith(reason.PolicyViolation))
 	}
-	s := tn.srv
-	for _, c := range [][2]string{{kindDatabase, "other_db"}, {kindRole, "app_outsider_role"}, {kindUser, "app_wrong_auth"}} {
+	for _, c := range [][2]string{{kindDatabase, "other_db"}, {kindRole, "other_role"}, {kindUser, outsideUserName}, {kindRole, "app_outsider_role"}, {kindUser, "app_wrong_auth"}} {
 		if id := s.uuid(t, c[0], c[1]); id != "" {
 			t.Errorf("%s %s exists although the policy refuses it", c[0], c[1])
 		}
 	}
-	for _, lc := range []string{"Database/" + tn.ns + "/outside", "Role/" + nsOutsider + "/intruder-" + tn.name, "User/" + tn.ns + "/wrong-auth"} {
+	if ok, _ := s.member(t, tn.userName, "app_tenant_role"); ok {
+		t.Errorf("%s holds app_tenant_role although the policy does not let RoleGrant grant it", tn.userName)
+	}
+	for _, lc := range []string{
+		"Database/" + tn.ns + "/outside", "Role/" + tn.ns + "/outside-role", "User/" + tn.ns + "/outside-user",
+		"Role/" + nsOutsider + "/intruder-" + tn.name, "User/" + tn.ns + "/wrong-auth", "RoleGrant/" + tn.ns + "/ungrantable",
+	} {
 		if n := s.statements(t, lc, false); n != 0 {
 			t.Errorf("%s ran %d statements that change something", lc, n)
 		}
@@ -638,8 +748,9 @@ func (tn *tenant) observeOnly(t *testing.T) {
 	}
 }
 
-// batch2 returns new MRs of every kind for the restart scenario.
-func (tn *tenant) batch2(t *testing.T) []resource.Managed {
+// batch2 returns new MRs of every kind for the restart scenario, and
+// restartRoles extra Role MRs.
+func (tn *tenant) batch2(t *testing.T) (batch, roles []resource.Managed) {
 	name := "app_restart_user"
 	if tn.jwt {
 		ensureServiceAccount(t, tn.ns, "restarter")
@@ -658,7 +769,10 @@ func (tn *tenant) batch2(t *testing.T) []resource.Managed {
 		MemberOfRef: &xpv2.NamespacedReference{Name: "restart"},
 		UserRef:     &xpv2.NamespacedReference{Name: "restart"},
 	}
-	return []resource.Managed{tn.database("restart", "app_restart", tn.cpc), tn.roleMR("restart", "app_restart_role", tn.cpc), tn.userMR("restart", name), grant, rg}
+	for i := range restartRoles {
+		roles = append(roles, tn.roleMR(fmt.Sprintf("restart-%02d", i), fmt.Sprintf("%s%02d", restartRolePrefix, i), tn.cpc))
+	}
+	return []resource.Managed{tn.database("restart", "app_restart", tn.cpc), tn.roleMR("restart", restartRole, tn.cpc), tn.userMR("restart", name), grant, rg}, roles
 }
 
 // owned are the MRs of a tenant that own a ClickHouse object, with its kind
@@ -674,15 +788,21 @@ func (tn *tenant) ownedMRs() []ownedMR {
 	if len(tn.restart) == 5 {
 		out = append(out,
 			ownedMR{mg: tn.restart[0], kind: kindDatabase, name: "app_restart"},
-			ownedMR{mg: tn.restart[1], kind: kindRole, name: "app_restart_role"},
+			ownedMR{mg: tn.restart[1], kind: kindRole, name: restartRole},
 			ownedMR{mg: tn.restart[2], kind: kindUser, name: *tn.restart[2].(*v1alpha1.User).Spec.ForProvider.Name})
+	}
+	for _, mg := range tn.restartRoles {
+		out = append(out, ownedMR{mg: mg, kind: kindRole, name: *mg.(*v1alpha1.Role).Spec.ForProvider.Name})
 	}
 	return out
 }
 
-// testRestart deletes the provider pod right after new MRs were created and
-// checks that, once the new pod runs, every MR is Ready, no claim and no
-// object changed, and every object was created exactly once.
+// testRestart deletes the provider pod while new MRs are being created and
+// checks that creates were running when it got SIGTERM: the old pod ran
+// creates after its deletion and left some to the new pod. A graceful
+// shutdown must let the running creates record their claims (design 5.9).
+// Once the new pod runs, every MR is Ready, no claim and no object changed,
+// and every object was created exactly once.
 func testRestart(t *testing.T, tenants []*tenant) {
 	var active []*tenant
 	for _, tn := range tenants {
@@ -710,18 +830,36 @@ func testRestart(t *testing.T, tenants []*tenant) {
 		t.Fatal(err)
 	}
 
+	// The extra roles of both servers first, then the other MRs. The pod is
+	// deleted as soon as the first extra role exists on a server, while the
+	// provider is creating the others.
 	for _, tn := range active {
-		tn.restart = tn.batch2(t)
+		tn.restart, tn.restartRoles = tn.batch2(t)
+	}
+	deleted := make(chan podDeletion, 1)
+	go func() { deleted <- deleteProviderOnFirstCreate(active) }()
+	for i := range restartRoles {
+		for _, tn := range active {
+			create(t, tn.restartRoles[i])
+		}
+	}
+	for _, tn := range active {
 		for _, mg := range tn.restart {
 			create(t, mg)
 		}
 	}
-	restartProvider(t)
+	del := <-deleted
+	if del.err != nil {
+		t.Fatal(del.err)
+	}
+	t.Logf("deleted provider pod(s) %v once the first role of the scenario existed", del.pods)
+	waitNewProviderPod(t, del.uids)
 
+	var oldAfter, fresh uint64
 	for _, tn := range active {
 		t.Run(tn.name, func(t *testing.T) {
 			s := tn.srv
-			waitReady(t, tn.restart...)
+			waitReady(t, append(slices.Clone(tn.restart), tn.restartRoles...)...)
 			for _, o := range before[tn] {
 				waitMR(t, o.mg, time.Minute, "Ready and Synced after the restart", readyAndSynced)
 				if id := o.mg.GetAnnotations()[v1alpha1.AnnotationOwnedID]; id != o.id {
@@ -732,6 +870,7 @@ func testRestart(t *testing.T, tenants []*tenant) {
 				}
 			}
 			for _, o := range tn.ownedMRs() {
+				get(t, o.mg)
 				if id := s.uuid(t, o.kind, o.name); id == "" || id != o.mg.GetAnnotations()[v1alpha1.AnnotationOwnedID] {
 					t.Errorf("%s %s: server UUID %q, owned-id %q", o.kind, o.name, id, o.mg.GetAnnotations()[v1alpha1.AnnotationOwnedID])
 				}
@@ -740,15 +879,34 @@ func testRestart(t *testing.T, tenants []*tenant) {
 					t.Errorf("%s %s was created %d times, want once", o.kind, o.name, n)
 				}
 			}
-			if got := s.grantsOf(t, kindRole, "app_restart_role"); !slices.Equal(got, []string{"SELECT app_restart.*"}) {
-				t.Errorf("grants of app_restart_role: %v", got)
+			if got := s.grantsOf(t, kindRole, restartRole); !slices.Equal(got, []string{"SELECT app_restart.*"}) {
+				t.Errorf("grants of %s: %v", restartRole, got)
 			}
 			user := *tn.restart[2].(*v1alpha1.User).Spec.ForProvider.Name
-			if ok, _ := s.member(t, user, "app_restart_role"); !ok {
-				t.Errorf("%s is not a member of app_restart_role", user)
+			if ok, _ := s.member(t, user, restartRole); !ok {
+				t.Errorf("%s is not a member of %s", user, restartRole)
 			}
 			tn.sameForeign(t, "the provider restart")
+
+			// Who created the extra roles, by the client host name (the pod
+			// name) that system.query_log records.
+			s.exec(t, "SYSTEM FLUSH LOGS")
+			q := "SELECT count() FROM system.query_log WHERE type = 'QueryFinish' AND startsWith(log_comment, ?) AND match(query, '^\\\\s*(?i:CREATE ROLE)\\\\s') AND "
+			lc := "Role/" + tn.ns + "/restart-"
+			oldBefore := s.count(t, q+"has(?, client_hostname) AND event_time_microseconds < toDateTime64(?, 6)", lc, del.pods, del.at[tn])
+			after := s.count(t, q+"has(?, client_hostname) AND event_time_microseconds >= toDateTime64(?, 6)", lc, del.pods, del.at[tn])
+			byNew := s.count(t, q+"NOT has(?, client_hostname)", lc, del.pods)
+			t.Logf("%s: the old pod created %d of the %d roles before its deletion and %d after it, the new pod %d", tn.name, oldBefore, restartRoles, after, byNew)
+			oldAfter += after
+			fresh += byNew
 		})
+	}
+	// The scenario is only meaningful if the shutdown interrupted the
+	// creates: the old pod was still creating after its deletion, and the
+	// new pod had roles left to create.
+	if oldAfter == 0 || fresh == 0 {
+		t.Errorf("the provider pod did not get SIGTERM while creates were running (old pod after its deletion: %d, new pod: %d); "+
+			"the scenario did not exercise the graceful shutdown", oldAfter, fresh)
 	}
 
 	after := &metav1.PartialObjectMetadataList{}
@@ -761,23 +919,64 @@ func testRestart(t *testing.T, tenants []*tenant) {
 	}
 }
 
-// restartProvider deletes the provider's pods and waits until a new pod is
-// ready.
-func restartProvider(t *testing.T) {
-	t.Helper()
-	selector := "pkg.crossplane.io/provider=" + providerName
-	pods, err := clientset.CoreV1().Pods(nsCrossplane).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
-	if err != nil || len(pods.Items) == 0 {
-		t.Fatalf("provider pods: %d, %v", len(pods.Items), err)
-	}
-	old := map[string]bool{}
-	for _, p := range pods.Items {
-		old[string(p.UID)] = true
-		if err := clientset.CoreV1().Pods(nsCrossplane).Delete(context.Background(), p.Name, metav1.DeleteOptions{}); err != nil {
-			t.Fatal(err)
+// podDeletion records the deletion of the provider's pods: their names and
+// UIDs, and each server's clock just before the deletion.
+type podDeletion struct {
+	pods []string
+	uids map[string]bool
+	at   map[*tenant]string
+	err  error
+}
+
+// deleteProviderOnFirstCreate waits until a role of the restart scenario
+// exists on one of the servers, then reads each server's clock and deletes
+// the provider's pods. It runs in its own goroutine, so it returns errors
+// instead of failing the test.
+func deleteProviderOnFirstCreate(active []*tenant) podDeletion {
+	ctx := context.Background()
+	deadline := time.Now().Add(2 * time.Minute)
+	for created := false; !created; {
+		for _, tn := range active {
+			var n uint64
+			if err := tn.srv.admin.QueryRow(ctx, "SELECT count() FROM system.roles WHERE startsWith(name, ?)", restartRolePrefix).Scan(&n); err != nil {
+				return podDeletion{err: fmt.Errorf("%s: %w", tn.name, err)}
+			}
+			created = created || n > 0
+		}
+		if !created {
+			if time.Now().After(deadline) {
+				return podDeletion{err: errors.New("no role of the restart scenario was created within 2 minutes")}
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
-	t.Logf("deleted provider pod(s) %v", podNames(pods.Items))
+	d := podDeletion{uids: map[string]bool{}, at: map[*tenant]string{}}
+	for _, tn := range active {
+		var now string
+		if err := tn.srv.admin.QueryRow(ctx, "SELECT toString(now64(6))").Scan(&now); err != nil {
+			return podDeletion{err: fmt.Errorf("%s: %w", tn.name, err)}
+		}
+		d.at[tn] = now
+	}
+	pods, err := clientset.CoreV1().Pods(nsCrossplane).List(ctx, metav1.ListOptions{LabelSelector: "pkg.crossplane.io/provider=" + providerName})
+	if err != nil || len(pods.Items) == 0 {
+		return podDeletion{err: fmt.Errorf("provider pods: %d, %v", len(pods.Items), err)}
+	}
+	for _, p := range pods.Items {
+		if err := clientset.CoreV1().Pods(nsCrossplane).Delete(ctx, p.Name, metav1.DeleteOptions{}); err != nil {
+			return podDeletion{err: err}
+		}
+		d.pods = append(d.pods, p.Name)
+		d.uids[string(p.UID)] = true
+	}
+	return d
+}
+
+// waitNewProviderPod waits until the deleted pods are gone and a new pod is
+// ready.
+func waitNewProviderPod(t *testing.T, old map[string]bool) {
+	t.Helper()
+	selector := "pkg.crossplane.io/provider=" + providerName
 	eventually(t, 3*time.Minute, "a new provider pod", func() (bool, string) {
 		pods, err := clientset.CoreV1().Pods(nsCrossplane).List(context.Background(), metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
@@ -794,14 +993,6 @@ func restartProvider(t *testing.T) {
 		}
 		return ready == 1 && stale == 0, strconv.Itoa(ready) + " new ready, " + strconv.Itoa(stale) + " old"
 	})
-}
-
-func podNames(pods []corev1.Pod) []string {
-	var out []string
-	for _, p := range pods {
-		out = append(out, p.Name)
-	}
-	return out
 }
 
 // deletion deletes every MR and checks that exactly what the provider
@@ -841,10 +1032,11 @@ func (tn *tenant) deletion(t *testing.T) {
 
 	owned := append([]resource.Managed{tn.user, tn.role}, tn.pcMRs...)
 	owned = append(owned, tn.restart...)
+	owned = append(owned, tn.restartRoles...)
 	deleteAndWait(t, 3*time.Minute, objects(owned...)...)
 	for _, c := range [][2]string{
 		{kindDatabase, dbShop}, {kindRole, roleReader}, {kindUser, tn.userName}, {kindDatabase, "app_scratch"}, {kindRole, "app_tenant_role"},
-		{kindDatabase, "app_restart"}, {kindRole, "app_restart_role"}, {kindUser, "app_restart_user"}, {kindUser, tn.serviceAccountUser("restarter")},
+		{kindDatabase, "app_restart"}, {kindRole, restartRole}, {kindUser, "app_restart_user"}, {kindUser, tn.serviceAccountUser("restarter")},
 	} {
 		if id := s.uuid(t, c[0], c[1]); id != "" {
 			t.Errorf("%s %s still exists", c[0], c[1])

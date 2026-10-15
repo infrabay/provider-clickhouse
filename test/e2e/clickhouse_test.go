@@ -56,12 +56,31 @@ func connectServer(t *testing.T, name string) *server {
 	return s
 }
 
-// exec runs admin SQL.
+// exec runs admin SQL. A failure prints the statement, so statements with a
+// secret go through execSecret.
 func (s *server) exec(t *testing.T, stmt string) {
 	t.Helper()
 	if err := s.admin.Exec(context.Background(), stmt); err != nil {
 		t.Fatalf("%s admin %q: %v", s.name, stmt, err)
 	}
+}
+
+// execSecret runs admin SQL that contains secret (a password the test
+// generated); a failure is reported with the secret replaced by [REDACTED],
+// in the statement and in the error.
+func (s *server) execSecret(t *testing.T, stmt, secret string) {
+	t.Helper()
+	if err := s.admin.Exec(context.Background(), stmt); err != nil {
+		t.Fatalf("%s admin %q: %s", s.name, redact(stmt, secret), redact(err.Error(), secret))
+	}
+}
+
+// redact replaces secret in s with [REDACTED].
+func redact(s, secret string) string {
+	if secret == "" {
+		return s
+	}
+	return strings.ReplaceAll(s, secret, "[REDACTED]")
 }
 
 // strings runs an admin query and returns the first column of every row as
@@ -225,6 +244,14 @@ func (s *server) statements(t *testing.T, logComment string, succeededOnly bool)
 		types = "('QueryFinish')"
 	}
 	return s.count(t, "SELECT count() FROM system.query_log WHERE log_comment = ? AND type IN "+types+" AND query_kind IN "+writeKinds, logComment)
+}
+
+// usersOf returns the ClickHouse users that ran the statements of one MR
+// (by log_comment), sorted.
+func (s *server) usersOf(t *testing.T, logComment string) []string {
+	t.Helper()
+	s.exec(t, "SYSTEM FLUSH LOGS")
+	return s.strings(t, "SELECT DISTINCT user FROM system.query_log WHERE log_comment = ? ORDER BY user", logComment)
 }
 
 // creates counts the CREATE statements for one MR that succeeded. The query

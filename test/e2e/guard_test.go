@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 )
@@ -67,7 +69,10 @@ func contextAllowed(name string) bool {
 }
 
 // serverLocal reports whether an API server URL is on this machine or on a
-// private network.
+// private network (the same rules as e2e::server_local in hack/e2e/lib.sh).
+// A private address alone does not make a cluster local, since a cloud
+// cluster can have a private endpoint: the context name allow-list comes
+// first and cloudNode last.
 func serverLocal(server string) bool {
 	u, err := url.Parse(server)
 	if err != nil {
@@ -80,6 +85,32 @@ func serverLocal(server string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified())
+}
+
+// cloudProviderIDs are the node provider ID schemes of cloud providers.
+var cloudProviderIDs = []string{"gce", "aws", "azure", "digitalocean", "linode", "oci", "ibm", "openstack", "vsphere", "hcloud", "alicloud", "exoscale", "scaleway", "equinixmetal"}
+
+// cloudNodeLabels are label prefixes of the managed node pools of GKE, EKS
+// and AKS.
+var cloudNodeLabels = []string{"cloud.google.com/gke-", "eks.amazonaws.com/", "kubernetes.azure.com/"}
+
+// cloudNode reports whether a node runs at a cloud provider, by its provider
+// ID or its labels (the same rules as e2e::refuse_cloud_nodes): defence in
+// depth behind the context name and API server checks.
+func cloudNode(n corev1.Node) bool {
+	for _, p := range cloudProviderIDs {
+		if strings.HasPrefix(n.Spec.ProviderID, p+"://") {
+			return true
+		}
+	}
+	for k := range n.Labels {
+		for _, p := range cloudNodeLabels {
+			if strings.HasPrefix(k, p) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func TestContextGuard(t *testing.T) {
@@ -100,6 +131,7 @@ func TestContextGuard(t *testing.T) {
 	}{
 		{"https://127.0.0.1:26443", true}, {"https://[::1]:6443", true}, {"https://k8s.orb.local", true},
 		{"https://192.168.49.2:8443", true}, {"https://34.1.2.3", false}, {"https://cluster.example.com", false},
+		{"https://10.prod.example.com:443", false}, {"https://127.example.com", false}, {"https://172.32.0.1", false},
 	} {
 		if got := serverLocal(c.server); got != c.want {
 			t.Errorf("serverLocal(%q) = %t, want %t", c.server, got, c.want)
@@ -107,5 +139,20 @@ func TestContextGuard(t *testing.T) {
 	}
 	if _, err := loadConfig("", ""); err == nil {
 		t.Error("loadConfig without a context name succeeded")
+	}
+	for _, c := range []struct {
+		node corev1.Node
+		want bool
+	}{
+		{corev1.Node{Spec: corev1.NodeSpec{ProviderID: "k3s://orbstack"}}, false},
+		{corev1.Node{Spec: corev1.NodeSpec{ProviderID: "kind://docker/xpch-e2e/xpch-e2e-control-plane"}}, false},
+		{corev1.Node{}, false},
+		{corev1.Node{Spec: corev1.NodeSpec{ProviderID: "gce://example-project/us-central1-a/node-1"}}, true},
+		{corev1.Node{Spec: corev1.NodeSpec{ProviderID: "aws:///us-east-1a/i-0123456789abcdef0"}}, true},
+		{corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"cloud.google.com/gke-nodepool": "default"}}}, true},
+	} {
+		if got := cloudNode(c.node); got != c.want {
+			t.Errorf("cloudNode(%q, %v) = %t, want %t", c.node.Spec.ProviderID, c.node.Labels, got, c.want)
+		}
 	}
 }

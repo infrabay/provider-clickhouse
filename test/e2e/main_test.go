@@ -17,12 +17,14 @@
 package e2e
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -96,6 +98,15 @@ func setup() error {
 	}
 	if clientset, err = kubernetes.NewForConfig(cfg); err != nil {
 		return err
+	}
+	nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("list the nodes: %w", err)
+	}
+	for _, n := range nodes.Items {
+		if cloudNode(n) {
+			return fmt.Errorf("node %s of context %q runs at a cloud provider; refusing", n.Name, os.Getenv(envContext))
+		}
 	}
 	restConfig = cfg
 	return nil

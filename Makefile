@@ -15,10 +15,19 @@ ENVTEST_K8S_VERSION ?= 1.35.x
 # renovate: datasource=helm depName=crossplane registryUrl=https://charts.crossplane.io/stable
 CROSSPLANE_VERSION ?= 2.4.2
 CROSSPLANE_MIN_VERSION ?= 2.0.0
-# kind for make e2e-kind-up; the node image matches the kind release.
+# kind for make e2e-kind-up. The node image is one that the kind release
+# lists in its release notes; Renovate does not track it (the digest belongs
+# to the kind release), so a kind update must also update KIND_NODE_IMAGE
+# from the new release notes.
 # renovate: datasource=github-releases depName=kubernetes-sigs/kind
 KIND_VERSION ?= v0.33.0
 KIND_NODE_IMAGE ?= kindest/node:v1.36.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed
+# kubectl and Helm for make e2e in CI (make e2e-tools puts them into bin/);
+# locally the ones on PATH are used unless bin/ comes first.
+# renovate: datasource=github-releases depName=kubernetes/kubernetes
+KUBECTL_VERSION ?= v1.37.1
+# renovate: datasource=github-releases depName=helm/helm
+HELM_VERSION ?= v4.3.0
 
 GO ?= go
 VERSION ?= $(shell git describe --tags --dirty --always 2>/dev/null || echo v0.0.0-dev)
@@ -81,6 +90,25 @@ e2e-oldest: ## make e2e with the oldest Crossplane release that package/crosspla
 e2e-cleanup: ## Remove everything make e2e installed from E2E_KUBE_CONTEXT.
 	hack/e2e/cleanup.sh
 
+.PHONY: e2e-tools
+e2e-tools: $(BIN)/kubectl $(BIN)/helm ## Fetch the pinned kubectl and Helm into bin/ (sha256-verified), for make e2e in CI.
+
+$(BIN)/kubectl:
+	@mkdir -p $(BIN)
+	curl -fsSL -o $@.download https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$(HOST_OS)/$(HOST_ARCH)/kubectl
+	curl -fsSL -o $@.sha256 https://dl.k8s.io/release/$(KUBECTL_VERSION)/bin/$(HOST_OS)/$(HOST_ARCH)/kubectl.sha256
+	@echo "$$(cut -d' ' -f1 $@.sha256)  $@.download" | shasum -a 256 -c -
+	chmod +x $@.download && mv $@.download $@
+
+$(BIN)/helm:
+	@mkdir -p $(BIN)/helm-download
+	curl -fsSL -o $(BIN)/helm-download/helm.tar.gz https://get.helm.sh/helm-$(HELM_VERSION)-$(HOST_OS)-$(HOST_ARCH).tar.gz
+	curl -fsSL -o $(BIN)/helm-download/helm.tar.gz.sha256sum https://get.helm.sh/helm-$(HELM_VERSION)-$(HOST_OS)-$(HOST_ARCH).tar.gz.sha256sum
+	@echo "$$(cut -d' ' -f1 $(BIN)/helm-download/helm.tar.gz.sha256sum)  $(BIN)/helm-download/helm.tar.gz" | shasum -a 256 -c -
+	tar -xzf $(BIN)/helm-download/helm.tar.gz -C $(BIN)/helm-download $(HOST_OS)-$(HOST_ARCH)/helm
+	mv $(BIN)/helm-download/$(HOST_OS)-$(HOST_ARCH)/helm $@
+	rm -rf $(BIN)/helm-download
+
 .PHONY: e2e-kind-up
 e2e-kind-up: ## Create the kind cluster E2E_KIND_CLUSTER for make e2e (context kind-<name>, kubeconfig E2E_KIND_KUBECONFIG).
 	@case "$(E2E_KIND_CLUSTER)" in xpch-e2e*) ;; *) echo "E2E_KIND_CLUSTER must start with xpch-e2e"; exit 1 ;; esac
@@ -110,10 +138,19 @@ vuln: ## govulncheck.
 reviewable: generate lint test envtest ## Everything a pull request needs; fails if generate changed files.
 	@git diff --exit-code -- apis package docs || (echo "generated files are out of date: run make generate"; exit 1)
 
+# The local cluster of make run (required; never the current context).
+KUBE_CONTEXT ?=
+
 .PHONY: run
-run: ## Install the CRDs into the current kube context and run the provider out of cluster.
-	kubectl apply -f package/crds
-	$(GO) run ./cmd/provider --debug
+run: ## Install the CRDs into the local cluster KUBE_CONTEXT (required, same allow-list as make e2e) and run the provider out of cluster against it.
+	@[ -n "$(KUBE_CONTEXT)" ] || { echo "KUBE_CONTEXT is not set: make run KUBE_CONTEXT=<local cluster context> (the current context is never used)"; exit 1; }
+	@E2E_KUBE_CONTEXT="$(KUBE_CONTEXT)" E2E_KUBECONFIG= bash -c 'source hack/e2e/lib.sh && e2e::guard'
+	@mkdir -p $(OUTPUT)
+	@# A kubeconfig with only that context, so that neither kubectl nor the
+	@# provider can use another one.
+	@(umask 077 && kubectl config view --minify --flatten --context "$(KUBE_CONTEXT)" >$(OUTPUT)/run.kubeconfig)
+	kubectl --kubeconfig $(OUTPUT)/run.kubeconfig apply -f package/crds
+	KUBECONFIG=$(OUTPUT)/run.kubeconfig $(GO) run ./cmd/provider --debug
 
 $(CROSSPLANE):
 	@mkdir -p $(BIN)

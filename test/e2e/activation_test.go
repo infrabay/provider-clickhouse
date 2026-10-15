@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -131,6 +132,15 @@ func testActivation(t *testing.T) {
 		}
 	}
 
+	if configKindsActivated(t) {
+		// Crossplane 2.0.0 and 2.0.1 start the provider while its config
+		// kinds are inactive. Before the config controllers waited for their
+		// CRDs (design 5.9), the manager stopped once controller-runtime's
+		// cache sync timeout had passed, and the pod restarted. The config
+		// kinds stay inactive for longer than that timeout.
+		waitProviderRunning(t, cacheSyncTimeout+30*time.Second)
+	}
+
 	// Then every kind, with the policy of examples/mrap.yaml.
 	b, err := os.ReadFile(filepath.Join("..", "..", "examples", "mrap.yaml"))
 	if err != nil {
@@ -154,6 +164,35 @@ func testActivation(t *testing.T) {
 	if n := providerRestarts(t); n != 0 {
 		t.Errorf("the provider container restarted %d times", n)
 	}
+}
+
+// cacheSyncTimeout is controller-runtime's default CacheSyncTimeout, which
+// the provider does not change.
+const cacheSyncTimeout = 2 * time.Minute
+
+// waitProviderRunning waits until the provider's container has run for d
+// without a restart, and fails as soon as it restarts.
+func waitProviderRunning(t *testing.T, d time.Duration) {
+	t.Helper()
+	eventually(t, d+3*time.Minute, "the provider running for "+d.String(), func() (bool, string) {
+		pods, err := clientset.CoreV1().Pods(nsCrossplane).List(context.Background(), metav1.ListOptions{LabelSelector: "pkg.crossplane.io/provider=" + providerName})
+		if err != nil {
+			return false, err.Error()
+		}
+		for _, p := range pods.Items {
+			for _, c := range p.Status.ContainerStatuses {
+				if c.RestartCount > 0 {
+					t.Fatalf("the provider container %s/%s restarted %d times while the config kinds were inactive", p.Name, c.Name, c.RestartCount)
+				}
+				if c.State.Running != nil {
+					up := time.Since(c.State.Running.StartedAt.Time)
+					return up >= d, "running for " + up.Round(time.Second).String()
+				}
+			}
+		}
+		return false, strconv.Itoa(len(pods.Items)) + " pods, none running"
+	})
+	t.Logf("the provider ran for %s with its config kinds inactive and did not restart", d)
 }
 
 // providerRestarts returns the restart count of the provider's containers.

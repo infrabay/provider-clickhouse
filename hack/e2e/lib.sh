@@ -86,29 +86,81 @@ e2e::context_allowed() {
 	return 1
 }
 
+# e2e::context_name_valid reports whether $1 is a context name the harness
+# accepts: letters, digits and . _ @ : - only, so that it is safe in the
+# jsonpath filter of e2e::guard.
+e2e::context_name_valid() {
+	case "$1" in
+	'' | *[!A-Za-z0-9._@:-]*) return 1 ;;
+	esac
+	return 0
+}
+
+# e2e::ipv4_local reports whether $1 is a dotted IPv4 address in 127/8, 10/8,
+# 172.16/12 or 192.168/16, or 0.0.0.0. The octets are compared as numbers, so
+# that a host name such as 10.example.com does not pass.
+e2e::ipv4_local() {
+	local a b c d o
+	printf '%s\n' "$1" | grep -Eq '^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$' || return 1
+	IFS=. read -r a b c d <<EOF
+$1
+EOF
+	for o in "${a}" "${b}" "${c}" "${d}"; do
+		[ "$((10#${o}))" -le 255 ] || return 1
+	done
+	a=$((10#${a})) b=$((10#${b})) c=$((10#${c})) d=$((10#${d}))
+	[ "${a}" -eq 127 ] || [ "${a}" -eq 10 ] ||
+		{ [ "${a}" -eq 172 ] && [ "${b}" -ge 16 ] && [ "${b}" -le 31 ]; } ||
+		{ [ "${a}" -eq 192 ] && [ "${b}" -eq 168 ]; } ||
+		{ [ "${a}" -eq 0 ] && [ "${b}" -eq 0 ] && [ "${c}" -eq 0 ] && [ "${d}" -eq 0 ]; }
+}
+
 # e2e::server_local reports whether the API server URL $1 is on this machine
-# or on a private network: loopback, a private IPv4 address, or a host name
-# that local cluster tools use.
+# or on a private network: a loopback or private IPv4 address (compared as
+# numbers), ::1, an IPv6 unique local address, or a host name that local
+# cluster tools use (exact names, and *.orb.local). The same rules as
+# serverLocal in test/e2e/guard_test.go. A private address alone does not
+# make a cluster local (a cloud cluster can have a private endpoint): the
+# context name allow-list and e2e::refuse_cloud_nodes come first and last.
 e2e::server_local() {
 	local hostport host
-	hostport="$(printf '%s' "$1" | sed -E 's#^[a-z]+://##; s#/.*$##')"
+	hostport="$(printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/.*$##; s#^[^@]*@##')"
 	case "${hostport}" in
 	\[*) host="${hostport#[}" && host="${host%%]*}" ;;
-	*) host="${hostport%:*}" ;;
+	*:*) host="${hostport%:*}" ;;
+	*) host="${hostport}" ;;
 	esac
 	case "${host}" in
-	localhost | 127.* | ::1 | 0.0.0.0 | 10.* | 192.168.* | host.docker.internal | kubernetes.docker.internal | *.orb.local) return 0 ;;
-	172.1[6-9].* | 172.2[0-9].* | 172.3[0-1].*) return 0 ;;
+	localhost | host.docker.internal | kubernetes.docker.internal | *.orb.local) return 0 ;;
+	::1 | :: | [fF][cCdD][0-9a-fA-F][0-9a-fA-F]:*) return 0 ;;
 	esac
-	return 1
+	e2e::ipv4_local "${host}"
+}
+
+# e2e::refuse_cloud_nodes fails when a node of the cluster runs at a cloud
+# provider: a provider ID of a cloud (gce://, aws://, azure:// and others) or
+# the node labels of GKE, EKS or AKS. Defence in depth behind the context
+# name and API server checks.
+e2e::refuse_cloud_nodes() {
+	local nodes
+	nodes="$(e2e::kubectl get nodes -o 'jsonpath={range .items[*]}{.metadata.name}{"|"}{.spec.providerID}{"|"}{.metadata.labels}{"\n"}{end}')" ||
+		e2e::die "cannot list the nodes of '${E2E_KUBE_CONTEXT}'"
+	[ -n "${nodes}" ] || e2e::die "'${E2E_KUBE_CONTEXT}' has no nodes"
+	if printf '%s\n' "${nodes}" | grep -Eq '\|(gce|aws|azure|digitalocean|linode|oci|ibm|openstack|vsphere|hcloud|alicloud|exoscale|scaleway|equinixmetal)://|cloud\.google\.com/gke-|eks\.amazonaws\.com/|kubernetes\.azure\.com/'; then
+		e2e::die "context '${E2E_KUBE_CONTEXT}' has nodes at a cloud provider; refusing"
+	fi
 }
 
 # e2e::guard refuses to continue unless E2E_KUBE_CONTEXT is set explicitly,
-# matches the local allow-list, exists in the kubeconfig and points at a local
-# API server. It never falls back to the current context.
+# matches the local allow-list, exists in the kubeconfig, points at a local
+# API server and has no cloud nodes. It never falls back to the current
+# context.
 e2e::guard() {
 	if [ -z "${E2E_KUBE_CONTEXT:-}" ]; then
 		e2e::die "E2E_KUBE_CONTEXT is not set. Name the local cluster explicitly, e.g. E2E_KUBE_CONTEXT=orbstack or E2E_KUBE_CONTEXT=kind-xpch-e2e (the current context is never used)."
+	fi
+	if ! e2e::context_name_valid "${E2E_KUBE_CONTEXT}"; then
+		e2e::die "context name '${E2E_KUBE_CONTEXT}' has characters other than letters, digits and . _ @ : -"
 	fi
 	if ! e2e::context_allowed "${E2E_KUBE_CONTEXT}"; then
 		e2e::die "context '${E2E_KUBE_CONTEXT}' is not a local cluster context (allowed: ${E2E_ALLOWED_CONTEXTS})"
@@ -122,24 +174,77 @@ e2e::guard() {
 	# An empty kubeconfig has no contexts list, which the filter rejects.
 	cluster="$(kubectl "${kc[@]+"${kc[@]}"}" config view -o "jsonpath={.contexts[?(@.name==\"${E2E_KUBE_CONTEXT}\")].context.cluster}" 2>/dev/null || true)"
 	[ -n "${cluster}" ] || e2e::die "context '${E2E_KUBE_CONTEXT}' does not exist in the kubeconfig"
+	case "${cluster}" in *[\"\'{}\]\[]*) e2e::die "context '${E2E_KUBE_CONTEXT}' names the cluster '${cluster}', which has characters the harness does not accept" ;; esac
 	server="$(kubectl "${kc[@]+"${kc[@]}"}" config view -o "jsonpath={.clusters[?(@.name==\"${cluster}\")].cluster.server}")"
 	if ! e2e::server_local "${server}"; then
 		e2e::die "context '${E2E_KUBE_CONTEXT}' points at API server '${server}', which is not local; refusing"
 	fi
 	export E2E_KUBE_CONTEXT
 	if [ -n "${E2E_KUBECONFIG:-}" ]; then export E2E_KUBECONFIG; fi
+	e2e::refuse_cloud_nodes
 }
 
-# e2e::foreign_crossplane fails when a Crossplane installation that the
-# harness did not create exists in the cluster: the harness would replace and
-# then remove it.
+# e2e::crossplane_namespace sets E2E_CROSSPLANE_NAMESPACE to "ours" when the
+# crossplane-system namespace exists with the harness label and to "absent"
+# when it does not exist. It dies when the namespace exists without the
+# label, or cannot be read. Call it directly, not in $(...), so that it can
+# stop the script.
+e2e::crossplane_namespace() {
+	local out
+	out="$(e2e::kubectl get namespace "${E2E_NS_CROSSPLANE}" --ignore-not-found -o "jsonpath={.metadata.name}|{.metadata.labels.app\.kubernetes\.io/part-of}" 2>&1)" ||
+		e2e::die "cannot read namespace ${E2E_NS_CROSSPLANE}: ${out}"
+	case "${out}" in
+	"") E2E_CROSSPLANE_NAMESPACE=absent ;;
+	"${E2E_NS_CROSSPLANE}|${E2E_LABEL_VALUE}") E2E_CROSSPLANE_NAMESPACE=ours ;;
+	*) e2e::die "namespace ${E2E_NS_CROSSPLANE} exists and was not created by the e2e harness (no label ${E2E_LABEL}); refusing to touch this Crossplane installation" ;;
+	esac
+}
+
+# e2e::foreign_crossplane_deployments prints the Crossplane Deployments
+# outside crossplane-system (label app, app.kubernetes.io/name or
+# app.kubernetes.io/part-of set to crossplane or crossplane-rbac-manager), for
+# example a Crossplane or UXP installed into another namespace. It fails if
+# kubectl does.
+e2e::foreign_crossplane_deployments() {
+	local out
+	out="$(e2e::kubectl get deployments -A -o 'jsonpath={range .items[*]}{.metadata.namespace}{"/"}{.metadata.name}{"|"}{.metadata.labels.app}{"|"}{.metadata.labels.app\.kubernetes\.io/name}{"|"}{.metadata.labels.app\.kubernetes\.io/part-of}{"\n"}{end}')" || return 1
+	printf '%s\n' "${out}" | grep -E '\|(crossplane|crossplane-rbac-manager)(\||$)' | grep -v "^${E2E_NS_CROSSPLANE}/" | sed -E 's#^([^|]*)\|.*#deployment/\1#' || true
+}
+
+# e2e::crossplane_cluster_objects prints the cluster-scoped objects that
+# cleanup.sh removes as part of a Crossplane installation the harness made:
+# *.crossplane.io CRDs, and ClusterRoles, ClusterRoleBindings and webhook
+# configurations whose names start with "crossplane". It fails if kubectl
+# does.
+e2e::crossplane_cluster_objects() {
+	local out type
+	out="$(e2e::kubectl get crd -o name)" || return 1
+	printf '%s\n' "${out}" | grep -E '\.crossplane\.io$' || true
+	for type in clusterroles clusterrolebindings validatingwebhookconfigurations mutatingwebhookconfigurations; do
+		out="$(e2e::kubectl get "${type}" -o name)" || return 1
+		printf '%s\n' "${out}" | grep -E '/crossplane' || true
+	done
+}
+
+# e2e::foreign_crossplane fails, before the harness installs anything, when
+# the cluster has Crossplane objects that the harness did not create: it
+# would install a second Crossplane next to them, and its cleanup would
+# remove them. With the harness's own crossplane-system (left by E2E_KEEP=1
+# or an interrupted run), Crossplane Deployments in other namespaces count;
+# without it, any Crossplane Deployment and any object of
+# e2e::crossplane_cluster_objects does, including the CRDs and RBAC that an
+# uninstalled Crossplane left behind.
 e2e::foreign_crossplane() {
-	local label
-	if e2e::kubectl get namespace "${E2E_NS_CROSSPLANE}" >/dev/null 2>&1; then
-		label="$(e2e::kubectl get namespace "${E2E_NS_CROSSPLANE}" -o "jsonpath={.metadata.labels.app\.kubernetes\.io/part-of}")"
-		if [ "${label}" != "${E2E_LABEL_VALUE}" ]; then
-			e2e::die "namespace ${E2E_NS_CROSSPLANE} exists and was not created by the e2e harness (no label ${E2E_LABEL}); refusing to touch this Crossplane installation"
-		fi
+	local found more
+	e2e::crossplane_namespace
+	found="$(e2e::foreign_crossplane_deployments)" || e2e::die "cannot list the Deployments of '${E2E_KUBE_CONTEXT}'"
+	if [ "${E2E_CROSSPLANE_NAMESPACE}" = absent ]; then
+		more="$(e2e::crossplane_cluster_objects)" || e2e::die "cannot list the CRDs, ClusterRoles, ClusterRoleBindings and webhook configurations of '${E2E_KUBE_CONTEXT}'"
+		found="$(printf '%s\n%s\n' "${found}" "${more}" | grep . || true)"
+	fi
+	if [ -n "${found}" ]; then
+		e2e::die "Crossplane objects that the e2e harness did not create exist in '${E2E_KUBE_CONTEXT}'; refusing to install a second Crossplane and to remove them afterwards. Use a cluster without Crossplane, or remove them first:
+$(printf '%s\n' "${found}" | sed 's/^/  /')"
 	fi
 }
 

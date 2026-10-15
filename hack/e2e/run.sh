@@ -40,7 +40,7 @@ E2E_REGISTRY_PORT="${E2E_REGISTRY_PORT:-35000}"
 # The provider's --poll interval; the drift scenarios wait for one interval
 # plus a margin.
 E2E_POLL_INTERVAL="${E2E_POLL_INTERVAL:-10s}"
-E2E_TEST_TIMEOUT="${E2E_TEST_TIMEOUT:-45m}"
+E2E_TEST_TIMEOUT="${E2E_TEST_TIMEOUT:-25m}"
 E2E_GO_TEST_ARGS="${E2E_GO_TEST_ARGS:-}"
 E2E_KEEP="${E2E_KEEP:-0}"
 GO="${GO:-go}"
@@ -53,6 +53,8 @@ e2e::guard
 
 on_exit() {
 	local status=$?
+	# A second Ctrl-C or SIGTERM stops the cleanup.
+	trap - INT TERM
 	if [ -n "${PF_PID}" ]; then kill "${PF_PID}" 2>/dev/null || true; fi
 	if [ "${status}" -ne 0 ]; then
 		e2e::warn "the end-to-end run failed (exit ${status}); writing diagnostics to ${ARTIFACTS}"
@@ -96,21 +98,43 @@ deploy_registry() {
 }
 
 push_package() {
-	local port
-	port=$((36000 + RANDOM % 1000))
-	e2e::log "pushing the package through a port-forward (127.0.0.1:${port})"
+	local log="${E2E_WORKDIR}/port-forward.log" port="" deadline
+	# With ":5000" kubectl picks a free local port, so that nothing else that
+	# listens on this machine can receive the push.
 	e2e::kubectl_argv
-	"${E2E_KUBECTL[@]}" -n "${E2E_NS_REGISTRY}" port-forward service/registry "${port}:5000" >"${E2E_WORKDIR}/port-forward.log" 2>&1 &
+	"${E2E_KUBECTL[@]}" -n "${E2E_NS_REGISTRY}" port-forward --address 127.0.0.1 service/registry :5000 >"${log}" 2>&1 &
 	PF_PID=$!
-	e2e::wait_until 30 "the registry port-forward" curl -fsS "http://127.0.0.1:${port}/v2/" ||
-		e2e::die "the registry port-forward did not come up: $(cat "${E2E_WORKDIR}/port-forward.log")"
+	deadline=$(($(date +%s) + 30))
+	while :; do
+		# "Forwarding from 127.0.0.1:<local port> -> <pod port>"
+		port="$(sed -n -E 's/^Forwarding from 127\.0\.0\.1:([0-9]+) -> [0-9]+$/\1/p' "${log}" | head -n 1)"
+		[ -z "${port}" ] || break
+		kill -0 "${PF_PID}" 2>/dev/null || e2e::die "the registry port-forward exited: $(cat "${log}")"
+		[ "$(date +%s)" -lt "${deadline}" ] || e2e::die "the registry port-forward did not come up: $(cat "${log}")"
+		sleep 1
+	done
+	e2e::log "pushing the package through a port-forward (127.0.0.1:${port})"
+	e2e::wait_until 30 "the registry behind the port-forward" curl -fsS "http://127.0.0.1:${port}/v2/" ||
+		e2e::die "the registry does not answer through the port-forward: $(cat "${log}")"
+	kill -0 "${PF_PID}" 2>/dev/null || e2e::die "the registry port-forward exited: $(cat "${log}")"
 	# go-containerregistry speaks plain HTTP to loopback registries.
 	"${CROSSPLANE}" xpkg push -f "${XPKG}" "127.0.0.1:${port}/${E2E_PROVIDER}:${TAG}"
+	# The registry accepts pushes without authentication, and on OrbStack and
+	# Docker Desktop its node port is reachable from the host: the package
+	# and the runtime image are referenced by the digest of this push, so
+	# that a later push to the tag cannot change what the cluster runs.
+	local digest
+	digest="$(curl -fsS -o /dev/null -D - \
+		-H 'Accept: application/vnd.oci.image.index.v1+json' -H 'Accept: application/vnd.oci.image.manifest.v1+json' \
+		-H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+		"http://127.0.0.1:${port}/v2/${E2E_PROVIDER}/manifests/${TAG}" | tr -d '\r' |
+		sed -n -E 's/^[Dd]ocker-[Cc]ontent-[Dd]igest: (sha256:[0-9a-f]{64})$/\1/p')"
+	[ -n "${digest}" ] || e2e::die "cannot read the digest of the pushed package"
 	kill "${PF_PID}" 2>/dev/null || true
 	wait "${PF_PID}" 2>/dev/null || true
 	PF_PID=""
-	PACKAGE="${REGISTRY_IP}:5000/${E2E_PROVIDER}:${TAG}"
-	RUNTIME_IMAGE="localhost:${E2E_REGISTRY_PORT}/${E2E_PROVIDER}:${TAG}"
+	PACKAGE="${REGISTRY_IP}:5000/${E2E_PROVIDER}@${digest}"
+	RUNTIME_IMAGE="localhost:${E2E_REGISTRY_PORT}/${E2E_PROVIDER}@${digest}"
 }
 
 install_crossplane() {
@@ -271,7 +295,13 @@ main() {
 		"${E2E_DIR}/cleanup.sh"
 	fi
 	trap on_exit EXIT
+	# Without these, bash runs the EXIT trap of a run stopped by a signal (Ctrl-C,
+	# a cancelled CI job) with status 0, and on_exit would skip the
+	# diagnostics.
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 	e2e::log "context ${E2E_KUBE_CONTEXT}, Crossplane ${CROSSPLANE_VERSION}, work directory ${E2E_WORKDIR}"
+	e2e::log "$(kubectl version --client 2>/dev/null | head -n 1), helm $(helm version --short 2>/dev/null)"
 
 	build_package
 	deploy_registry
